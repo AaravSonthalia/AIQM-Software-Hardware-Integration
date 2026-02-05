@@ -302,7 +302,7 @@ class MainWindow(QMainWindow):
 
         self.worker: Optional[PowerSupplyWorker] = None
         self.resource = resource
-        self.advanced_mode = False
+        self.advanced_mode = True  # Show advanced view (with graph) by default
 
         # Data for plotting
         self.time_data = []
@@ -338,6 +338,7 @@ class MainWindow(QMainWindow):
         top_bar.addStretch()
 
         self.view_toggle = QCheckBox("Advanced View")
+        self.view_toggle.setChecked(True)  # Advanced view on by default
         self.view_toggle.toggled.connect(self._toggle_view)
         top_bar.addWidget(self.view_toggle)
 
@@ -387,7 +388,7 @@ class MainWindow(QMainWindow):
             self.current_curve = self.plot_widget.plot(pen='c', name='Current (A)')
             self.power_curve = self.plot_widget.plot(pen='m', name='Power (W)')
 
-            self.plot_widget.setVisible(False)
+            self.plot_widget.setVisible(True)  # Graph visible by default
             left_panel.addWidget(self.plot_widget)
 
         left_panel.addStretch()
@@ -402,7 +403,7 @@ class MainWindow(QMainWindow):
 
         # Protection panel (advanced view)
         self.protection_panel = ProtectionPanel()
-        self.protection_panel.setVisible(False)
+        self.protection_panel.setVisible(True)  # Visible by default with advanced view
         right_panel.addWidget(self.protection_panel)
 
         # Emergency stop
@@ -515,8 +516,8 @@ class MainWindow(QMainWindow):
             self.voltage_display.set_color("#888")
             self.current_display.set_color("#888")
 
-        # Update plot data
-        if HAS_PLOTTING and self.advanced_mode:
+        # Update plot data (always collect, even if view is hidden)
+        if HAS_PLOTTING:
             now = time.time() - self.start_time
             self.time_data.append(now)
             self.voltage_data.append(state.voltage_measured)
