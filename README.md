@@ -41,4 +41,4 @@ python dracal_thermocouple_reader.py --port /dev/tty.usbserial-XXXX --interval-m
 ## Notes
 
 - Use the exact serial port shown by your OS (for example `/dev/tty.usbserial-*` on macOS).
-- OWON and Dracal tools are currently separate scripts; control-loop integration is the next step.
+- OWON and Dracal tools are currently separate scripts. Control-loop integration is the next step.
