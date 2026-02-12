@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QLineEdit, QGroupBox,
     QFrame, QMessageBox, QComboBox, QCheckBox, QSpinBox,
-    QDoubleSpinBox, QStatusBar, QSplitter
+    QDoubleSpinBox, QStatusBar, QSplitter, QTabWidget
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QColor, QPalette
@@ -37,6 +37,7 @@ except ImportError:
     print("      Install with: pip install pyqtgraph")
 
 from owon_power_supply import OWONPowerSupply, find_owon_supplies
+from dracal_thermocouple_reader import DracalVCPReader, auto_detect_port, extract_temperature
 
 
 @dataclass
@@ -52,6 +53,17 @@ class PowerSupplyState:
     ocp_limit: float = 0.0
     connected: bool = False
     error: str = ""
+
+
+@dataclass
+class TemperatureState:
+    """Current state of the thermocouple reader."""
+    temperature: float = 0.0
+    unit: str = "C"
+    channel: str = "temperature"
+    connected: bool = False
+    error: str = ""
+    device_info: str = ""
 
 
 class PowerSupplyWorker(QThread):
@@ -144,6 +156,97 @@ class PowerSupplyWorker(QThread):
     def queue_command(self, cmd: str, *args):
         """Queue a command for execution."""
         self._command_queue.append((cmd, args))
+
+    def stop(self):
+        """Stop the worker thread."""
+        self.running = False
+
+
+class ThermocoupleWorker(QThread):
+    """Background thread for Dracal thermocouple communication."""
+
+    state_updated = pyqtSignal(TemperatureState)
+
+    def __init__(self, port: Optional[str] = None, interval_ms: int = 500, frac: int = 2):
+        super().__init__()
+        self.port = port
+        self.interval_ms = interval_ms
+        self.frac = frac
+        self.running = False
+        self.reader: Optional[DracalVCPReader] = None
+
+    def run(self):
+        """Main worker loop."""
+        self.running = True
+        state = TemperatureState()
+        port = self.port or auto_detect_port()
+
+        if not port:
+            state.error = "No Dracal serial port detected."
+            self.state_updated.emit(state)
+            return
+
+        try:
+            self.reader = DracalVCPReader(port=port)
+            self.reader.connect()
+
+            self.reader.send_command("INFO")
+            time.sleep(0.2)
+            self.reader.send_command(f"POLL {self.interval_ms}")
+            time.sleep(0.2)
+            self.reader.send_command(f"FRAC {self.frac}")
+            time.sleep(0.2)
+
+            state.connected = True
+            state.device_info = port
+            self.state_updated.emit(state)
+        except Exception as e:
+            state.connected = False
+            state.error = str(e)
+            self.state_updated.emit(state)
+            return
+
+        while self.running:
+            try:
+                raw = self.reader.read_line()
+                if not raw:
+                    continue
+
+                record = self.reader.parse_line(raw)
+                self.reader.handle_info_record(record)
+
+                if record.line_type == "I":
+                    continue
+
+                temp = extract_temperature(record)
+                if temp is None:
+                    continue
+
+                name, value, unit = temp
+                try:
+                    numeric_temp = float(value)
+                except (TypeError, ValueError):
+                    continue
+
+                state.connected = True
+                state.error = ""
+                state.channel = name
+                state.temperature = numeric_temp
+                state.unit = unit
+                if record.product and record.serial:
+                    state.device_info = f"{record.product} {record.serial}"
+                self.state_updated.emit(state)
+
+            except Exception as e:
+                state.error = str(e)
+                self.state_updated.emit(state)
+                time.sleep(0.2)
+
+        if self.reader:
+            try:
+                self.reader.disconnect()
+            except Exception:
+                pass
 
     def stop(self):
         """Stop the worker thread."""
@@ -297,10 +400,11 @@ class MainWindow(QMainWindow):
     def __init__(self, resource: Optional[str] = None):
         super().__init__()
 
-        self.setWindowTitle("OWON Power Supply Control")
+        self.setWindowTitle("Hardware Control Dashboard")
         self.setMinimumSize(800, 600)
 
         self.worker: Optional[PowerSupplyWorker] = None
+        self.thermo_worker: Optional[ThermocoupleWorker] = None
         self.resource = resource
         self.advanced_mode = True  # Show advanced view (with graph) by default
 
@@ -310,6 +414,9 @@ class MainWindow(QMainWindow):
         self.current_data = []
         self.power_data = []
         self.start_time = time.time()
+        self.temp_time_data = []
+        self.temp_data = []
+        self.temp_start_time = time.time()
 
         self._setup_ui()
         self._connect_signals()
@@ -322,8 +429,19 @@ class MainWindow(QMainWindow):
         """Set up the user interface."""
         central = QWidget()
         self.setCentralWidget(central)
-
         main_layout = QVBoxLayout(central)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_power_tab(), "Power Supply")
+        self.tabs.addTab(self._build_temperature_tab(), "Temperature")
+        main_layout.addWidget(self.tabs)
+
+        self.statusBar().showMessage("Ready")
+
+    def _build_power_tab(self) -> QWidget:
+        """Build the power supply tab."""
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
 
         # Top bar: connection and view toggle
         top_bar = QHBoxLayout()
@@ -338,19 +456,16 @@ class MainWindow(QMainWindow):
         top_bar.addStretch()
 
         self.view_toggle = QCheckBox("Advanced View")
-        self.view_toggle.setChecked(True)  # Advanced view on by default
+        self.view_toggle.setChecked(True)
         self.view_toggle.toggled.connect(self._toggle_view)
         top_bar.addWidget(self.view_toggle)
 
-        main_layout.addLayout(top_bar)
+        tab_layout.addLayout(top_bar)
 
         # Main content area
         content = QHBoxLayout()
 
-        # Left side: measurements
         left_panel = QVBoxLayout()
-
-        # Measurement displays
         measurements = QGroupBox("Measurements")
         meas_layout = QGridLayout(measurements)
 
@@ -361,52 +476,39 @@ class MainWindow(QMainWindow):
         meas_layout.addWidget(self.voltage_display, 0, 0)
         meas_layout.addWidget(self.current_display, 0, 1)
         meas_layout.addWidget(self.power_display, 0, 2)
-
         left_panel.addWidget(measurements)
 
-        # Setpoints display (simple view)
         self.setpoints_group = QGroupBox("Setpoints")
         setpoints_layout = QGridLayout(self.setpoints_group)
-
         self.voltage_sp_display = ValueDisplay("V Setpoint", "V", 2)
         self.current_sp_display = ValueDisplay("I Limit", "A", 3)
-
         setpoints_layout.addWidget(self.voltage_sp_display, 0, 0)
         setpoints_layout.addWidget(self.current_sp_display, 0, 1)
-
         left_panel.addWidget(self.setpoints_group)
 
-        # Plot area (advanced view only)
         if HAS_PLOTTING:
             self.plot_widget = pg.PlotWidget(title="Power Output")
             self.plot_widget.setLabel('left', 'Value')
             self.plot_widget.setLabel('bottom', 'Time', 's')
             self.plot_widget.addLegend()
             self.plot_widget.showGrid(x=True, y=True)
-
             self.voltage_curve = self.plot_widget.plot(pen='y', name='Voltage (V)')
             self.current_curve = self.plot_widget.plot(pen='c', name='Current (A)')
             self.power_curve = self.plot_widget.plot(pen='m', name='Power (W)')
-
-            self.plot_widget.setVisible(True)  # Graph visible by default
+            self.plot_widget.setVisible(True)
             left_panel.addWidget(self.plot_widget)
 
         left_panel.addStretch()
         content.addLayout(left_panel, stretch=2)
 
-        # Right side: controls
         right_panel = QVBoxLayout()
-
-        # Control panel
         self.control_panel = ControlPanel(max_voltage=24.0, max_current=1.0)
         right_panel.addWidget(self.control_panel)
 
-        # Protection panel (advanced view)
         self.protection_panel = ProtectionPanel()
-        self.protection_panel.setVisible(True)  # Visible by default with advanced view
+        self.protection_panel.setVisible(True)
         right_panel.addWidget(self.protection_panel)
 
-        # Emergency stop
         self.estop_btn = QPushButton("EMERGENCY STOP")
         self.estop_btn.setMinimumHeight(60)
         self.estop_btn.setStyleSheet("""
@@ -429,11 +531,50 @@ class MainWindow(QMainWindow):
 
         right_panel.addStretch()
         content.addLayout(right_panel, stretch=1)
+        tab_layout.addLayout(content)
+        return tab
 
-        main_layout.addLayout(content)
+    def _build_temperature_tab(self) -> QWidget:
+        """Build the thermocouple monitoring tab."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
 
-        # Status bar
-        self.statusBar().showMessage("Ready")
+        top_bar = QHBoxLayout()
+        self.temp_connect_btn = QPushButton("Connect Thermocouple")
+        self.temp_connect_btn.clicked.connect(self._on_temp_connect_clicked)
+        top_bar.addWidget(self.temp_connect_btn)
+
+        self.temp_status_label = QLabel("Disconnected")
+        top_bar.addWidget(self.temp_status_label)
+        top_bar.addStretch()
+        layout.addLayout(top_bar)
+
+        temp_group = QGroupBox("Live Temperature")
+        temp_layout = QVBoxLayout(temp_group)
+        self.temp_value_label = QLabel("--.- C")
+        self.temp_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.temp_value_label.setFont(QFont("Monospace", 36, QFont.Weight.Bold))
+        temp_layout.addWidget(self.temp_value_label)
+
+        self.temp_channel_label = QLabel("Channel: --")
+        self.temp_channel_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        temp_layout.addWidget(self.temp_channel_label)
+
+        self.temp_device_label = QLabel("Device: --")
+        self.temp_device_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        temp_layout.addWidget(self.temp_device_label)
+        layout.addWidget(temp_group)
+
+        if HAS_PLOTTING:
+            self.temp_plot = pg.PlotWidget(title="Temperature Trend")
+            self.temp_plot.setLabel('left', 'Temperature')
+            self.temp_plot.setLabel('bottom', 'Time', 's')
+            self.temp_plot.showGrid(x=True, y=True)
+            self.temp_curve = self.temp_plot.plot(pen='r', name='Temperature')
+            layout.addWidget(self.temp_plot)
+
+        layout.addStretch()
+        return tab
 
     def _connect_signals(self):
         """Connect control signals."""
@@ -488,6 +629,31 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Disconnected")
         self.resource = None
 
+    def _on_temp_connect_clicked(self):
+        """Handle thermocouple connect button."""
+        if self.thermo_worker and self.thermo_worker.isRunning():
+            self._disconnect_thermocouple()
+        else:
+            self._connect_thermocouple()
+
+    def _connect_thermocouple(self):
+        """Connect to Dracal thermocouple reader."""
+        self.thermo_worker = ThermocoupleWorker()
+        self.thermo_worker.state_updated.connect(self._on_temp_state_updated)
+        self.thermo_worker.start()
+        self.temp_connect_btn.setText("Disconnect Thermocouple")
+        self.temp_status_label.setText("Connecting...")
+
+    def _disconnect_thermocouple(self):
+        """Disconnect thermocouple worker."""
+        if self.thermo_worker:
+            self.thermo_worker.stop()
+            self.thermo_worker.wait()
+            self.thermo_worker = None
+
+        self.temp_connect_btn.setText("Connect Thermocouple")
+        self.temp_status_label.setText("Disconnected")
+
     def _on_state_updated(self, state: PowerSupplyState):
         """Handle state update from worker."""
         if not state.connected:
@@ -535,6 +701,28 @@ class MainWindow(QMainWindow):
             self.current_curve.setData(self.time_data, self.current_data)
             self.power_curve.setData(self.time_data, self.power_data)
 
+    def _on_temp_state_updated(self, state: TemperatureState):
+        """Handle thermocouple updates."""
+        if not state.connected and state.error:
+            self.temp_status_label.setText(f"Error: {state.error}")
+            return
+
+        self.temp_status_label.setText("Connected")
+        self.temp_value_label.setText(f"{state.temperature:.2f} {state.unit}")
+        self.temp_channel_label.setText(f"Channel: {state.channel}")
+        self.temp_device_label.setText(f"Device: {state.device_info}")
+
+        if HAS_PLOTTING:
+            now = time.time() - self.temp_start_time
+            self.temp_time_data.append(now)
+            self.temp_data.append(state.temperature)
+
+            while self.temp_time_data and self.temp_time_data[0] < now - 120:
+                self.temp_time_data.pop(0)
+                self.temp_data.pop(0)
+
+            self.temp_curve.setData(self.temp_time_data, self.temp_data)
+
     def _on_output_toggled(self, enabled: bool):
         """Handle output toggle."""
         if self.worker:
@@ -561,6 +749,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Handle window close."""
         self._disconnect_from_psu()
+        self._disconnect_thermocouple()
         event.accept()
 
 
