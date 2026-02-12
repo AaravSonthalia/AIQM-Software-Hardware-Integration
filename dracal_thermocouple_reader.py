@@ -239,6 +239,153 @@ def extract_temperature(record: DracalRecord) -> Optional[tuple[str, float | int
     return None
 
 
+class DracalTMC100k:
+    """High-level TMC100k interface built on the shared VCP reader."""
+
+    DEFAULT_BAUD_RATE = 9600
+    DEFAULT_POLL_MS = 500
+    DEFAULT_FRAC = 3
+
+    def __init__(
+        self,
+        port: str,
+        poll_interval_ms: int = DEFAULT_POLL_MS,
+        decimal_places: int = DEFAULT_FRAC,
+        timeout: float = 2.0,
+    ):
+        self.port = port
+        self.poll_interval_ms = poll_interval_ms
+        self.decimal_places = decimal_places
+        self.timeout = timeout
+
+        self._reader = DracalVCPReader(port=port, baudrate=self.DEFAULT_BAUD_RATE, timeout=timeout)
+        self._last_tc_temp: Optional[float] = None
+        self._last_cj_temp: Optional[float] = None
+        self._product = ""
+        self._serial = ""
+
+    def connect(self) -> None:
+        self._reader.connect()
+        configure_sensor(self._reader, self.poll_interval_ms, self.decimal_places)
+
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            raw = self._reader.read_line()
+            if not raw:
+                continue
+            try:
+                record = self._reader.parse_line(raw)
+            except ValueError:
+                continue
+
+            self._reader.handle_info_record(record)
+            if record.line_type != "D":
+                continue
+
+            self._update_from_record(record)
+            if self._last_tc_temp is not None:
+                return
+
+        raise ConnectionError(
+            f"Connected to {self.port} but received no valid data. "
+            "Ensure the device is in VCP mode."
+        )
+
+    def disconnect(self) -> None:
+        try:
+            self._reader.send_command("POLL 0")
+        except Exception:
+            pass
+        self._reader.disconnect()
+
+    def read_temperature(self) -> float:
+        record = self._read_next_data_record()
+        self._update_from_record(record)
+        if self._last_tc_temp is None:
+            raise RuntimeError("No valid temperature reading available")
+        return self._last_tc_temp
+
+    def read_cold_junction(self) -> float:
+        if self._last_cj_temp is None:
+            raise RuntimeError("No cold junction reading available")
+        return self._last_cj_temp
+
+    def get_info(self) -> dict:
+        return {
+            "product_id": self._product,
+            "serial_number": self._serial,
+            "poll_interval_ms": self.poll_interval_ms,
+            "decimal_places": self.decimal_places,
+        }
+
+    def _read_next_data_record(self) -> DracalRecord:
+        deadline = time.time() + max(2.0, self.timeout)
+        while time.time() < deadline:
+            raw = self._reader.read_line()
+            if not raw:
+                continue
+            try:
+                record = self._reader.parse_line(raw)
+            except ValueError:
+                continue
+
+            self._reader.handle_info_record(record)
+            if record.line_type == "D":
+                return record
+
+        raise RuntimeError("No valid temperature data received")
+
+    def _update_from_record(self, record: DracalRecord) -> None:
+        if record.product:
+            self._product = record.product
+        if record.serial:
+            self._serial = record.serial
+
+        temp = extract_temperature(record)
+        if temp is not None:
+            _, temp_value, _ = temp
+            try:
+                self._last_tc_temp = float(temp_value)
+            except (TypeError, ValueError):
+                pass
+
+        numeric_values = []
+        for point in record.points:
+            try:
+                numeric_values.append(float(point.value))
+            except (TypeError, ValueError):
+                continue
+
+        if len(numeric_values) >= 2:
+            self._last_cj_temp = numeric_values[1]
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.disconnect()
+        return False
+
+
+def find_dracal_sensors() -> list[tuple[str, str]]:
+    """Scan serial ports for likely Dracal sensors."""
+    found: list[tuple[str, str]] = []
+
+    for port in list_ports.comports():
+        description = port.description or ""
+        if "dracal" in description.lower() or "tmc100" in description.lower():
+            found.append((port.device, description))
+
+    if found:
+        return found
+
+    detected = auto_detect_port()
+    if detected:
+        found.append((detected, "Dracal-compatible port"))
+    return found
+
+
 def configure_sensor(reader: DracalVCPReader, interval_ms: int, frac: Optional[int]) -> None:
     reader.send_command("INFO")
     time.sleep(0.3)

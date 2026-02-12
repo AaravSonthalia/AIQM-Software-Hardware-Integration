@@ -272,7 +272,7 @@ class OWONPowerSupply(SCPIDevice):
         return self.measure_all()
 
 
-def find_owon_supplies() -> list[str]:
+def find_owon_supplies() -> list[tuple[str, str]]:
     """
     Scan for OWON power supplies on available serial ports.
 

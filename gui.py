@@ -20,12 +20,11 @@ from dataclasses import dataclass
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QLabel, QPushButton, QLineEdit, QGroupBox,
-    QFrame, QMessageBox, QComboBox, QCheckBox, QSpinBox,
-    QDoubleSpinBox, QStatusBar, QSplitter, QTabWidget
+    QGridLayout, QLabel, QPushButton, QGroupBox,
+    QFrame, QMessageBox, QCheckBox, QDoubleSpinBox, QTabWidget
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
-from PyQt6.QtGui import QFont, QColor, QPalette
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtGui import QFont
 
 # Try to import pyqtgraph for plotting (optional)
 try:
