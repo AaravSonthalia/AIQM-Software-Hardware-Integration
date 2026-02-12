@@ -363,6 +363,7 @@ class ProtectionPanel(QGroupBox):
 
     def __init__(self):
         super().__init__("Protection Settings")
+        self._initialized = False  # Track if we've loaded initial values
 
         layout = QGridLayout(self)
 
@@ -389,9 +390,24 @@ class ProtectionPanel(QGroupBox):
         layout.addWidget(self.ocp_btn, 1, 2)
 
     def update_state(self, state: PowerSupplyState):
-        """Update displayed protection values."""
-        self.ovp_spin.setValue(state.ovp_limit)
-        self.ocp_spin.setValue(state.ocp_limit)
+        """Update displayed protection values only on initial load or if not focused."""
+        # Only auto-update spin boxes if user is not actively editing them
+        # This prevents overwriting user input before they click "Set"
+        if not self._initialized:
+            # First update - load initial values from device
+            self.ovp_spin.setValue(state.ovp_limit)
+            self.ocp_spin.setValue(state.ocp_limit)
+            self._initialized = True
+        else:
+            # Subsequent updates - only update if spin box doesn't have focus
+            if not self.ovp_spin.hasFocus():
+                self.ovp_spin.setValue(state.ovp_limit)
+            if not self.ocp_spin.hasFocus():
+                self.ocp_spin.setValue(state.ocp_limit)
+
+    def reset_initialized(self):
+        """Reset initialization flag (call on disconnect)."""
+        self._initialized = False
 
 
 class MainWindow(QMainWindow):
@@ -628,6 +644,7 @@ class MainWindow(QMainWindow):
         self.connect_btn.setText("Connect")
         self.status_label.setText("Disconnected")
         self.resource = None
+        self.protection_panel.reset_initialized()  # Reset so values reload on reconnect
 
     def _on_temp_connect_clicked(self):
         """Handle thermocouple connect button."""
