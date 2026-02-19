@@ -9,6 +9,7 @@ Python tools for integrating hardware used in AI-driven MBE process control.
 - `owon_data_logger.py`: OWON voltage/current/power CSV logger.
 - `owon_self_test.py`: OWON communication and safety test script.
 - `dracal_thermocouple_reader.py`: Dracal thermocouple reader (VCP mode).
+- `temperature_pid_control.py`: simple PID loop using OWON + Dracal.
 - `gui.py`: GUI entry point (work in progress).
 
 ## Setup
@@ -37,6 +38,18 @@ Dracal reader with CSV output:
 
 ```bash
 python dracal_thermocouple_reader.py --port /dev/tty.usbserial-XXXX --interval-ms 500 --frac 2 --csv logs/thermocouple.csv
+```
+
+Simple PID temperature control:
+
+```bash
+python temperature_pid_control.py --target 100 --hold-minutes 10 --margin 1.0
+```
+
+Safety-focused run with stricter limits:
+
+```bash
+python temperature_pid_control.py --target 100 --hold-minutes 10 --margin 1.0 --max-temp-hard 150 --target-timeout-minutes 20 --max-voltage-step 0.5
 ```
 
 ## Notes
