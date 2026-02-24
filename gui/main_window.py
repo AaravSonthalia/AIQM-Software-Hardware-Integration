@@ -17,6 +17,8 @@ from gui.temperature_tab import TemperatureTab
 from gui.dashboard_tab import DashboardTab
 from gui.visuals_tab import VisualsTab
 from gui.config_tab import ConfigTab
+from gui.pid_controller import PIDController
+from gui.pid_tab import PIDTab
 from gui.action_log_tab import ActionLogTab
 
 
@@ -58,6 +60,8 @@ class MainWindow(QMainWindow):
         self.dashboard_tab = DashboardTab()
         self.visuals_tab = VisualsTab()
         self.config_tab = ConfigTab(self.action_logger)
+        self.pid_controller = PIDController(self.action_logger)
+        self.pid_tab = PIDTab(self.pid_controller)
         self.log_tab = ActionLogTab(self.action_logger)
 
         self.tabs.addTab(self.psu_tab, "Power Supply")
@@ -65,6 +69,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
         self.tabs.addTab(self.visuals_tab, "Visuals")
         self.tabs.addTab(self.config_tab, "Config")
+        self.tabs.addTab(self.pid_tab, "PID")
         self.tabs.addTab(self.log_tab, "Action Log")
 
         main_layout.addWidget(self.tabs)
@@ -79,6 +84,9 @@ class MainWindow(QMainWindow):
         # Temperature tab signals
         self.temp_tab.connect_requested.connect(self._connect_thermocouple)
         self.temp_tab.disconnect_requested.connect(self._disconnect_thermocouple)
+
+        # PID tab emergency stop → same path as PSU E-Stop button
+        self.pid_tab.emergency_stop_requested.connect(self._on_pid_emergency_stop)
 
     # --- PSU worker lifecycle ---
 
@@ -104,9 +112,14 @@ class MainWindow(QMainWindow):
         self.psu_worker.state_updated.connect(self._on_psu_state)
         self.psu_worker.start()
         self.psu_tab.status_label.setText("Connecting...")
+        self.pid_controller.set_psu_worker(self.psu_worker)
 
     @pyqtSlot()
     def _disconnect_from_psu(self):
+        # Stop PID before pulling the PSU worker out from under it
+        self.pid_controller.stop()
+        self.pid_controller.set_psu_worker(None)
+
         if self.psu_worker:
             self.psu_worker.stop()
             self.psu_worker.wait()
@@ -121,6 +134,11 @@ class MainWindow(QMainWindow):
             self.psu_worker.queue_command(cmd, *args)
             if cmd == "emergency_stop":
                 self.statusBar().showMessage("!!! EMERGENCY STOP ACTIVATED !!!")
+
+    @pyqtSlot()
+    def _on_pid_emergency_stop(self):
+        """PID E-Stop: also updates the status bar (PSU command already queued by PIDController)."""
+        self.statusBar().showMessage("!!! PID EMERGENCY STOP ACTIVATED !!!")
 
     # --- Thermocouple worker lifecycle ---
 
@@ -154,6 +172,7 @@ class MainWindow(QMainWindow):
         self.dashboard_tab.update_psu_state(state)
         self.visuals_tab.update_psu_state(state)
         self.action_logger.update_psu_state(state)
+        self.pid_controller.on_psu_state(state)
 
     @pyqtSlot(TemperatureState)
     def _on_temp_state(self, state: TemperatureState):
@@ -162,11 +181,13 @@ class MainWindow(QMainWindow):
         self.dashboard_tab.update_temp_state(state)
         self.visuals_tab.update_temp_state(state)
         self.action_logger.update_temp_state(state)
+        self.pid_controller.on_temp_state(state)
 
     # --- Shutdown ---
 
     def closeEvent(self, event):
         self.action_logger.log("System", "Application Closing", "")
+        self.pid_controller.emergency_stop()
         self._disconnect_from_psu()
         self._disconnect_thermocouple()
         event.accept()
