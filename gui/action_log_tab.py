@@ -5,9 +5,9 @@ Action log viewer tab widget.
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog,
-    QMessageBox, QDoubleSpinBox,
+    QMessageBox,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt
 
 from gui.state import ActionLogEntry
 from gui.action_logger import ActionLogger
@@ -29,34 +29,6 @@ class ActionLogTab(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-
-        # Recording toolbar
-        rec_bar = QHBoxLayout()
-
-        rec_bar.addWidget(QLabel("Interval:"))
-        self.interval_spin = QDoubleSpinBox()
-        self.interval_spin.setRange(0.1, 3600.0)
-        self.interval_spin.setValue(1.0)
-        self.interval_spin.setSuffix(" s")
-        self.interval_spin.setDecimals(1)
-        self.interval_spin.setSingleStep(0.5)
-        rec_bar.addWidget(self.interval_spin)
-
-        self.record_btn = QPushButton("Start Recording")
-        self.record_btn.setCheckable(True)
-        self.record_btn.clicked.connect(self._on_record_toggled)
-        rec_bar.addWidget(self.record_btn)
-
-        self.rec_status = QLabel("")
-        rec_bar.addWidget(self.rec_status)
-
-        rec_bar.addStretch()
-        layout.addLayout(rec_bar)
-
-        # Recording timer
-        self._rec_timer = QTimer(self)
-        self._rec_timer.timeout.connect(self._on_record_tick)
-        self._rec_count = 0
 
         # Table
         self.table = QTableWidget(0, len(self.COLUMNS))
@@ -120,28 +92,6 @@ class ActionLogTab(QWidget):
         """Clear the table."""
         self.table.setRowCount(0)
         self.count_label.setText("0 entries")
-
-    def _on_record_toggled(self, checked: bool):
-        if checked:
-            interval_ms = int(self.interval_spin.value() * 1000)
-            self._rec_count = 0
-            self._rec_timer.start(interval_ms)
-            self.record_btn.setText("Stop Recording")
-            self.record_btn.setStyleSheet("background-color: #d32f2f; color: white;")
-            self.interval_spin.setEnabled(False)
-            self.action_logger.log("Recording", "Started", f"Interval: {self.interval_spin.value():.1f}s")
-        else:
-            self._rec_timer.stop()
-            self.record_btn.setText("Start Recording")
-            self.record_btn.setStyleSheet("")
-            self.interval_spin.setEnabled(True)
-            self.rec_status.setText("")
-            self.action_logger.log("Recording", "Stopped", f"{self._rec_count} measurements taken")
-
-    def _on_record_tick(self):
-        self._rec_count += 1
-        self.action_logger.log("Measurement", "Auto-Record", f"#{self._rec_count}")
-        self.rec_status.setText(f"#{self._rec_count}")
 
     def _on_export(self):
         filepath, _ = QFileDialog.getSaveFileName(

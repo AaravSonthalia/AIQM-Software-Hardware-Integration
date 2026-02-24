@@ -2,11 +2,16 @@
 Power Supply tab widget.
 """
 
+import time
+from collections import deque
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QPushButton, QGroupBox, QCheckBox,
 )
 from PyQt6.QtCore import pyqtSignal
+
+import pyqtgraph as pg
 
 from gui.state import PowerSupplyState
 from gui.widgets import ValueDisplay, ControlPanel, ProtectionPanel
@@ -24,6 +29,13 @@ class PowerSupplyTab(QWidget):
         super().__init__(parent)
         self.action_logger = action_logger
         self.advanced_mode = True
+
+        # Live plot buffers
+        self.psu_start = time.time()
+        self.psu_time = deque(maxlen=120)
+        self.psu_voltage = deque(maxlen=120)
+        self.psu_current = deque(maxlen=120)
+        self.psu_power = deque(maxlen=120)
 
         self._build_ui()
         self._connect_signals()
@@ -110,6 +122,37 @@ class PowerSupplyTab(QWidget):
 
         layout.addLayout(content)
 
+        # Live plots: V / I / P stacked with linked X axes
+        readings_group = QGroupBox("Live Readings")
+        readings_layout = QVBoxLayout(readings_group)
+        readings_layout.setContentsMargins(4, 4, 4, 4)
+        readings_layout.setSpacing(2)
+
+        self.v_plot = pg.PlotWidget(title="Voltage")
+        self.v_plot.setLabel("left", "V", "V")
+        self.v_plot.showGrid(x=True, y=True)
+        self.v_curve = self.v_plot.plot(pen=pg.mkPen("y", width=2))
+
+        self.i_plot = pg.PlotWidget(title="Current")
+        self.i_plot.setLabel("left", "I", "A")
+        self.i_plot.showGrid(x=True, y=True)
+        self.i_curve = self.i_plot.plot(pen=pg.mkPen("c", width=2))
+
+        self.p_plot = pg.PlotWidget(title="Power")
+        self.p_plot.setLabel("left", "P", "W")
+        self.p_plot.setLabel("bottom", "Time", "s")
+        self.p_plot.showGrid(x=True, y=True)
+        self.p_curve = self.p_plot.plot(pen=pg.mkPen("m", width=2))
+
+        # Link X axes
+        self.i_plot.setXLink(self.v_plot)
+        self.p_plot.setXLink(self.v_plot)
+
+        readings_layout.addWidget(self.v_plot)
+        readings_layout.addWidget(self.i_plot)
+        readings_layout.addWidget(self.p_plot)
+        layout.addWidget(readings_group)
+
     def _connect_signals(self):
         self.control_panel.voltage_changed.connect(self._on_set_voltage)
         self.control_panel.current_changed.connect(self._on_set_current)
@@ -194,6 +237,18 @@ class PowerSupplyTab(QWidget):
         else:
             self.voltage_display.set_color("#888")
             self.current_display.set_color("#888")
+
+        # Update live plots
+        now = time.time() - self.psu_start
+        self.psu_time.append(now)
+        self.psu_voltage.append(state.voltage_measured)
+        self.psu_current.append(state.current_measured)
+        self.psu_power.append(state.power_measured)
+
+        t = list(self.psu_time)
+        self.v_curve.setData(t, list(self.psu_voltage))
+        self.i_curve.setData(t, list(self.psu_current))
+        self.p_curve.setData(t, list(self.psu_power))
 
     def on_disconnected(self):
         """Reset UI on disconnect."""

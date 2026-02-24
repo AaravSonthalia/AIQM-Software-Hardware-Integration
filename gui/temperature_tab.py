@@ -2,11 +2,16 @@
 Temperature monitoring tab widget.
 """
 
+import time
+from collections import deque
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QGroupBox,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
+
+import pyqtgraph as pg
 
 from gui.state import TemperatureState
 from gui.action_logger import ActionLogger
@@ -21,6 +26,12 @@ class TemperatureTab(QWidget):
     def __init__(self, action_logger: ActionLogger, parent=None):
         super().__init__(parent)
         self.action_logger = action_logger
+
+        # Live plot buffers
+        self.temp_start = time.time()
+        self.temp_time = deque(maxlen=240)
+        self.temp_tc = deque(maxlen=240)
+        self.temp_cj = deque(maxlen=240)
 
         self._build_ui()
 
@@ -63,6 +74,22 @@ class TemperatureTab(QWidget):
 
         layout.addWidget(temp_group)
 
+        # Temperature trend plot
+        trend_group = QGroupBox("Temperature Trend")
+        trend_layout = QVBoxLayout(trend_group)
+        trend_layout.setContentsMargins(4, 4, 4, 4)
+
+        self.temp_plot = pg.PlotWidget()
+        self.temp_plot.setLabel("left", "Temperature", "C")
+        self.temp_plot.setLabel("bottom", "Time", "s")
+        self.temp_plot.addLegend()
+        self.temp_plot.showGrid(x=True, y=True)
+        self.tc_curve = self.temp_plot.plot(pen=pg.mkPen("r", width=2), name="Thermocouple")
+        self.cj_curve = self.temp_plot.plot(pen=pg.mkPen("b", width=2), name="Cold Junction")
+
+        trend_layout.addWidget(self.temp_plot)
+        layout.addWidget(trend_group)
+
         layout.addStretch()
 
     def _on_connect_clicked(self):
@@ -89,6 +116,16 @@ class TemperatureTab(QWidget):
         self.cj_label.setText(f"Cold Junction: {state.cold_junction:.2f} {state.unit}")
         self.channel_label.setText(f"Channel: {state.channel}")
         self.device_label.setText(f"Device: {state.device_info}")
+
+        # Update live plot
+        now = time.time() - self.temp_start
+        self.temp_time.append(now)
+        self.temp_tc.append(state.temperature)
+        self.temp_cj.append(state.cold_junction)
+
+        t = list(self.temp_time)
+        self.tc_curve.setData(t, list(self.temp_tc))
+        self.cj_curve.setData(t, list(self.temp_cj))
 
     def on_disconnected(self):
         """Reset UI on disconnect."""

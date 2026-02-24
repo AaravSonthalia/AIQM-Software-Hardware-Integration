@@ -16,6 +16,7 @@ from gui.power_supply_tab import PowerSupplyTab
 from gui.temperature_tab import TemperatureTab
 from gui.dashboard_tab import DashboardTab
 from gui.visuals_tab import VisualsTab
+from gui.config_tab import ConfigTab
 from gui.action_log_tab import ActionLogTab
 
 
@@ -56,12 +57,14 @@ class MainWindow(QMainWindow):
         self.temp_tab = TemperatureTab(self.action_logger)
         self.dashboard_tab = DashboardTab()
         self.visuals_tab = VisualsTab()
+        self.config_tab = ConfigTab(self.action_logger)
         self.log_tab = ActionLogTab(self.action_logger)
 
         self.tabs.addTab(self.psu_tab, "Power Supply")
         self.tabs.addTab(self.temp_tab, "Temperature")
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
         self.tabs.addTab(self.visuals_tab, "Visuals")
+        self.tabs.addTab(self.config_tab, "Config")
         self.tabs.addTab(self.log_tab, "Action Log")
 
         main_layout.addWidget(self.tabs)
@@ -95,7 +98,9 @@ class MainWindow(QMainWindow):
             self.resource, idn = supplies[0]
             self.statusBar().showMessage(f"Found: {idn}")
 
-        self.psu_worker = PowerSupplyWorker(self.resource)
+        self.psu_worker = PowerSupplyWorker(
+            self.resource, poll_interval=self.config_tab.psu_poll_interval
+        )
         self.psu_worker.state_updated.connect(self._on_psu_state)
         self.psu_worker.start()
         self.psu_tab.status_label.setText("Connecting...")
@@ -124,7 +129,9 @@ class MainWindow(QMainWindow):
         if self.thermo_worker and self.thermo_worker.isRunning():
             return
 
-        self.thermo_worker = ThermocoupleWorker()
+        self.thermo_worker = ThermocoupleWorker(
+            poll_interval=self.config_tab.tc_poll_interval
+        )
         self.thermo_worker.state_updated.connect(self._on_temp_state)
         self.thermo_worker.start()
         self.temp_tab.status_label.setText("Connecting...")

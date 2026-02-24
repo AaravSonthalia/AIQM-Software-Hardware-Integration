@@ -16,9 +16,10 @@ class PowerSupplyWorker(QThread):
 
     state_updated = pyqtSignal(PowerSupplyState)
 
-    def __init__(self, resource: str):
+    def __init__(self, resource: str, poll_interval: float = 0.5):
         super().__init__()
         self.resource = resource
+        self.poll_interval = poll_interval
         self.psu: Optional[OWONPowerSupply] = None
         self.running = False
         self._command_queue = []
@@ -64,7 +65,7 @@ class PowerSupplyWorker(QThread):
                 state.error = str(e)
 
             self.state_updated.emit(state)
-            time.sleep(0.5)  # 2 Hz update rate
+            time.sleep(self.poll_interval)
 
         # Cleanup
         if self.psu:
@@ -112,9 +113,10 @@ class ThermocoupleWorker(QThread):
 
     state_updated = pyqtSignal(TemperatureState)
 
-    def __init__(self, port: Optional[str] = None):
+    def __init__(self, port: Optional[str] = None, poll_interval: float = 0.5):
         super().__init__()
         self.port = port
+        self.poll_interval = poll_interval
         self.running = False
         self._sensor = None
 
@@ -188,7 +190,7 @@ class ThermocoupleWorker(QThread):
                 state.error = str(e)
                 self.state_updated.emit(state)
 
-            time.sleep(0.5)
+            time.sleep(self.poll_interval)
 
         # Cleanup
         if self._sensor:
