@@ -61,7 +61,7 @@ class MainWindow(QMainWindow):
         self.visuals_tab = VisualsTab()
         self.config_tab = ConfigTab(self.action_logger)
         self.pid_controller = PIDController(self.action_logger)
-        self.pid_tab = PIDTab(self.pid_controller)
+        self.pid_tab = PIDTab(self.pid_controller, self.config_tab)
         self.log_tab = ActionLogTab(self.action_logger)
 
         self.tabs.addTab(self.psu_tab, "Power Supply")

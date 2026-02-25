@@ -33,9 +33,10 @@ class PIDTab(QWidget):
 
     emergency_stop_requested = pyqtSignal()
 
-    def __init__(self, pid_controller: PIDController, parent=None):
+    def __init__(self, pid_controller: PIDController, config_tab, parent=None):
         super().__init__(parent)
         self.pid_controller = pid_controller
+        self._config_tab = config_tab
         self._build_ui()
         self.pid_controller.pid_state_updated.connect(self._on_pid_state)
         self._update_button_states("IDLE")
@@ -157,9 +158,21 @@ class PIDTab(QWidget):
         self.slew_spin.setDecimals(2)
         form.addRow("Slew rate:", self.slew_spin)
 
-        cutoff_label = QLabel(f"{HARD_CUTOFF_C:.0f} °C  (fixed)")
-        cutoff_label.setStyleSheet("color: #F44336; font-weight: bold;")
-        form.addRow("Hard cutoff:", cutoff_label)
+        cutoff_display = QLabel()
+        cutoff_display.setStyleSheet("color: #FF9800; font-weight: bold;")
+        cutoff_display.setToolTip("Configured in the Config tab → Safety section.")
+
+        def _refresh_cutoff():
+            cutoff_display.setText(
+                f"{self._config_tab.hard_cutoff_c:.1f} °C  (set in Config tab)"
+            )
+
+        # Update the display whenever the spinbox in Config tab changes
+        self._config_tab.hard_cutoff_spin.valueChanged.connect(
+            lambda _: _refresh_cutoff()
+        )
+        _refresh_cutoff()
+        form.addRow("Hard cutoff:", cutoff_display)
 
         return group
 
@@ -389,4 +402,5 @@ class PIDTab(QWidget):
             threshold_t1=self.t1_spin.value(),
             threshold_t2=self.t2_spin.value(),
             interp_band_c=self.interp_spin.value(),
+            hard_cutoff_c=self._config_tab.hard_cutoff_c,
         )

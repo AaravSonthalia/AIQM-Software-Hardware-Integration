@@ -23,7 +23,7 @@ from gui.state import PowerSupplyState, TemperatureState
 from gui.action_logger import ActionLogger
 
 
-HARD_CUTOFF_C: float = 300.0  # absolute maximum — emergency stop if reached
+HARD_CUTOFF_C: float = 300.0  # absolute system ceiling — Config tab cannot exceed this
 
 
 # ------------------------------------------------------------------
@@ -49,6 +49,7 @@ class PIDConfig:
     threshold_t1: float         # °C — Band 1 → Band 2 crossover
     threshold_t2: float         # °C — Band 2 → Band 3 crossover
     interp_band_c: float        # °C — width of smooth transition zone
+    hard_cutoff_c: float = 150.0  # °C — emergency stop if temperature reaches this
 
 
 # ------------------------------------------------------------------
@@ -176,10 +177,11 @@ class PIDController(QObject):
         """Validate config and transition to ARMED."""
         if self._run_state.controller_state == "RUNNING":
             return
-        if config.target_c >= HARD_CUTOFF_C:
+        effective_cutoff = min(config.hard_cutoff_c, HARD_CUTOFF_C)
+        if config.target_c >= effective_cutoff:
             self._fault(
                 f"Target {config.target_c:.1f} °C is at or above the "
-                f"hard cutoff ({HARD_CUTOFF_C:.0f} °C)"
+                f"configured hard cutoff ({effective_cutoff:.1f} °C)"
             )
             return
         if config.threshold_t1 >= config.threshold_t2:
@@ -300,10 +302,11 @@ class PIDController(QObject):
         self._last_tick = now
         temp_c = state.temperature
 
-        # Hard cutoff
-        if temp_c >= HARD_CUTOFF_C:
+        # Hard cutoff — use the configured value, capped at the system ceiling
+        effective_cutoff = min(self._config.hard_cutoff_c, HARD_CUTOFF_C)
+        if temp_c >= effective_cutoff:
             self._fault(
-                f"Hard cutoff reached: {temp_c:.2f} °C ≥ {HARD_CUTOFF_C:.0f} °C",
+                f"Hard cutoff reached: {temp_c:.2f} °C ≥ {effective_cutoff:.1f} °C",
                 emergency=True,
             )
             return

@@ -40,6 +40,10 @@ class ConfigTab(QWidget):
     def tc_poll_interval(self) -> float:
         return self.tc_poll_spin.value()
 
+    @property
+    def hard_cutoff_c(self) -> float:
+        return self.hard_cutoff_spin.value()
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
@@ -51,6 +55,7 @@ class ConfigTab(QWidget):
         layout.addWidget(self._build_recording_group())
         layout.addWidget(self._build_export_group())
         layout.addWidget(self._build_polling_group())
+        layout.addWidget(self._build_safety_group())
         layout.addStretch()
 
     def _build_recording_group(self) -> QGroupBox:
@@ -125,6 +130,28 @@ class ConfigTab(QWidget):
 
         note = QLabel("Changes take effect on next connect.")
         note.setStyleSheet("color: gray; font-style: italic;")
+        form.addRow("", note)
+
+        return group
+
+    def _build_safety_group(self) -> QGroupBox:
+        group = QGroupBox("Safety")
+        form = QFormLayout(group)
+
+        self.hard_cutoff_spin = QDoubleSpinBox()
+        self.hard_cutoff_spin.setRange(20.0, 300.0)
+        self.hard_cutoff_spin.setValue(150.0)
+        self.hard_cutoff_spin.setSingleStep(5.0)
+        self.hard_cutoff_spin.setDecimals(1)
+        self.hard_cutoff_spin.setSuffix(" °C")
+        form.addRow("PID hard cutoff:", self.hard_cutoff_spin)
+
+        note = QLabel(
+            "If the thermocouple reads at or above this temperature during a PID run,\n"
+            "the controller triggers an emergency stop immediately.\n"
+            "Keep this low while the heater is unenclosed."
+        )
+        note.setStyleSheet("color: #FF9800; font-style: italic;")
         form.addRow("", note)
 
         return group
