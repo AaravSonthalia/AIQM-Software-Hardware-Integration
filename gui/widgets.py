@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QFrame, QVBoxLayout, QGridLayout, QLabel, QPushButton,
     QGroupBox, QDoubleSpinBox,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
 from gui.state import PowerSupplyState
@@ -90,6 +90,13 @@ class ControlPanel(QGroupBox):
         self._update_output_button(False)
         layout.addWidget(self.output_btn, 2, 0, 1, 3)
 
+        # Prevents the poll loop from fighting the button for 2 s after a click
+        self._output_pending = False
+        self._pending_timer = QTimer(self)
+        self._pending_timer.setSingleShot(True)
+        self._pending_timer.setInterval(2000)
+        self._pending_timer.timeout.connect(self._clear_output_pending)
+
     def _on_voltage_set(self):
         self.voltage_changed.emit(self.voltage_spin.value())
 
@@ -98,7 +105,13 @@ class ControlPanel(QGroupBox):
 
     def _on_output_toggle(self):
         enabled = self.output_btn.isChecked()
+        self._output_pending = True
+        self._pending_timer.start()
+        self._update_output_button(enabled)
         self.output_toggled.emit(enabled)
+
+    def _clear_output_pending(self):
+        self._output_pending = False
 
     def _update_output_button(self, enabled: bool):
         if enabled:
@@ -112,8 +125,14 @@ class ControlPanel(QGroupBox):
 
     def update_state(self, state: PowerSupplyState):
         """Update controls to reflect current state."""
-        self.output_btn.setChecked(state.output_enabled)
-        self._update_output_button(state.output_enabled)
+        if self._output_pending:
+            # Hardware has caught up — stop blocking updates
+            if state.output_enabled == self.output_btn.isChecked():
+                self._pending_timer.stop()
+                self._output_pending = False
+        else:
+            self.output_btn.setChecked(state.output_enabled)
+            self._update_output_button(state.output_enabled)
 
 
 class ProtectionPanel(QGroupBox):

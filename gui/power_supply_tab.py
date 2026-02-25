@@ -216,7 +216,9 @@ class PowerSupplyTab(QWidget):
             self.status_label.setText(f"Error: {state.error}")
             return
 
-        self.status_label.setText("Connected")
+        self.status_label.setText(
+            f"Connected  ⚠ {state.error}" if state.error else "Connected"
+        )
         self.connect_btn.setText("Disconnect")
 
         # Update displays

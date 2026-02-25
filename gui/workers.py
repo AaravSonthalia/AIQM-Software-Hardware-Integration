@@ -75,29 +75,27 @@ class PowerSupplyWorker(QThread):
                 pass
 
     def _execute_command(self, cmd: str, args: tuple):
-        """Execute a command on the power supply."""
+        """Execute a command on the power supply. Raises on failure so the
+        caller can surface the error through state.error."""
         if not self.psu:
             return
 
-        try:
-            if cmd == "set_voltage":
-                self.psu.set_voltage(args[0])
-            elif cmd == "set_current":
-                self.psu.set_current(args[0])
-            elif cmd == "output_on":
-                self.psu.output_on()
-            elif cmd == "output_off":
-                self.psu.output_off()
-            elif cmd == "set_ovp":
-                self.psu.set_ovp(args[0])
-            elif cmd == "set_ocp":
-                self.psu.set_ocp(args[0])
-            elif cmd == "emergency_stop":
-                self.psu.output_off()
-                self.psu.set_voltage(0)
-                self.psu.set_current(0)
-        except Exception as e:
-            print(f"Command error: {e}")
+        if cmd == "set_voltage":
+            self.psu.set_voltage(args[0])
+        elif cmd == "set_current":
+            self.psu.set_current(args[0])
+        elif cmd == "output_on":
+            self.psu.output_on()
+        elif cmd == "output_off":
+            self.psu.output_off()
+        elif cmd == "set_ovp":
+            self.psu.set_ovp(args[0])
+        elif cmd == "set_ocp":
+            self.psu.set_ocp(args[0])
+        elif cmd == "emergency_stop":
+            self.psu.output_off()
+            self.psu.set_voltage(0)
+            self.psu.set_current(0)
 
     def queue_command(self, cmd: str, *args):
         """Queue a command for execution."""
