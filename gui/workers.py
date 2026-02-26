@@ -6,6 +6,7 @@ import time
 from typing import Optional
 
 from PyQt6.QtCore import QThread, pyqtSignal
+import pyvisa
 
 from gui.state import PowerSupplyState, TemperatureState
 from owon_power_supply import OWONPowerSupply
@@ -23,6 +24,8 @@ class PowerSupplyWorker(QThread):
         self.psu: Optional[OWONPowerSupply] = None
         self.running = False
         self._command_queue = []
+        self._consecutive_failures = 0
+        self._poll_counter = 0
 
     def run(self):
         """Main worker loop."""
@@ -48,21 +51,37 @@ class PowerSupplyWorker(QThread):
                     cmd, args = self._command_queue.pop(0)
                     self._execute_command(cmd, args)
 
-                # Read current state
+                # Read high-rate telemetry each cycle
                 v, i, p = self.psu.measure_all()
                 state.voltage_measured = v
                 state.current_measured = i
                 state.power_measured = p
-                state.voltage_setpoint = self.psu.get_voltage_setpoint()
-                state.current_setpoint = self.psu.get_current_setpoint()
                 state.output_enabled = self.psu.get_output_state()
-                state.ovp_limit = self.psu.get_ovp()
-                state.ocp_limit = self.psu.get_ocp()
+
+                # Read slower-moving values less frequently to reduce bus load
+                if self._poll_counter % 5 == 0:
+                    state.voltage_setpoint = self.psu.get_voltage_setpoint()
+                    state.current_setpoint = self.psu.get_current_setpoint()
+                    state.ovp_limit = self.psu.get_ovp()
+                    state.ocp_limit = self.psu.get_ocp()
+
+                self._poll_counter += 1
                 state.connected = True
                 state.error = ""
+                self._consecutive_failures = 0
 
             except Exception as e:
                 state.error = str(e)
+                self._consecutive_failures += 1
+
+                # If repeated VISA timeouts happen, force reconnect path
+                if self._is_timeout_error(e) and self._consecutive_failures >= 3:
+                    state.connected = False
+                    if self._reconnect():
+                        state.connected = True
+                        state.error = ""
+                        self._consecutive_failures = 0
+                        self._poll_counter = 0
 
             self.state_updated.emit(state)
             time.sleep(self.poll_interval)
@@ -73,6 +92,26 @@ class PowerSupplyWorker(QThread):
                 self.psu.disconnect()
             except Exception:
                 pass
+
+    def _is_timeout_error(self, exc: Exception) -> bool:
+        """Return True if exception is a VISA timeout."""
+        if isinstance(exc, pyvisa.errors.VisaIOError):
+            return exc.error_code == pyvisa.constants.VI_ERROR_TMO
+        return "VI_ERROR_TMO" in str(exc)
+
+    def _reconnect(self) -> bool:
+        """Attempt to re-establish PSU connection after repeated failures."""
+        try:
+            if self.psu:
+                try:
+                    self.psu.disconnect()
+                except Exception:
+                    pass
+            self.psu = OWONPowerSupply(self.resource)
+            self.psu.connect()
+            return True
+        except Exception:
+            return False
 
     def _execute_command(self, cmd: str, args: tuple):
         """Execute a command on the power supply. Raises on failure so the

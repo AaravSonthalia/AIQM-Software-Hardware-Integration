@@ -132,7 +132,7 @@ class SCPIDevice:
         """
         return self.query("SYST:ERR?")
 
-    def check_errors(self) -> list[str]:
+    def check_errors(self, max_reads: int = 20) -> list[str]:
         """
         Read all errors from the error queue.
 
@@ -140,11 +140,31 @@ class SCPIDevice:
             List of error strings
         """
         errors = []
-        while True:
-            error = self.get_error()
-            if error.startswith("0,") or error.startswith("+0,"):
+        seen = set()
+
+        for _ in range(max_reads):
+            error = self.get_error().strip()
+
+            # Different instruments format "no error" differently.
+            compact = error.replace(" ", "")
+            if (
+                compact.startswith("0,")
+                or compact.startswith("+0,")
+                or compact == "0"
+                or compact == "+0"
+                or compact == "0x0000"
+                or compact == "+0x0000"
+                or "no error" in error.lower()
+            ):
                 break
+
             errors.append(error)
+
+            # Guard against instruments that keep returning the same entry.
+            if error in seen:
+                break
+            seen.add(error)
+
         return errors
 
     def __enter__(self):
