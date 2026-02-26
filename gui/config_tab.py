@@ -140,7 +140,7 @@ class ConfigTab(QWidget):
 
         self.hard_cutoff_spin = QDoubleSpinBox()
         self.hard_cutoff_spin.setRange(20.0, 300.0)
-        self.hard_cutoff_spin.setValue(150.0)
+        self.hard_cutoff_spin.setValue(75.0)
         self.hard_cutoff_spin.setSingleStep(5.0)
         self.hard_cutoff_spin.setDecimals(1)
         self.hard_cutoff_spin.setSuffix(" °C")

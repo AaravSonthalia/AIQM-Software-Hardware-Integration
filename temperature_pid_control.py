@@ -208,7 +208,7 @@ def parse_args() -> argparse.Namespace:
         help="Max output voltage change rate in V/s",
     )
 
-    parser.add_argument("--max-temp-hard", type=float, default=180.0, help="Hard over-temp cutoff in C")
+    parser.add_argument("--max-temp-hard", type=float, default=75.0, help="Hard over-temp cutoff in C")
     parser.add_argument("--min-temp-valid", type=float, default=-50.0, help="Minimum valid sensor value")
     parser.add_argument("--max-temp-valid", type=float, default=400.0, help="Maximum valid sensor value")
     parser.add_argument(
@@ -253,13 +253,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--high-temp-threshold",
         type=float,
-        default=890.0,
+        default=120.0,
         help="Above this temperature, auto-reduce output slew rate",
     )
     parser.add_argument(
         "--high-temp-max-voltage-step",
         type=float,
-        default=0.25,
+        default=0.5,
         help="Reduced output slew rate (V/s) when above high-temp threshold",
     )
 
@@ -268,18 +268,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable temperature-dependent PID gains",
     )
-    parser.add_argument("--pid-threshold-1", type=float, default=400.0, help="Gain schedule threshold 1 (C)")
-    parser.add_argument("--pid-threshold-2", type=float, default=750.0, help="Gain schedule threshold 2 (C)")
-    parser.add_argument("--pid-ramp-band", type=float, default=100.0, help="Gain interpolation band width (C)")
-    parser.add_argument("--p-low", type=float, default=62.0, help="Gain schedule low-temp P")
-    parser.add_argument("--i-low", type=float, default=136.0, help="Gain schedule low-temp I")
-    parser.add_argument("--d-low", type=float, default=23.0, help="Gain schedule low-temp D")
-    parser.add_argument("--p-mid", type=float, default=76.0, help="Gain schedule mid-temp P")
-    parser.add_argument("--i-mid", type=float, default=49.0, help="Gain schedule mid-temp I")
-    parser.add_argument("--d-mid", type=float, default=8.0, help="Gain schedule mid-temp D")
-    parser.add_argument("--p-high", type=float, default=183.0, help="Gain schedule high-temp P")
-    parser.add_argument("--i-high", type=float, default=30.0, help="Gain schedule high-temp I")
-    parser.add_argument("--d-high", type=float, default=5.0, help="Gain schedule high-temp D")
+    parser.add_argument("--pid-threshold-1", type=float, default=60.0, help="Gain schedule threshold 1 (C) — Band 1/2 boundary")
+    parser.add_argument("--pid-threshold-2", type=float, default=110.0, help="Gain schedule threshold 2 (C) — Band 2/3 boundary")
+    parser.add_argument("--pid-ramp-band", type=float, default=10.0, help="Gain interpolation band width (C)")
+    parser.add_argument("--p-low", type=float, default=1.0, help="Gain schedule low-temp P (Band 1: T < threshold-1)")
+    parser.add_argument("--i-low", type=float, default=0.02, help="Gain schedule low-temp I")
+    parser.add_argument("--d-low", type=float, default=0.0, help="Gain schedule low-temp D")
+    parser.add_argument("--p-mid", type=float, default=1.0, help="Gain schedule mid-temp P (Band 2: threshold-1 to threshold-2)")
+    parser.add_argument("--i-mid", type=float, default=0.02, help="Gain schedule mid-temp I")
+    parser.add_argument("--d-mid", type=float, default=0.0, help="Gain schedule mid-temp D")
+    parser.add_argument("--p-high", type=float, default=1.0, help="Gain schedule high-temp P (Band 3: T > threshold-2)")
+    parser.add_argument("--i-high", type=float, default=0.02, help="Gain schedule high-temp I")
+    parser.add_argument("--d-high", type=float, default=0.0, help="Gain schedule high-temp D")
 
     parser.add_argument("--owon-port", help="OWON serial port path (ex: /dev/tty.usbserial-XXXX)")
     parser.add_argument("--dracal-port", help="Dracal serial port path (ex: /dev/tty.usbmodemXXXX)")
