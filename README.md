@@ -7,10 +7,13 @@ Python tools for integrating hardware used in AI-driven MBE process control.
 - `SCPI_class.py`: Base SCPI communication wrapper (PyVISA).
 - `owon_power_supply.py`: OWON SPE power supply interface.
 - `owon_data_logger.py`: OWON voltage/current/power CSV logger.
-- `owon_self_test.py`: OWON communication and safety test script.
+- `scripts/`: CLI workflows (`heater_step_test.py`, `psu_diagnostic.py`, `owon_self_test.py`, `analyze_step_test.py`).
 - `dracal_thermocouple_reader.py`: Dracal thermocouple reader (VCP mode).
 - `temperature_pid_control.py`: simple PID loop using OWON + Dracal.
 - `gui.py`: GUI entry point (work in progress).
+
+Root launchers are kept for compatibility, so existing commands like
+`python heater_step_test.py ...` still work.
 
 ## Setup
 
