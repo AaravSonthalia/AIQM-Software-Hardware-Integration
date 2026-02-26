@@ -152,6 +152,8 @@ class SCPIDevice:
                 or compact.startswith("+0,")
                 or compact == "0"
                 or compact == "+0"
+                or compact == "0x0000"
+                or compact == "+0x0000"
                 or "no error" in error.lower()
             ):
                 break
