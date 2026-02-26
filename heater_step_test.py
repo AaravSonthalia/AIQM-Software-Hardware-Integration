@@ -143,12 +143,15 @@ def resolve_dracal(port: Optional[str]) -> str:
 
 def safe_shutdown(psu: OWONPowerSupply, reason: str) -> None:
     print(f"\n[SHUTDOWN] {reason}")
-    try:
-        psu.set_voltage(0.0)
-        psu.output_off()
-        psu.set_local()  # return front-panel control to the user
-    except Exception as exc:
-        print(f"[SHUTDOWN] Warning — PSU command failed: {exc}")
+    for cmd, label in [
+        (lambda: psu.set_voltage(0.0), "set voltage 0"),
+        (lambda: psu.output_off(),     "output off"),
+        (lambda: psu.set_local(),      "set local"),   # always attempt — unlocks front panel
+    ]:
+        try:
+            cmd()
+        except Exception as exc:
+            print(f"[SHUTDOWN] Warning — '{label}' failed: {exc}")
 
 
 # ------------------------------------------------------------------
