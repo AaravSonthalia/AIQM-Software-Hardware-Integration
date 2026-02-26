@@ -214,9 +214,9 @@ def run_step_test(args: argparse.Namespace) -> int:
             )
             return 1
 
-        # Safe initial state
+        # Safe initial state — enable output first, then zero voltage.
+        # Some OWON units refuse OUTP ON when setpoint is 0 V.
         psu.set_current(current_limit)
-        psu.set_voltage(0.0)
         psu.output_on()
         time.sleep(1.0)  # let PSU finish processing burst of writes before first query
 
@@ -225,6 +225,9 @@ def run_step_test(args: argparse.Namespace) -> int:
                 "PSU output did not turn on after OUTP ON command. "
                 "Check front panel for OVP/OCP/OTP fault indicators."
             )
+
+        psu.set_voltage(0.0)  # now safe to zero — output is confirmed on
+        time.sleep(0.5)
 
         print(f"\nOutput ON at 0 V.  Starting step sequence...\n")
         print(
