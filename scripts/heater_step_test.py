@@ -56,6 +56,11 @@ DEFAULT_MAX_TEMP_C = 75.0
 DEFAULT_CURRENT_LIMIT_A = 1.0
 DEFAULT_COOLDOWN_S = 60.0
 
+# No-heat detector: warn if temperature hasn't risen by this many °C within
+# this many seconds of a step starting.  Catches TC contact problems early.
+NO_HEAT_CHECK_S = 60.0
+NO_HEAT_MIN_RISE_C = 1.0
+
 
 # ------------------------------------------------------------------
 # CSV logger
@@ -149,12 +154,15 @@ def resolve_dracal(port: Optional[str]) -> str:
 
 def safe_shutdown(psu: OWONPowerSupply, reason: str) -> None:
     print(f"\n[SHUTDOWN] {reason}")
-    try:
-        psu.set_voltage(0.0)
-        psu.output_off()
-        psu.set_local()  # return front-panel control to the user
-    except Exception as exc:
-        print(f"[SHUTDOWN] Warning — PSU command failed: {exc}")
+    for cmd, label in [
+        (lambda: psu.set_voltage(0.0), "set voltage 0"),
+        (lambda: psu.output_off(),     "output off"),
+        (lambda: psu.set_local(),      "set local"),
+    ]:
+        try:
+            cmd()
+        except Exception as exc:
+            print(f"[SHUTDOWN] Warning — '{label}' failed: {exc}")
 
 
 # ------------------------------------------------------------------
@@ -212,6 +220,14 @@ def run_step_test(args: argparse.Namespace) -> int:
         initial_temp = sensor.read_temperature()
         initial_cj = sensor.read_cold_junction()
         print(f"  T = {initial_temp:.2f} °C  |  CJ = {initial_cj:.2f} °C")
+
+        # TC sanity check: reading should be plausible for a room-temperature start.
+        if not (10.0 <= initial_temp <= 45.0):
+            print(
+                f"\n[WARNING] Initial TC reading ({initial_temp:.2f} °C) is outside the "
+                "expected room-temperature range (10–45 °C). "
+                "Check thermocouple connection and placement before proceeding."
+            )
 
         if initial_temp >= max_temp:
             print(
@@ -281,6 +297,8 @@ def run_step_test(args: argparse.Namespace) -> int:
                     )
 
             step_start = time.time()
+            step_t0 = sensor.read_temperature()  # temperature at step start
+            no_heat_warned = False
             sample_count = 0
 
             while True:
@@ -301,6 +319,21 @@ def run_step_test(args: argparse.Namespace) -> int:
                     f"{setpoint_v:5.1f}V  {v:6.3f}V  {i:6.4f}A  {p:6.3f}W  "
                     f"{temp:7.2f}°C  {cj:7.2f}°C"
                 )
+
+                # No-heat detector: warn if temperature hasn't risen after
+                # NO_HEAT_CHECK_S seconds.  Likely cause: TC not in contact.
+                if (
+                    not no_heat_warned
+                    and elapsed_step >= NO_HEAT_CHECK_S
+                    and (temp - step_t0) < NO_HEAT_MIN_RISE_C
+                ):
+                    print(
+                        f"\n  [WARNING] {NO_HEAT_CHECK_S:.0f}s elapsed at {setpoint_v:.1f} V "
+                        f"but temperature has not risen by {NO_HEAT_MIN_RISE_C:.1f} °C "
+                        f"(ΔT = {temp - step_t0:+.2f} °C). "
+                        "Check thermocouple contact with heater — press Ctrl+C to abort.\n"
+                    )
+                    no_heat_warned = True
 
                 # Hard cutoff
                 if temp >= max_temp:
