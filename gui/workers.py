@@ -5,10 +5,11 @@ Background worker threads for instrument communication.
 import time
 from typing import Optional
 
+import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 import pyvisa
 
-from gui.state import PowerSupplyState, TemperatureState
+from gui.state import PowerSupplyState, TemperatureState, CameraState, PyrometerState
 from owon_power_supply import OWONPowerSupply
 
 
@@ -237,5 +238,167 @@ class ThermocoupleWorker(QThread):
                 pass
 
     def stop(self):
-        """Stop the worker thread."""
+        """Stop the thermocouple worker thread."""
+        self.running = False
+
+
+class RheedCameraWorker(QThread):
+    """Background thread for RHEED camera frame acquisition."""
+
+    state_updated = pyqtSignal(CameraState)
+
+    def __init__(self, mode: str = "dummy", poll_interval: float = 1.0):
+        super().__init__()
+        self.mode = mode
+        self.poll_interval = poll_interval
+        self.running = False
+        self._camera = None
+
+    def run(self):
+        """Main worker loop — connect camera and emit frames."""
+        self.running = True
+        state = CameraState(mode=self.mode)
+
+        # Create camera driver based on mode
+        try:
+            self._camera = self._create_camera()
+            self._camera.connect()
+            state.connected = True
+        except Exception as e:
+            state.connected = False
+            state.error = str(e)
+            self.state_updated.emit(state)
+            return
+
+        frame_count = 0
+        fps_start = time.time()
+        fps_frame_count = 0
+
+        while self.running:
+            try:
+                frame = self._camera.read_frame()
+                frame_count += 1
+                fps_frame_count += 1
+
+                # Compute FPS over a rolling 1-second window
+                elapsed = time.time() - fps_start
+                if elapsed >= 1.0:
+                    state.fps = fps_frame_count / elapsed
+                    fps_start = time.time()
+                    fps_frame_count = 0
+
+                state.frame = frame
+                state.frame_number = frame_count
+                state.height, state.width = frame.shape[:2]
+                state.connected = True
+                state.error = ""
+
+            except Exception as e:
+                state.error = str(e)
+                state.frame = None
+
+            self.state_updated.emit(state)
+            time.sleep(self.poll_interval)
+
+        # Cleanup
+        if self._camera is not None:
+            try:
+                self._camera.disconnect()
+            except Exception:
+                pass
+
+    def _create_camera(self):
+        """Factory method — import and instantiate camera driver."""
+        if self.mode == "direct":
+            from drivers.rheed_camera import VmbCamera
+            return VmbCamera()
+        elif self.mode == "screengrab":
+            from drivers.rheed_camera import ScreenGrabCamera
+            return ScreenGrabCamera()
+        else:
+            from drivers.rheed_camera import DummyCamera
+            return DummyCamera()
+
+    def stop(self):
+        """Stop the camera worker thread."""
+        self.running = False
+
+
+class PyrometerWorker(QThread):
+    """Background thread for pyrometer temperature polling."""
+
+    state_updated = pyqtSignal(PyrometerState)
+
+    def __init__(self, mode: str = "dummy", poll_interval: float = 0.5):
+        super().__init__()
+        self.mode = mode
+        self.poll_interval = poll_interval
+        self.running = False
+        self._sensor = None
+
+    def run(self):
+        """Main worker loop — connect pyrometer and emit temperatures."""
+        self.running = True
+        state = PyrometerState(mode=self.mode)
+
+        try:
+            self._sensor = self._create_sensor()
+            self._sensor.connect()
+            state.connected = True
+
+            # Get device info if available
+            if hasattr(self._sensor, "get_info"):
+                try:
+                    info = self._sensor.get_info()
+                    parts = []
+                    if "name" in info:
+                        parts.append(info["name"])
+                    if "serial" in info:
+                        parts.append(f"S/N: {info['serial']}")
+                    state.device_info = " | ".join(parts) if parts else self.mode
+                except Exception:
+                    state.device_info = self.mode
+            else:
+                state.device_info = self.mode
+
+            self.state_updated.emit(state)
+
+        except Exception as e:
+            state.connected = False
+            state.error = str(e)
+            self.state_updated.emit(state)
+            return
+
+        while self.running:
+            try:
+                state.temperature = self._sensor.read_temperature()
+                state.connected = True
+                state.error = ""
+            except Exception as e:
+                state.error = str(e)
+
+            self.state_updated.emit(state)
+            time.sleep(self.poll_interval)
+
+        # Cleanup
+        if self._sensor is not None:
+            try:
+                self._sensor.disconnect()
+            except Exception:
+                pass
+
+    def _create_sensor(self):
+        """Factory method — import and instantiate pyrometer driver."""
+        if self.mode == "modbus":
+            from drivers.pyrometer import ModbusPyrometer
+            return ModbusPyrometer()
+        elif self.mode == "screengrab":
+            from drivers.pyrometer import ScreenGrabPyrometer
+            return ScreenGrabPyrometer()
+        else:
+            from drivers.pyrometer import DummyPyrometer
+            return DummyPyrometer()
+
+    def stop(self):
+        """Stop the pyrometer worker thread."""
         self.running = False

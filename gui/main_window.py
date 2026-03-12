@@ -9,8 +9,11 @@ from PyQt6.QtCore import pyqtSlot
 
 from owon_power_supply import find_owon_supplies
 
-from gui.state import PowerSupplyState, TemperatureState
-from gui.workers import PowerSupplyWorker, ThermocoupleWorker
+from gui.state import PowerSupplyState, TemperatureState, CameraState, PyrometerState
+from gui.workers import (
+    PowerSupplyWorker, ThermocoupleWorker,
+    RheedCameraWorker, PyrometerWorker,
+)
 from gui.action_logger import ActionLogger
 from gui.power_supply_tab import PowerSupplyTab
 from gui.temperature_tab import TemperatureTab
@@ -20,6 +23,8 @@ from gui.config_tab import ConfigTab
 from gui.pid_controller import PIDController
 from gui.pid_tab import PIDTab
 from gui.action_log_tab import ActionLogTab
+from gui.rheed_tab import RheedTab
+from gui.pyrometer_tab import PyrometerTab
 
 
 class MainWindow(QMainWindow):
@@ -34,6 +39,8 @@ class MainWindow(QMainWindow):
         self.resource = resource
         self.psu_worker: Optional[PowerSupplyWorker] = None
         self.thermo_worker: Optional[ThermocoupleWorker] = None
+        self.camera_worker: Optional[RheedCameraWorker] = None
+        self.pyrometer_worker: Optional[PyrometerWorker] = None
 
         # Central logging service
         self.action_logger = ActionLogger(self)
@@ -57,6 +64,8 @@ class MainWindow(QMainWindow):
 
         self.psu_tab = PowerSupplyTab(self.action_logger)
         self.temp_tab = TemperatureTab(self.action_logger)
+        self.rheed_tab = RheedTab(self.action_logger)
+        self.pyrometer_tab = PyrometerTab(self.action_logger)
         self.dashboard_tab = DashboardTab()
         self.visuals_tab = VisualsTab()
         self.config_tab = ConfigTab(self.action_logger)
@@ -64,8 +73,10 @@ class MainWindow(QMainWindow):
         self.pid_tab = PIDTab(self.pid_controller, self.config_tab)
         self.log_tab = ActionLogTab(self.action_logger)
 
+        self.tabs.addTab(self.rheed_tab, "RHEED")
+        self.tabs.addTab(self.pyrometer_tab, "Pyrometer")
         self.tabs.addTab(self.psu_tab, "Power Supply")
-        self.tabs.addTab(self.temp_tab, "Temperature")
+        self.tabs.addTab(self.temp_tab, "Thermocouple")
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
         self.tabs.addTab(self.visuals_tab, "Visuals")
         self.tabs.addTab(self.config_tab, "Config")
@@ -87,6 +98,14 @@ class MainWindow(QMainWindow):
 
         # PID tab emergency stop → same path as PSU E-Stop button
         self.pid_tab.emergency_stop_requested.connect(self._on_pid_emergency_stop)
+
+        # RHEED camera tab signals
+        self.rheed_tab.connect_requested.connect(self._connect_camera)
+        self.rheed_tab.disconnect_requested.connect(self._disconnect_camera)
+
+        # Pyrometer tab signals
+        self.pyrometer_tab.connect_requested.connect(self._connect_pyrometer)
+        self.pyrometer_tab.disconnect_requested.connect(self._disconnect_pyrometer)
 
     # --- PSU worker lifecycle ---
 
@@ -163,6 +182,48 @@ class MainWindow(QMainWindow):
 
         self.temp_tab.on_disconnected()
 
+    # --- RHEED camera worker lifecycle ---
+
+    @pyqtSlot(str)
+    def _connect_camera(self, mode: str):
+        if self.camera_worker and self.camera_worker.isRunning():
+            return
+
+        self.camera_worker = RheedCameraWorker(mode=mode, poll_interval=1.0)
+        self.camera_worker.state_updated.connect(self._on_camera_state)
+        self.camera_worker.start()
+        self.rheed_tab.status_label.setText("Connecting...")
+
+    @pyqtSlot()
+    def _disconnect_camera(self):
+        if self.camera_worker:
+            self.camera_worker.stop()
+            self.camera_worker.wait()
+            self.camera_worker = None
+
+        self.rheed_tab.on_disconnected()
+
+    # --- Pyrometer worker lifecycle ---
+
+    @pyqtSlot(str)
+    def _connect_pyrometer(self, mode: str):
+        if self.pyrometer_worker and self.pyrometer_worker.isRunning():
+            return
+
+        self.pyrometer_worker = PyrometerWorker(mode=mode, poll_interval=0.5)
+        self.pyrometer_worker.state_updated.connect(self._on_pyrometer_state)
+        self.pyrometer_worker.start()
+        self.pyrometer_tab.status_label.setText("Connecting...")
+
+    @pyqtSlot()
+    def _disconnect_pyrometer(self):
+        if self.pyrometer_worker:
+            self.pyrometer_worker.stop()
+            self.pyrometer_worker.wait()
+            self.pyrometer_worker = None
+
+        self.pyrometer_tab.on_disconnected()
+
     # --- Signal fan-out ---
 
     @pyqtSlot(PowerSupplyState)
@@ -183,6 +244,16 @@ class MainWindow(QMainWindow):
         self.action_logger.update_temp_state(state)
         self.pid_controller.on_temp_state(state)
 
+    @pyqtSlot(CameraState)
+    def _on_camera_state(self, state: CameraState):
+        """Fan out RHEED camera state to consumers."""
+        self.rheed_tab.update_state(state)
+
+    @pyqtSlot(PyrometerState)
+    def _on_pyrometer_state(self, state: PyrometerState):
+        """Fan out pyrometer state to consumers."""
+        self.pyrometer_tab.update_state(state)
+
     # --- Shutdown ---
 
     def closeEvent(self, event):
@@ -190,4 +261,6 @@ class MainWindow(QMainWindow):
         self.pid_controller.emergency_stop()
         self._disconnect_from_psu()
         self._disconnect_thermocouple()
+        self._disconnect_camera()
+        self._disconnect_pyrometer()
         event.accept()

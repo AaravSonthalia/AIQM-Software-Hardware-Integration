@@ -37,6 +37,31 @@ class TemperatureState:
 
 
 @dataclass
+class CameraState:
+    """Current state of the RHEED camera."""
+    frame: Optional[object] = None  # numpy ndarray (H, W, 3) uint8; typed as object for signal compat
+    frame_number: int = 0
+    fps: float = 0.0
+    width: int = 0
+    height: int = 0
+    intensity: float = 0.0  # ROI mean intensity for oscillation tracking
+    connected: bool = False
+    error: str = ""
+    mode: str = ""  # "direct", "screengrab", or "dummy"
+
+
+@dataclass
+class PyrometerState:
+    """Current state of the pyrometer (separate from thermocouple)."""
+    temperature: float = 0.0
+    unit: str = "C"
+    connected: bool = False
+    error: str = ""
+    device_info: str = ""
+    mode: str = ""  # "modbus", "screengrab", or "dummy"
+
+
+@dataclass
 class ActionLogEntry:
     """A single entry in the action log."""
     timestamp: datetime = field(default_factory=datetime.now)
