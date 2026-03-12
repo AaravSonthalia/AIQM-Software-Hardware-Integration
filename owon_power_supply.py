@@ -17,7 +17,7 @@ class OWONPowerSupply(SCPIDevice):
 
     def __init__(
         self,
-        resource_name: str = "ASRL/dev/tty.usbserial-110::INSTR",
+        resource_name: str = "",
         timeout: int = 3000,
         baud_rate: int = DEFAULT_BAUD_RATE,
     ):
@@ -25,10 +25,21 @@ class OWONPowerSupply(SCPIDevice):
         Initialize connection to an OWON SPE power supply.
 
         Args:
-            resource_name: VISA resource string for serial port
+            resource_name: VISA resource string for serial port.
+                Mac:     "ASRL/dev/cu.usbserial-120::INSTR"
+                Windows: "ASRLCOM3::INSTR"
+                If empty, auto-detects via find_owon_supplies().
             timeout: Communication timeout in milliseconds
             baud_rate: Serial baud rate (default 115200)
         """
+        if not resource_name:
+            found = find_owon_supplies()
+            if found:
+                resource_name = found[0][0]
+            else:
+                raise RuntimeError(
+                    "No OWON power supply found. Specify resource_name manually."
+                )
         super().__init__(resource_name, timeout)
         self.baud_rate = baud_rate
 

@@ -75,6 +75,11 @@ class PyrometerTab(QWidget):
         self.temp_value_label.setStyleSheet("color: #FF6600;")  # orange for pyrometer
         temp_layout.addWidget(self.temp_value_label)
 
+        self.emissivity_label = QLabel("Emissivity: --")
+        self.emissivity_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.emissivity_label.setFont(QFont("Monospace", 14))
+        temp_layout.addWidget(self.emissivity_label)
+
         self.mode_label = QLabel("Mode: --")
         self.mode_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         temp_layout.addWidget(self.mode_label)
@@ -130,6 +135,10 @@ class PyrometerTab(QWidget):
         self.mode_combo.setEnabled(False)
 
         self.temp_value_label.setText(f"{state.temperature:.1f} {state.unit}")
+        if state.emissivity is not None:
+            self.emissivity_label.setText(f"Emissivity: {state.emissivity:.3f}")
+        else:
+            self.emissivity_label.setText("Emissivity: --")
         self.mode_label.setText(f"Mode: {state.mode}")
         self.device_label.setText(f"Device: {state.device_info}")
 

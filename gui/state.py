@@ -54,6 +54,7 @@ class CameraState:
 class PyrometerState:
     """Current state of the pyrometer (separate from thermocouple)."""
     temperature: float = 0.0
+    emissivity: Optional[float] = None  # 0.0-1.0, from TemperaSure or Modbus
     unit: str = "C"
     connected: bool = False
     error: str = ""

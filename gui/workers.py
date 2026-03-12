@@ -374,6 +374,10 @@ class PyrometerWorker(QThread):
                 state.temperature = self._sensor.read_temperature()
                 state.connected = True
                 state.error = ""
+
+                # Read emissivity if the driver supports it
+                if hasattr(self._sensor, "read_emissivity"):
+                    state.emissivity = self._sensor.read_emissivity()
             except Exception as e:
                 state.error = str(e)
 

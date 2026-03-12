@@ -45,8 +45,16 @@ Launch: `python growth_monitor_app.py` (optional PSU port arg)
 | `gui/workers.py` | Background worker threads |
 
 ### Phased Roadmap
-- **v1 (current):** Display + manual logging, dummy drivers, test on Mac
-- **v2:** Deploy to Bulbasaur, connect real hardware (kSA screengrab, COM4 pyrometer, OWON)
+- **v1:** Display + manual logging, dummy drivers, test on Mac — **DONE**
+- **v2 (current):** Deploy to Bulbasaur, connect real hardware
+  - [x] Python 3.12 installed on Bulbasaur
+  - [x] GUI launches on Bulbasaur (`python gui.py`)
+  - [x] RHEED screengrab connects to kSA 400 window (gun was off — needs live pattern test)
+  - [x] Pyrometer screengrab reads live temp from TemperaSure — values verified
+  - [x] Pyrometer Modbus on COM4 (blocked when TemperaSure holds port — expected)
+  - [ ] OWON PSU on Bulbasaur (not yet plugged in / enumerated)
+  - [ ] RHEED with gun on — verify live pattern displays
+  - [ ] Full end-to-end growth session test (Growth Monitor app)
 - **v3:** Re-enable Classifier2, live AI confidence, invite Justin
 - **v4:** RL policy, PID loop, closed-loop AI-Scientist mode
 
@@ -56,9 +64,11 @@ Launch: `python growth_monitor_app.py` (optional PSU port arg)
 - CPU inference benchmarked at **13ms/frame** — no GPU/cluster needed.
 
 ## Deployment Target
-- **Bulbasaur** (lab PC): Must run Growth Monitor GUI with all hardware connected
-- No Python installed on Bulbasaur yet (blocker)
-- TeamViewer: ID 1 756 871 318
+- **Bulbasaur** (lab PC, Windows): Python 3.12.10 installed, GUI verified 2026-03-12
+  - Displays: 1920x1200 + 1920x1080
+  - COM4: Prolific PL2303GS → pyrometer RS-422 (IFD-5)
+  - OWON PSU: not yet connected on Bulbasaur
+  - TeamViewer: ID 1 756 871 318
 
 ## Safety
 - PID has hard temperature limits (`--max-temp-hard`) and voltage step limits
@@ -67,6 +77,10 @@ Launch: `python growth_monitor_app.py` (optional PSU port arg)
 
 ## Setup
 ```bash
+# Mac
 python3 -m venv .venv && source .venv/bin/activate
-pip install pyvisa pyvisa-py pyserial
+pip install pyvisa pyvisa-py pyserial PyQt6 pyqtgraph numpy
+
+# Bulbasaur (Windows) — no venv, system Python
+pip install PyQt6 pyqtgraph numpy pyvisa pyvisa-py pyserial mss Pillow pywinauto pymodbus
 ```

@@ -334,6 +334,39 @@ class ScreenGrabPyrometer(TemperatureSensor):
         except (ValueError, TypeError):
             raise RuntimeError(f"Could not parse temperature: '{value_str}'")
 
+    def read_emissivity(self) -> Optional[float]:
+        """Scrape emissivity value from TemperaSure, if available.
+
+        Emissivity is typically in the second Edit control of ToolBar2,
+        or in a separate toolbar. Returns None if not found.
+        """
+        if not self._connected or self._app is None:
+            return None
+
+        try:
+            dlg = self._app.window(title=self._window_title)
+            toolbar2 = dlg.child_window(control_type="ToolBar", title_re="ToolBar2")
+            edit_controls = toolbar2.children(control_type="Edit")
+
+            if len(edit_controls) >= 2:
+                val = float(edit_controls[1].get_value())
+                if 0.0 <= val <= 1.0:
+                    return val
+
+            # Fallback: search all toolbars for an Edit with a value in [0, 1]
+            for tb in dlg.children(control_type="ToolBar"):
+                for ed in tb.children(control_type="Edit"):
+                    try:
+                        val = float(ed.get_value())
+                        if 0.01 <= val <= 1.0:
+                            return val
+                    except (ValueError, TypeError):
+                        continue
+        except Exception:
+            pass
+
+        return None
+
 
 class DummyPyrometer(TemperatureSensor):
     """Test pyrometer that returns a slowly varying temperature."""
