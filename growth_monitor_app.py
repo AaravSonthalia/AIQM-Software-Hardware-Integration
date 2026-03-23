@@ -1,13 +1,12 @@
-"""Launch the MBE Growth Monitor GUI."""
+"""Launch the OMBE Growth Monitor GUI."""
 import sys
 from PyQt6.QtWidgets import QApplication
 from gui.growth_app import GrowthApp
 
 
 def main():
-    resource = f"ASRL{sys.argv[1]}::INSTR" if len(sys.argv) > 1 else None
     app = QApplication(sys.argv)
-    window = GrowthApp(psu_resource=resource)
+    window = GrowthApp()
     window.show()
     sys.exit(app.exec())
 

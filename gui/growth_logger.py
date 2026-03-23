@@ -2,11 +2,11 @@
 Session data logger for MBE growth monitoring.
 
 Creates a session directory with periodic sensor CSV, commit log CSV,
-and saved RHEED frames.
+saved RHEED frames, session metadata JSON, and growth log export.
 """
 
 import csv
-import os
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -15,22 +15,15 @@ import numpy as np
 
 
 class GrowthLogger:
-    """Logs sensor data and user-annotated commits during a growth session."""
+    """Logs sensor data and timestamped entries during a growth session."""
 
     SENSOR_FIELDS = [
         "timestamp", "elapsed_s", "pyrometer_temp_C",
-        "psu_voltage_V", "psu_current_A", "psu_power_W",
     ]
     COMMIT_FIELDS = [
-        "timestamp", "elapsed_s", "sample_id",
-        "pyrometer_temp_C", "psu_voltage_V", "psu_current_A",
-        "ai_classification", "human_classification",
-        "ai_instructions", "human_instructions", "frame_path",
-    ]
-    AUTO_CAPTURE_FIELDS = [
-        "timestamp", "elapsed_s", "change_score",
-        "pyrometer_temp_C", "psu_voltage_V", "psu_current_A",
-        "frame_path",
+        "timestamp", "time_display", "elapsed_s", "sample_id", "grower",
+        "pyrometer_temp_C", "voltage_V", "current_A",
+        "note", "frame_path",
     ]
 
     def __init__(self, base_dir: str = "logs/growths"):
@@ -42,13 +35,15 @@ class GrowthLogger:
         self._commit_file = None
         self._commit_writer = None
         self._commit_counter = 0
-        self._auto_capture_file = None
-        self._auto_capture_writer = None
-        self._auto_capture_counter = 0
+        self._entries: list[dict] = []  # Accumulated entries for export
 
     @property
     def active(self) -> bool:
         return self._session_dir is not None
+
+    @property
+    def session_dir(self) -> Optional[Path]:
+        return self._session_dir
 
     def start_session(self, sample_id: str):
         """Create session directory and open CSV files."""
@@ -61,45 +56,42 @@ class GrowthLogger:
 
         sensor_path = self._session_dir / "sensor_log.csv"
         self._sensor_file = open(sensor_path, "w", newline="")
-        self._sensor_writer = csv.DictWriter(self._sensor_file, fieldnames=self.SENSOR_FIELDS)
+        self._sensor_writer = csv.DictWriter(
+            self._sensor_file, fieldnames=self.SENSOR_FIELDS,
+        )
         self._sensor_writer.writeheader()
 
         commit_path = self._session_dir / "commit_log.csv"
         self._commit_file = open(commit_path, "w", newline="")
-        self._commit_writer = csv.DictWriter(self._commit_file, fieldnames=self.COMMIT_FIELDS)
+        self._commit_writer = csv.DictWriter(
+            self._commit_file, fieldnames=self.COMMIT_FIELDS,
+        )
         self._commit_writer.writeheader()
 
-        ac_path = self._session_dir / "auto_capture_log.csv"
-        self._auto_capture_file = open(ac_path, "w", newline="")
-        self._auto_capture_writer = csv.DictWriter(
-            self._auto_capture_file, fieldnames=self.AUTO_CAPTURE_FIELDS,
-        )
-        self._auto_capture_writer.writeheader()
-
         self._commit_counter = 0
-        self._auto_capture_counter = 0
+        self._entries = []
 
-    def log_sensors(self, pyro_temp, psu_v, psu_i, psu_p, elapsed_s):
+    def log_sensors(self, pyro_temp, elapsed_s):
         """Append a row to sensor_log.csv."""
         if not self._sensor_writer:
             return
         self._sensor_writer.writerow({
             "timestamp": datetime.now().isoformat(),
             "elapsed_s": f"{elapsed_s:.2f}",
-            "pyrometer_temp_C": f"{pyro_temp:.1f}" if pyro_temp is not None else "",
-            "psu_voltage_V": f"{psu_v:.3f}" if psu_v is not None else "",
-            "psu_current_A": f"{psu_i:.3f}" if psu_i is not None else "",
-            "psu_power_W": f"{psu_p:.3f}" if psu_p is not None else "",
+            "pyrometer_temp_C": (
+                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
+            ),
         })
         self._sensor_file.flush()
 
     def log_commit(self, entry: dict):
-        """Append a row to commit_log.csv."""
+        """Append a row to commit_log.csv and accumulate for export."""
         if not self._commit_writer:
             return
         row = {field: entry.get(field, "") for field in self.COMMIT_FIELDS}
         self._commit_writer.writerow(row)
         self._commit_file.flush()
+        self._entries.append(entry)
 
     def save_frame(self, frame: np.ndarray, timestamp: str = "") -> str:
         """Save frame as PNG to session frames/ subdir, return path."""
@@ -107,7 +99,7 @@ class GrowthLogger:
             return ""
         self._commit_counter += 1
         ts = timestamp or datetime.now().strftime("%H%M%S")
-        fname = f"commit_{self._commit_counter:03d}_{ts}.png"
+        fname = f"entry_{self._commit_counter:03d}_{ts}.png"
         path = self._session_dir / "frames" / fname
 
         try:
@@ -115,7 +107,6 @@ class GrowthLogger:
             img = Image.fromarray(frame)
             img.save(str(path))
         except ImportError:
-            # Fallback: save raw with cv2 if available, else skip
             try:
                 import cv2
                 cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
@@ -124,58 +115,146 @@ class GrowthLogger:
 
         return str(path)
 
-    def log_auto_capture(
-        self,
-        frame: np.ndarray,
-        score: float,
-        elapsed_s: float,
-        pyro_temp=None,
-        psu_v=None,
-        psu_i=None,
-    ) -> str:
-        """Save an auto-captured frame and log the event."""
+    def save_session_metadata(self, metadata: dict):
+        """Save session metadata to a JSON file."""
         if self._session_dir is None:
+            return
+        meta = {
+            **metadata,
+            "session_end": datetime.now().isoformat(),
+            "total_entries": len(self._entries),
+        }
+        meta_path = self._session_dir / "session_metadata.json"
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+    def export_growth_log(self, metadata: dict) -> str:
+        """Export session as OMBE growth log. Returns file path or empty string."""
+        if self._session_dir is None or not self._entries:
             return ""
 
-        self._auto_capture_counter += 1
-        ts = datetime.now().strftime("%H%M%S")
-        fname = f"auto_{self._auto_capture_counter:03d}_{ts}.png"
-        path = self._session_dir / "frames" / fname
-
         try:
-            from PIL import Image
-            img = Image.fromarray(frame)
-            img.save(str(path))
+            return self._export_xlsx(metadata)
         except ImportError:
-            try:
-                import cv2
-                cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            except ImportError:
-                path = ""
+            return self._export_csv_log(metadata)
 
-        if self._auto_capture_writer:
-            self._auto_capture_writer.writerow({
-                "timestamp": datetime.now().isoformat(),
-                "elapsed_s": f"{elapsed_s:.2f}",
-                "change_score": f"{score:.4f}",
-                "pyrometer_temp_C": f"{pyro_temp:.1f}" if pyro_temp is not None else "",
-                "psu_voltage_V": f"{psu_v:.3f}" if psu_v is not None else "",
-                "psu_current_A": f"{psu_i:.3f}" if psu_i is not None else "",
-                "frame_path": str(path),
-            })
-            self._auto_capture_file.flush()
+    def _export_xlsx(self, metadata: dict) -> str:
+        """Export as xlsx matching OMBE growth log template."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
 
-        return str(path)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Growth Log"
+
+        bold = Font(bold=True)
+        bold_large = Font(bold=True, size=12)
+
+        # --- Header section ---
+        ws['B2'] = 'Date:'
+        ws['B2'].font = bold
+        ws['D2'] = metadata.get('date', '')
+        ws['G2'] = 'Substrate:'
+        ws['G2'].font = bold
+
+        ws['B3'] = 'Grower:'
+        ws['B3'].font = bold
+        ws['D3'] = metadata.get('grower', '')
+        ws['G3'] = 'Sample ID:'
+        ws['G3'].font = bold
+        ws['I3'] = metadata.get('sample_id', '')
+
+        ws['B4'] = 'Base pressure (mbar):'
+        ws['B4'].font = bold
+        ws['G4'] = 'Growth pressure (mbar):'
+        ws['G4'].font = bold
+
+        # --- Source parameter headers (OMBE elements) ---
+        elements = ['Substrate', 'Sr', 'Ti', 'Y', 'Er', 'Eu', 'O', 'Al', 'Ta']
+        for i, elem in enumerate(elements):
+            cell = ws.cell(row=5, column=3 + i, value=elem)
+            cell.font = bold
+        ws.cell(row=5, column=12, value='Flux ratio').font = bold
+
+        ws['B6'] = 'Temperature (\u2103)'
+        ws['B6'].font = bold
+        ws['B7'] = 'Flux (mbar)'
+        ws['B7'].font = bold
+        ws['B8'] = 'Time (min)'
+        ws['B8'].font = bold
+
+        # --- Growth notes section ---
+        ws['B9'] = 'Growth Notes'
+        ws['B9'].font = bold_large
+
+        ws['B10'] = 'Time (hh:mm)'
+        ws['B10'].font = bold
+        ws['C10'] = 'Temp (\u2103)'
+        ws['C10'].font = bold
+        ws['D10'] = 'Operation'
+        ws['D10'].font = bold
+
+        # Pre/post annealing headers
+        ws['C11'] = 'Pre-growth annealing T (\u2103)'
+        ws['F11'] = 'Pre-growth annealing time (min)'
+        ws['H11'] = 'Post-growth annealing T (\u2103)'
+        ws['K11'] = 'Post-growth annealing time (min)'
+
+        # --- Operations log entries ---
+        for i, entry in enumerate(self._entries):
+            row = 13 + i
+            ws.cell(row=row, column=2, value=entry.get('time_display', ''))
+            temp = entry.get('pyrometer_temp_C', '')
+            if temp:
+                try:
+                    ws.cell(row=row, column=3, value=float(temp))
+                except ValueError:
+                    ws.cell(row=row, column=3, value=temp)
+            ws.cell(row=row, column=4, value=entry.get('note', ''))
+
+        # --- Column widths ---
+        ws.column_dimensions['B'].width = 18
+        ws.column_dimensions['C'].width = 14
+        ws.column_dimensions['D'].width = 60
+        ws.column_dimensions['G'].width = 22
+        ws.column_dimensions['I'].width = 20
+
+        export_path = self._session_dir / "growth_log.xlsx"
+        wb.save(str(export_path))
+        return str(export_path)
+
+    def _export_csv_log(self, metadata: dict) -> str:
+        """Fallback CSV export if openpyxl is not available."""
+        if self._session_dir is None:
+            return ""
+        export_path = self._session_dir / "growth_log_export.csv"
+        with open(export_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["OMBE Growth Log"])
+            writer.writerow(["Date", metadata.get('date', '')])
+            writer.writerow(["Grower", metadata.get('grower', '')])
+            writer.writerow(["Sample ID", metadata.get('sample_id', '')])
+            writer.writerow([])
+            writer.writerow([
+                "Time", "Temp (\u2103)", "Voltage (V)", "Current (A)", "Note",
+            ])
+            for entry in self._entries:
+                writer.writerow([
+                    entry.get("time_display", ""),
+                    entry.get("pyrometer_temp_C", ""),
+                    entry.get("voltage_V", ""),
+                    entry.get("current_A", ""),
+                    entry.get("note", ""),
+                ])
+        return str(export_path)
 
     def end_session(self):
         """Close CSV files."""
-        for f in (self._sensor_file, self._commit_file, self._auto_capture_file):
+        for f in (self._sensor_file, self._commit_file):
             if f and not f.closed:
                 f.close()
         self._sensor_file = None
         self._sensor_writer = None
         self._commit_file = None
         self._commit_writer = None
-        self._auto_capture_file = None
-        self._auto_capture_writer = None
         self._session_dir = None

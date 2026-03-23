@@ -1,9 +1,13 @@
 """
-MBE Growth Monitor — single-screen dark-themed dashboard widget.
+MBE Growth Monitor — OMBE Growth Log Assistant.
 
-Displays live RHEED image, pyrometer temperature, PSU voltage/current,
-elapsed timer, AI + human classification, and a COMMIT button for
-user-annotated snapshots.
+Provides live RHEED + pyrometer display, timestamped operations logging,
+and growth log export for OMBE growths.
+
+Tab layout:
+  Monitor  — value displays, live RHEED image, note entry, LOG ENTRY button
+  Session  — config (upper-left), sensor log (upper-right),
+             growth notes (bottom half, full width), export
 """
 
 from datetime import datetime
@@ -11,13 +15,14 @@ from typing import Optional
 
 import numpy as np
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QTextEdit, QSizePolicy, QFrame,
-    QSlider, QCheckBox, QDoubleSpinBox, QGroupBox, QComboBox,
-    QFormLayout, QFileDialog,
+    QDoubleSpinBox, QComboBox, QFormLayout, QFileDialog,
+    QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
+    QAbstractItemView, QGroupBox,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QFont, QColor, QShortcut, QKeySequence
+from PyQt6.QtGui import QImage, QPixmap, QFont, QShortcut, QKeySequence
 
 from gui.state import PowerSupplyState, CameraState, PyrometerState
 from gui.widgets import ValueDisplay
@@ -39,6 +44,13 @@ QLineEdit, QTextEdit {
     border: 1px solid #555;
     padding: 4px;
 }
+QDoubleSpinBox, QComboBox {
+    border: 1px solid #555;
+    border-radius: 0px;
+    padding: 4px;
+    background-color: #fff;
+    color: #111;
+}
 QLabel {
     background-color: transparent;
 }
@@ -54,71 +66,56 @@ QPushButton:disabled {
     color: #666;
     border-color: #333;
 }
+QTabWidget::pane {
+    border: 1px solid #555;
+    background-color: #111;
+}
+QTabBar::tab {
+    background: #222;
+    color: #aaa;
+    padding: 8px 16px;
+    border: 1px solid #555;
+    border-bottom: none;
+}
+QTabBar::tab:selected {
+    background: #333;
+    color: #fff;
+}
+QTableWidget {
+    background-color: #1a1a1a;
+    color: #ddd;
+    gridline-color: #333;
+    border: 1px solid #555;
+}
+QTableWidget::item {
+    padding: 4px;
+}
+QHeaderView::section {
+    background-color: #222;
+    color: #ddd;
+    padding: 6px;
+    border: 1px solid #333;
+    font-weight: bold;
+}
+QGroupBox {
+    border: 1px solid #555;
+    margin-top: 8px;
+    padding-top: 16px;
+    font-weight: bold;
+}
+QGroupBox::title {
+    color: #ddd;
+    subcontrol-position: top left;
+    padding: 2px 8px;
+}
 """
 
 BTN_ARM = "QPushButton { background-color: #2563eb; color: white; }"
 BTN_DISARM = "QPushButton { background-color: #7c3aed; color: white; }"
 BTN_START = "QPushButton { background-color: #16a34a; color: white; }"
 BTN_STOP = "QPushButton { background-color: #dc2626; color: white; }"
-BTN_TEAL = "QPushButton { background-color: #0d9488; color: white; }"
 
-# Reconstruction labels shared by sliders, confidence bars, and AI output.
-# Aligned to Classifier2's RECONSTRUCTION_TYPES output order.
-RECON_LABELS = ["(1x1)", "Tw(2x1)", "c(6x2)", "rt13", "HTR"]
-
-
-# ---------------------------------------------------------------------------
-# ConfidenceBarWidget
-# ---------------------------------------------------------------------------
-
-class ConfidenceBarWidget(QWidget):
-    """Horizontal bar showing colored segments with percentage labels."""
-
-    def __init__(self, n_segments: int = 5, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(30)
-        self._n = n_segments
-        self._values = [0.0] * n_segments
-        self._labels = [""] * n_segments
-
-    def set_confidences(self, values: list[float]):
-        self._values = (values + [0.0] * self._n)[: self._n]
-        self.update()
-
-    def set_labels(self, names: list[str]):
-        self._labels = (names + [""] * self._n)[: self._n]
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        total = sum(self._values) or 1.0
-
-        x = 0.0
-        font = QFont("Monospace", 9)
-        painter.setFont(font)
-
-        for i, val in enumerate(self._values):
-            frac = val / total
-            seg_w = frac * w
-            if seg_w < 1:
-                continue
-            # Draw segment
-            shade = max(40, min(255, int(80 + 175 * (val / 100.0))))
-            painter.setBrush(QColor(shade, 100, 100))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRect(int(x), 0, int(seg_w), h)
-
-            # Draw percentage text
-            pct_text = f"{val:.0f}%"
-            painter.setPen(QColor("white"))
-            painter.drawText(
-                int(x), 0, int(seg_w), h,
-                Qt.AlignmentFlag.AlignCenter, pct_text,
-            )
-            x += seg_w
-        painter.end()
+MAX_SENSOR_DISPLAY_ROWS = 500
 
 
 # ---------------------------------------------------------------------------
@@ -126,14 +123,14 @@ class ConfidenceBarWidget(QWidget):
 # ---------------------------------------------------------------------------
 
 class GrowthMonitor(QWidget):
-    """Main growth monitoring widget — single-screen dark-themed dashboard."""
+    """Main growth monitoring widget — OMBE growth log assistant."""
 
     arm_requested = pyqtSignal()
     disarm_requested = pyqtSignal()
     start_requested = pyqtSignal()
     stop_requested = pyqtSignal()
     commit_requested = pyqtSignal(dict)
-    psu_command_requested = pyqtSignal(str, tuple)
+    export_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -161,205 +158,154 @@ class GrowthMonitor(QWidget):
         root.setContentsMargins(12, 8, 12, 8)
         root.setSpacing(8)
 
-        # Row 1: Sample ID + buttons
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Sample ID:"))
+        # === Top bar: Grower, Sample ID, buttons (always visible) ===
+        top = QHBoxLayout()
+
+        top.addWidget(QLabel("Grower:"))
+        self.grower_input = QLineEdit()
+        self.grower_input.setPlaceholderText("Enter grower name...")
+        self.grower_input.setFixedWidth(180)
+        top.addWidget(self.grower_input)
+
+        top.addWidget(QLabel("  Sample ID:"))
         self.sample_id_input = QLineEdit()
-        self.sample_id_input.setPlaceholderText("Enter sample ID...")
-        self.sample_id_input.setFixedWidth(250)
-        row1.addWidget(self.sample_id_input)
-        row1.addStretch()
+        self.sample_id_input.setPlaceholderText("e.g. STO15_SY250702B")
+        self.sample_id_input.setFixedWidth(220)
+        top.addWidget(self.sample_id_input)
+
+        top.addStretch()
 
         self.arm_btn = QPushButton("ARM")
         self.start_btn = QPushButton("START")
         self.stop_btn = QPushButton("STOP")
         for btn in (self.arm_btn, self.start_btn, self.stop_btn):
             btn.setFixedWidth(100)
-        row1.addWidget(self.arm_btn)
-        row1.addWidget(self.start_btn)
-        row1.addWidget(self.stop_btn)
-        root.addLayout(row1)
+        top.addWidget(self.arm_btn)
+        top.addWidget(self.start_btn)
+        top.addWidget(self.stop_btn)
+        root.addLayout(top)
 
         # Separator
-        sep1 = QFrame()
-        sep1.setFrameShape(QFrame.Shape.HLine)
-        sep1.setStyleSheet("color: #555;")
-        root.addWidget(sep1)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #555;")
+        root.addWidget(sep)
 
-        # Row 2: Value displays
-        row2 = QHBoxLayout()
+        # === Tab widget ===
+        self._tabs = QTabWidget()
+        self._build_monitor_tab()
+        self._build_session_tab()
+        root.addWidget(self._tabs, 1)
+
+        # === Connect button signals ===
+        self.arm_btn.clicked.connect(self._on_arm_clicked)
+        self.start_btn.clicked.connect(self._on_start_clicked)
+        self.stop_btn.clicked.connect(self._on_stop_clicked)
+
+    # ----- Monitor Tab -----------------------------------------------------
+
+    def _build_monitor_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        # Value displays at top of monitor tab
+        vals = QHBoxLayout()
         self.elapsed_display = ValueDisplay("Elapsed Time", "", 0)
         self.elapsed_display.value.setText("00:00:00.00")
-        self.temp_display = ValueDisplay("Temperature", "C", 0)
+        self.temp_display = ValueDisplay("Temperature", "\u2103", 0)
         self.voltage_display = ValueDisplay("Voltage", "V", 2)
         self.current_display = ValueDisplay("Current", "A", 3)
-        for d in (self.elapsed_display, self.temp_display, self.voltage_display, self.current_display):
-            d.setStyleSheet("QFrame { border: 1px solid #555; } QLabel { background: transparent; }")
-            row2.addWidget(d)
-        root.addLayout(row2)
+        for d in (self.elapsed_display, self.temp_display,
+                  self.voltage_display, self.current_display):
+            d.setStyleSheet(
+                "QFrame { border: 1px solid #555; } "
+                "QLabel { background: transparent; }"
+            )
+            vals.addWidget(d)
+        layout.addLayout(vals)
 
-        # Separator
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet("color: #555;")
-        root.addWidget(sep2)
+        # Main content: RHEED (left) | Note + Button (right)
+        content = QHBoxLayout()
+        content.setSpacing(12)
 
-        # Row 3: Main content — left (RHEED + classification) | right (instructions + commit)
-        row3 = QHBoxLayout()
-        row3.setSpacing(12)
-
-        # --- Left panel: AI class, RHEED image, Human class ---
-        left = QVBoxLayout()
-        left.setSpacing(6)
-
-        # AI classification (disabled for v1 — visible but grayed out)
-        ai_row = QHBoxLayout()
-        ai_lbl = QLabel("AI:")
-        ai_lbl.setStyleSheet("color: #555;")
-        ai_row.addWidget(ai_lbl)
-        self.ai_class_label = QLabel("\u2014")
-        self.ai_class_label.setStyleSheet("color: #555; font-style: italic;")
-        self.ai_class_label.setEnabled(False)
-        ai_row.addWidget(self.ai_class_label, 1)
-
-        self.ai_bad_indicator = QLabel("BAD")
-        self.ai_bad_indicator.setVisible(False)
-        ai_row.addWidget(self.ai_bad_indicator)
-
-        self.ai_quality_label = QLabel("")
-        self.ai_quality_label.setStyleSheet("color: #555; font-size: 11px;")
-        self.ai_quality_label.setEnabled(False)
-        ai_row.addWidget(self.ai_quality_label)
-
-        left.addLayout(ai_row)
-
-        self.ai_confidence = ConfidenceBarWidget(n_segments=len(RECON_LABELS))
-        self.ai_confidence.set_labels(RECON_LABELS)
-        self.ai_confidence.set_confidences([0] * len(RECON_LABELS))
-        self.ai_confidence.setEnabled(False)
-        self.ai_confidence.setStyleSheet("background-color: #1a1a1a;")
-        left.addWidget(self.ai_confidence)
-
-        # RHEED image
+        # --- Left: RHEED image ---
         self.rheed_image_label = QLabel()
         self.rheed_image_label.setMinimumSize(400, 300)
         self.rheed_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.rheed_image_label.setStyleSheet("background-color: #000; border: 1px solid #555;")
+        self.rheed_image_label.setStyleSheet(
+            "background-color: #000; border: 1px solid #555;"
+        )
         self.rheed_image_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
         )
-        left.addWidget(self.rheed_image_label, 1)
+        content.addWidget(self.rheed_image_label, 2)
 
-        # Human classification — checkboxes (multiple can be checked for transitional states)
-        human_group = QGroupBox("Human Classification")
-        human_group.setStyleSheet(
-            "QGroupBox { border: 1px solid #555; padding-top: 14px; margin-top: 4px; }"
-            "QGroupBox::title { color: #ddd; subcontrol-position: top left; padding: 2px 6px; }"
-        )
-        human_hbox = QHBoxLayout(human_group)
-        human_hbox.setSpacing(12)
-        human_hbox.setContentsMargins(6, 4, 6, 4)
-
-        self._human_checkboxes: dict[str, QCheckBox] = {}
-        for label_name in RECON_LABELS:
-            cb = QCheckBox(label_name)
-            cb.setStyleSheet("font-family: monospace; font-size: 12px;")
-            human_hbox.addWidget(cb)
-            self._human_checkboxes[label_name] = cb
-
-        left.addWidget(human_group)
-
-        # Auto-capture controls (disabled for v1)
-        ac_row = QHBoxLayout()
-        ac_row.setSpacing(8)
-
-        self.auto_capture_checkbox = QCheckBox("Auto-Capture (coming soon)")
-        self.auto_capture_checkbox.setEnabled(False)
-        self.auto_capture_checkbox.setStyleSheet("color: #555;")
-        ac_row.addWidget(self.auto_capture_checkbox)
-
-        thresh_lbl = QLabel("Threshold:")
-        thresh_lbl.setStyleSheet("color: #555;")
-        ac_row.addWidget(thresh_lbl)
-        self.auto_capture_threshold = QDoubleSpinBox()
-        self.auto_capture_threshold.setRange(0.01, 1.00)
-        self.auto_capture_threshold.setSingleStep(0.05)
-        self.auto_capture_threshold.setValue(0.20)
-        self.auto_capture_threshold.setFixedWidth(70)
-        self.auto_capture_threshold.setEnabled(False)
-        ac_row.addWidget(self.auto_capture_threshold)
-
-        self.auto_capture_delta_label = QLabel("delta: ---")
-        self.auto_capture_delta_label.setStyleSheet("color: #555; font-family: monospace; font-size: 11px;")
-        ac_row.addWidget(self.auto_capture_delta_label)
-        ac_row.addStretch()
-
-        left.addLayout(ac_row)
-
-        row3.addLayout(left, 2)
-
-        # --- Right panel: Instructions + buttons ---
+        # --- Right: Note input + LOG ENTRY ---
         right = QVBoxLayout()
-        right.setSpacing(8)
+        right.setSpacing(10)
 
-        ai_instr_lbl = QLabel("AI Instructions")
-        ai_instr_lbl.setStyleSheet("color: #555;")
-        right.addWidget(ai_instr_lbl)
-        self.ai_instructions_box = QTextEdit()
-        self.ai_instructions_box.setReadOnly(True)
-        self.ai_instructions_box.setEnabled(False)
-        self.ai_instructions_box.setPlaceholderText("AI instructions (coming soon)")
-        self.ai_instructions_box.setMaximumHeight(120)
-        self.ai_instructions_box.setStyleSheet("background-color: #1a1a1a; color: #555; border: 1px solid #333;")
-        right.addWidget(self.ai_instructions_box)
+        # Note input — prominent, expands to fill available space
+        note_label = QLabel("Log Entry")
+        note_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        right.addWidget(note_label)
 
-        right.addWidget(QLabel("Human Instructions"))
-        self.human_instructions_box = QTextEdit()
-        self.human_instructions_box.setPlaceholderText("Enter growth notes...")
-        self.human_instructions_box.setMaximumHeight(120)
-        right.addWidget(self.human_instructions_box)
+        self.log_note_input = QTextEdit()
+        self.log_note_input.setPlaceholderText("What's happening now?")
+        self.log_note_input.setStyleSheet(
+            "QTextEdit { font-size: 15px; padding: 8px; }"
+        )
+        right.addWidget(self.log_note_input, 1)  # stretch to fill
 
-        right.addStretch()
-
-        # Bottom buttons
-        btn_row = QHBoxLayout()
-        self.commit_btn = QPushButton("SAVE OBSERVATION  (Ctrl+S)")
+        # LOG ENTRY button — right below input
+        self.commit_btn = QPushButton("LOG ENTRY  (Ctrl+S)")
         self.commit_btn.setStyleSheet(
-            "QPushButton { background-color: #0d9488; color: white; font-size: 16px; font-weight: bold; }"
+            "QPushButton { background-color: #0d9488; color: white; "
+            "font-size: 16px; font-weight: bold; }"
             "QPushButton:disabled { background-color: #222; color: #666; }"
         )
         self.commit_btn.setFixedHeight(54)
-        btn_row.addWidget(self.commit_btn)
-        right.addLayout(btn_row)
+        self.commit_btn.clicked.connect(self._on_commit)
+        right.addWidget(self.commit_btn)
 
-        # Keyboard shortcut for save
+        # Keyboard shortcut
         self._save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         self._save_shortcut.activated.connect(self._on_commit)
 
-        row3.addLayout(right, 1)
-        root.addLayout(row3, 1)
+        content.addLayout(right, 1)
+        layout.addLayout(content, 1)
 
-        # --- Config panel (collapsible) ---
-        self._config_toggle = QPushButton("▶ Config")
-        self._config_toggle.setStyleSheet(
-            "QPushButton { text-align: left; border: none; color: #aaa; font-size: 12px; padding: 2px; }"
-        )
-        self._config_toggle.setCheckable(True)
-        self._config_toggle.clicked.connect(self._toggle_config)
-        root.addWidget(self._config_toggle)
+        self._tabs.addTab(tab, "Monitor")
 
-        self._config_panel = QWidget()
-        self._config_panel.setVisible(False)
-        config_form = QFormLayout(self._config_panel)
-        config_form.setContentsMargins(12, 4, 12, 4)
+    # ----- Session Tab -----------------------------------------------------
+
+    def _build_session_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        # === Top half: Config (left) + Sensor Log (right) ===
+        top_half = QHBoxLayout()
+        top_half.setSpacing(12)
+
+        # --- Config (upper-left) ---
+        config_group = QGroupBox("Config")
+        config_group.setMaximumWidth(420)
+        config_form = QFormLayout(config_group)
+        config_form.setContentsMargins(10, 16, 10, 8)
         config_form.setSpacing(6)
+        config_form.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
 
         self.config_interval_spin = QDoubleSpinBox()
-        self.config_interval_spin.setRange(0.1, 60.0)
+        self.config_interval_spin.setRange(1.0, 600.0)
         self.config_interval_spin.setValue(1.0)
         self.config_interval_spin.setSuffix(" s")
-        self.config_interval_spin.setDecimals(1)
-        self.config_interval_spin.setSingleStep(0.5)
+        self.config_interval_spin.setDecimals(0)
+        self.config_interval_spin.setSingleStep(1.0)
         config_form.addRow("Recording interval:", self.config_interval_spin)
 
         save_row = QHBoxLayout()
@@ -367,8 +313,11 @@ class GrowthMonitor(QWidget):
         self.config_save_path.setPlaceholderText("logs/growths")
         self.config_save_path.setText("logs/growths")
         save_row.addWidget(self.config_save_path)
-        browse_btn = QPushButton("Browse...")
-        browse_btn.setFixedWidth(80)
+        browse_btn = QPushButton("Browse")
+        browse_btn.setFixedWidth(70)
+        browse_btn.setStyleSheet(
+            "QPushButton { font-size: 11px; padding: 4px 8px; }"
+        )
         browse_btn.clicked.connect(self._on_config_browse)
         save_row.addWidget(browse_btn)
         config_form.addRow("Save folder:", save_row)
@@ -384,22 +333,78 @@ class GrowthMonitor(QWidget):
         self.config_pyrometer_mode.addItems(["dummy", "modbus", "screengrab"])
         config_form.addRow("Pyrometer mode:", self.config_pyrometer_mode)
 
-        self.config_psu_resource = QLineEdit()
-        self.config_psu_resource.setPlaceholderText("e.g. ASRL/dev/cu.usbserial-120::INSTR")
-        config_form.addRow("PSU resource:", self.config_psu_resource)
+        top_half.addWidget(config_group)
 
-        root.addWidget(self._config_panel)
+        # --- Sensor Log (upper-right) ---
+        sensor_container = QVBoxLayout()
+        sensor_container.setSpacing(4)
+        sensor_label = QLabel("Sensor Log \u2014 Interval Reads")
+        sensor_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        sensor_container.addWidget(sensor_label)
 
-        # --- Connect button signals ---
-        self.arm_btn.clicked.connect(self._on_arm_clicked)
-        self.start_btn.clicked.connect(self._on_start_clicked)
-        self.stop_btn.clicked.connect(self._on_stop_clicked)
-        self.commit_btn.clicked.connect(self._on_commit)
+        self.sensor_log_table = QTableWidget(0, 4)
+        self.sensor_log_table.setHorizontalHeaderLabels(
+            ["Time", "Temp (\u2103)", "V (V)", "I (A)"]
+        )
+        s_header = self.sensor_log_table.horizontalHeader()
+        s_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.sensor_log_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.sensor_log_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.sensor_log_table.verticalHeader().setVisible(False)
+        sensor_container.addWidget(self.sensor_log_table)
+
+        top_half.addLayout(sensor_container, 1)
+
+        layout.addLayout(top_half)
+
+        # === Bottom half: Growth Notes (full width) ===
+        notes_label = QLabel("Growth Notes \u2014 Grower Commits")
+        notes_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        layout.addWidget(notes_label)
+
+        self.growth_notes_table = QTableWidget(0, 5)
+        self.growth_notes_table.setHorizontalHeaderLabels(
+            ["Time", "Temp (\u2103)", "V (V)", "I (A)", "Note"]
+        )
+        n_header = self.growth_notes_table.horizontalHeader()
+        # Columns 0-3: fixed width, evenly sharing ~50% of space
+        for col in range(4):
+            n_header.setSectionResizeMode(
+                col, QHeaderView.ResizeMode.Interactive
+            )
+            self.growth_notes_table.setColumnWidth(col, 100)
+        # Column 4 (Note): stretches to fill remaining ~50%
+        n_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.growth_notes_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.growth_notes_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.growth_notes_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.growth_notes_table, 1)
+
+        # Export button row
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self.export_btn = QPushButton("Export Growth Log")
+        self.export_btn.setStyleSheet(
+            "QPushButton { background-color: #2563eb; color: white; "
+            "font-size: 14px; padding: 10px 20px; }"
+        )
+        self.export_btn.clicked.connect(lambda: self.export_requested.emit())
+        btn_row.addWidget(self.export_btn)
+        layout.addLayout(btn_row)
+
+        self._tabs.addTab(tab, "Session")
 
     # ----- State machine ---------------------------------------------------
 
     def _apply_state(self):
-        """Update button enable/disable and text based on current state."""
         s = self._state
         if s == "idle":
             self.arm_btn.setText("ARM")
@@ -409,6 +414,7 @@ class GrowthMonitor(QWidget):
             self.stop_btn.setEnabled(False)
             self.commit_btn.setEnabled(False)
             self.sample_id_input.setEnabled(True)
+            self.grower_input.setEnabled(True)
         elif s == "armed":
             self.arm_btn.setText("DISARM")
             self.arm_btn.setStyleSheet(BTN_DISARM)
@@ -418,6 +424,7 @@ class GrowthMonitor(QWidget):
             self.stop_btn.setEnabled(False)
             self.commit_btn.setEnabled(False)
             self.sample_id_input.setEnabled(True)
+            self.grower_input.setEnabled(True)
         elif s == "running":
             self.arm_btn.setEnabled(False)
             self.start_btn.setEnabled(False)
@@ -425,16 +432,16 @@ class GrowthMonitor(QWidget):
             self.stop_btn.setStyleSheet(BTN_STOP)
             self.commit_btn.setEnabled(True)
             self.sample_id_input.setEnabled(False)
+            self.grower_input.setEnabled(False)
 
     def set_state(self, new_state: str):
-        """Transition to a new state (called by GrowthApp)."""
         self._state = new_state
         self._apply_state()
 
     def _on_arm_clicked(self):
         if self._state == "idle":
             self.arm_requested.emit()
-        elif self._state in ("armed",):
+        elif self._state == "armed":
             self.disarm_requested.emit()
 
     def _on_start_clicked(self):
@@ -479,7 +486,7 @@ class GrowthMonitor(QWidget):
     def update_pyrometer_state(self, state: PyrometerState):
         self._latest_pyro = state
         if state.connected:
-            self.temp_display.value.setText(f"{state.temperature:.0f} C")
+            self.temp_display.value.setText(f"{state.temperature:.0f} \u2103")
         else:
             self.temp_display.value.setText("---")
 
@@ -504,102 +511,134 @@ class GrowthMonitor(QWidget):
         )
         self.rheed_image_label.setPixmap(pixmap)
 
-    # ----- Human classification (checkboxes) ---------------------------------
+    # ----- LOG ENTRY handler ----------------------------------------------
 
-    def get_human_classification(self) -> dict[str, bool]:
-        """Return current checkbox states as a dict of booleans."""
-        return {name: self._human_checkboxes[name].isChecked() for name in RECON_LABELS}
+    def _on_commit(self):
+        if not self.commit_btn.isEnabled():
+            return
 
-    # ----- Config panel helpers -----------------------------------------------
+        now = datetime.now()
+        temp_str = (
+            f"{self._latest_pyro.temperature:.1f}"
+            if self._latest_pyro and self._latest_pyro.connected else ""
+        )
+        voltage_str = (
+            f"{self._latest_psu.voltage_measured:.3f}"
+            if self._latest_psu and self._latest_psu.connected else ""
+        )
+        current_str = (
+            f"{self._latest_psu.current_measured:.3f}"
+            if self._latest_psu and self._latest_psu.connected else ""
+        )
 
-    def _toggle_config(self, checked: bool):
-        self._config_panel.setVisible(checked)
-        self._config_toggle.setText("▼ Config" if checked else "▶ Config")
+        entry = {
+            "timestamp": now.isoformat(),
+            "time_display": now.strftime("%H:%M"),
+            "sample_id": self.sample_id_input.text(),
+            "grower": self.grower_input.text(),
+            "elapsed_s": f"{self.get_elapsed_seconds():.2f}",
+            "pyrometer_temp_C": temp_str,
+            "voltage_V": voltage_str,
+            "current_A": current_str,
+            "note": self.log_note_input.toPlainText().strip(),
+        }
+
+        # Add row to Growth Notes table
+        self._add_growth_note_row(entry)
+
+        # Clear the note input for next entry
+        self.log_note_input.clear()
+
+        self.commit_requested.emit(entry)
+
+    def _add_growth_note_row(self, entry: dict):
+        """Add a row to the Growth Notes table."""
+        row = self.growth_notes_table.rowCount()
+        self.growth_notes_table.insertRow(row)
+        self.growth_notes_table.setItem(
+            row, 0, QTableWidgetItem(entry.get("time_display", ""))
+        )
+        self.growth_notes_table.setItem(
+            row, 1, QTableWidgetItem(
+                entry.get("pyrometer_temp_C", "") or "---"
+            )
+        )
+        self.growth_notes_table.setItem(
+            row, 2, QTableWidgetItem(
+                entry.get("voltage_V", "") or "---"
+            )
+        )
+        self.growth_notes_table.setItem(
+            row, 3, QTableWidgetItem(
+                entry.get("current_A", "") or "---"
+            )
+        )
+        self.growth_notes_table.setItem(
+            row, 4, QTableWidgetItem(entry.get("note", ""))
+        )
+        self.growth_notes_table.scrollToBottom()
+
+    # ----- Sensor Log display ---------------------------------------------
+
+    def add_sensor_log_row(self, time_str: str, temp: Optional[float],
+                           voltage: Optional[float] = None,
+                           current: Optional[float] = None):
+        """Add a row to the Sensor Log table (called by GrowthApp timer)."""
+        table = self.sensor_log_table
+
+        # Cap rows to prevent UI lag during long sessions
+        if table.rowCount() >= MAX_SENSOR_DISPLAY_ROWS:
+            table.removeRow(0)
+
+        row = table.rowCount()
+        table.insertRow(row)
+        table.setItem(row, 0, QTableWidgetItem(time_str))
+        table.setItem(
+            row, 1, QTableWidgetItem(
+                f"{temp:.1f}" if temp is not None else "---"
+            )
+        )
+        table.setItem(
+            row, 2, QTableWidgetItem(
+                f"{voltage:.3f}" if voltage is not None else "---"
+            )
+        )
+        table.setItem(
+            row, 3, QTableWidgetItem(
+                f"{current:.3f}" if current is not None else "---"
+            )
+        )
+        table.scrollToBottom()
+
+    # ----- Config helpers -------------------------------------------------
 
     def _on_config_browse(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Save Folder")
         if folder:
             self.config_save_path.setText(folder)
 
-    # ----- AI classification display ---------------------------------------
-
-    def update_ai_classification(self, result: dict):
-        """Update AI classification displays from ClassifierBridge output.
-
-        *result* keys: predicted_class, classification_scores (dict label→float),
-        is_bad, bad_confidence, quality.
-        """
-        self.ai_class_label.setText(result.get("predicted_class", ""))
-        self.ai_class_label.setStyleSheet("color: #4ade80; font-weight: bold;")
-
-        # Confidence bar — map scores dict to ordered list
-        scores = result.get("classification_scores", {})
-        vals = [scores.get(lbl, 0.0) * 100 for lbl in RECON_LABELS]
-        self.ai_confidence.set_confidences(vals)
-
-        # Bad indicator
-        is_bad = result.get("is_bad", False)
-        self.ai_bad_indicator.setVisible(is_bad)
-
-        # Quality score
-        quality = result.get("quality")
-        if quality is not None:
-            self.ai_quality_label.setText(f"Q:{quality:.0%}")
-        else:
-            self.ai_quality_label.setText("")
-
-    # ----- COMMIT handler -------------------------------------------------
-
-    def _on_commit(self):
-        if not self.commit_btn.isEnabled():
-            return
-        import json
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "sample_id": self.sample_id_input.text(),
-            "elapsed_s": f"{self.get_elapsed_seconds():.2f}",
-            "pyrometer_temp_C": (
-                f"{self._latest_pyro.temperature:.1f}"
-                if self._latest_pyro and self._latest_pyro.connected else ""
-            ),
-            "psu_voltage_V": (
-                f"{self._latest_psu.voltage_measured:.3f}"
-                if self._latest_psu and self._latest_psu.connected else ""
-            ),
-            "psu_current_A": (
-                f"{self._latest_psu.current_measured:.3f}"
-                if self._latest_psu and self._latest_psu.connected else ""
-            ),
-            "ai_classification": self.ai_class_label.text(),
-            "human_classification": json.dumps(self.get_human_classification()),
-            "ai_instructions": self.ai_instructions_box.toPlainText(),
-            "human_instructions": self.human_instructions_box.toPlainText(),
-        }
-        self.commit_requested.emit(entry)
-
-    # ----- Frame save (standalone, outside commit) ------------------------
+    # ----- Accessors for GrowthApp ----------------------------------------
 
     def get_current_frame(self) -> Optional[np.ndarray]:
         return self._current_frame
 
+    def get_session_metadata(self) -> dict:
+        """Return session metadata for growth log export."""
+        return {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "grower": self.grower_input.text(),
+            "sample_id": self.sample_id_input.text(),
+        }
+
     # ----- Reset -----------------------------------------------------------
 
     def reset_displays(self):
-        """Clear all displays back to defaults."""
+        """Clear live data displays back to defaults (preserves tables)."""
         self.elapsed_display.value.setText("00:00:00.00")
         self.temp_display.value.setText("---")
         self.voltage_display.value.setText("---")
         self.current_display.value.setText("---")
         self.rheed_image_label.clear()
-        self.ai_class_label.setText("\u2014")
-        self.ai_class_label.setStyleSheet("color: #555; font-style: italic;")
-        self.ai_bad_indicator.setVisible(False)
-        self.ai_quality_label.setText("")
-        self.ai_confidence.set_confidences([0] * len(RECON_LABELS))
-        # Reset human checkboxes
-        for name in RECON_LABELS:
-            self._human_checkboxes[name].setChecked(False)
-        self.auto_capture_delta_label.setText("delta: ---")
         self._start_time = None
         self._current_frame = None
         self._latest_psu = None
