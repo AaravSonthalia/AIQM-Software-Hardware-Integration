@@ -136,10 +136,39 @@ class ScreenGrabCamera(RheedCamera):
     Falls back to full-screen capture with window title search.
     """
 
-    def __init__(self, window_title: str = "AVT Manta_G Live Video"):
+    def __init__(self, window_title: str = "Live Video"):
         self._window_title = window_title
         self._connected = False
         self._capture_method: Optional[str] = None
+
+    @staticmethod
+    def _find_window_by_substring(substring: str) -> int:
+        """Find the first window whose title contains *substring* (case-insensitive).
+
+        Returns the HWND (int) or 0 if not found.  Uses EnumWindows so it
+        works even when the full kSA title includes camera model, serial
+        number, and state tags like '[live]'.
+        """
+        import ctypes
+        import ctypes.wintypes
+
+        result = ctypes.c_void_p(0)
+        target = substring.lower()
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        def enum_cb(hwnd, _lparam):
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+            if target in buf.value.lower():
+                result.value = hwnd
+                return False  # stop enumeration
+            return True
+
+        ctypes.windll.user32.EnumWindows(enum_cb, 0)
+        return int(result.value) if result.value else 0
 
     def connect(self) -> None:
         # Try platform-specific window capture
@@ -182,17 +211,22 @@ class ScreenGrabCamera(RheedCamera):
     def _grab_win32(self) -> np.ndarray:
         """Capture kSA window on Windows using win32gui + mss."""
         import ctypes
+        import ctypes.wintypes
         import mss
 
-        # Find window by title
-        user32 = ctypes.windll.user32
-        hwnd = user32.FindWindowW(None, self._window_title)
+        # Find window by partial title match.
+        # kSA Live Video title format: "{CameraName} Live Video [live]"
+        # e.g. "AVT Manta_G-033B (E0022060) 10 Live Video [live]"
+        hwnd = self._find_window_by_substring(self._window_title)
         if not hwnd:
-            raise RuntimeError(f"Window '{self._window_title}' not found.")
+            raise RuntimeError(
+                f"No window containing '{self._window_title}' found. "
+                "Check that kSA 400 Live Video is open."
+            )
 
         # Get window rectangle
         rect = ctypes.wintypes.RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
 
         monitor = {
             "left": rect.left,
