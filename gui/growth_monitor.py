@@ -51,6 +51,16 @@ QDoubleSpinBox, QComboBox {
     background-color: #fff;
     color: #111;
 }
+QComboBox QAbstractItemView {
+    background-color: #fff;
+    color: #111;
+    selection-background-color: #2563eb;
+    selection-color: #fff;
+    border: 1px solid #555;
+}
+QComboBox::drop-down {
+    border: none;
+}
 QLabel {
     background-color: transparent;
 }
