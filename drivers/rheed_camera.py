@@ -143,15 +143,15 @@ class ScreenGrabCamera(RheedCamera):
 
     @staticmethod
     def _find_live_video_window(search_term: str = "Live Video") -> int:
-        """Find the kSA Live Video child window handle.
+        """Find the kSA Live Video window handle.
 
-        kSA 400 is an MDI application — the Live Video pane is a child
-        window embedded inside the main frame, not a standalone top-level
-        window.  ``EnumWindows`` only sees top-level windows, so we:
-
-        1. Find the main "kSA 400" top-level window via EnumWindows.
-        2. Search its children via EnumChildWindows for the Live Video pane.
-        3. Fall back to the main window if no child is found.
+        Search strategy (in priority order):
+        1. Top-level window containing *search_term* but NOT starting with
+           "kSA 400" — this is the detached Live Video window (when the kSA
+           option "Keep Live Video inside application" is unchecked).
+        2. Child window of the main kSA 400 frame containing *search_term*
+           — this is the MDI child pane (default kSA layout).
+        3. The main kSA 400 window itself as a fallback.
 
         Returns the HWND (int) or 0 if kSA 400 is not running.
         """
@@ -161,46 +161,58 @@ class ScreenGrabCamera(RheedCamera):
         search_lower = search_term.lower()
         user32 = ctypes.windll.user32
 
-        # --- Step 1: find the main kSA 400 top-level window ---
-        main_hwnd = ctypes.c_void_p(0)
-
-        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-        def _find_main(hwnd, _lp):
+        def _get_title(hwnd):
             length = user32.GetWindowTextLengthW(hwnd)
             if length == 0:
-                return True
+                return ""
             buf = ctypes.create_unicode_buffer(length + 1)
             user32.GetWindowTextW(hwnd, buf, length + 1)
-            if buf.value.lower().startswith("ksa 400"):
+            return buf.value
+
+        # --- Step 1: scan ALL top-level windows ---
+        main_hwnd = ctypes.c_void_p(0)
+        detached_hwnd = ctypes.c_void_p(0)
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        def _enum_toplevel(hwnd, _lp):
+            title = _get_title(hwnd).lower()
+            if not title:
+                return True
+            # Detached Live Video window (priority 1)
+            if search_lower in title and not title.startswith("ksa 400"):
+                detached_hwnd.value = hwnd
+                return False  # found best match, stop
+            # Main kSA 400 frame
+            if title.startswith("ksa 400") and not main_hwnd.value:
                 main_hwnd.value = hwnd
-                return False
             return True
 
-        user32.EnumWindows(_find_main, 0)
+        user32.EnumWindows(_enum_toplevel, 0)
+
+        # Priority 1: detached top-level Live Video window
+        if detached_hwnd.value:
+            return int(detached_hwnd.value)
+
         if not main_hwnd.value:
             return 0
 
-        # --- Step 2: search children for the Live Video pane ---
+        # --- Step 2: search children of main kSA window ---
         child_hwnd = ctypes.c_void_p(0)
 
         @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-        def _find_child(hwnd, _lp):
-            length = user32.GetWindowTextLengthW(hwnd)
-            if length == 0:
-                return True
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.GetWindowTextW(hwnd, buf, length + 1)
-            if search_lower in buf.value.lower():
+        def _enum_children(hwnd, _lp):
+            title = _get_title(hwnd).lower()
+            if search_lower in title:
                 child_hwnd.value = hwnd
                 return False
             return True
 
-        user32.EnumChildWindows(int(main_hwnd.value), _find_child, 0)
+        user32.EnumChildWindows(int(main_hwnd.value), _enum_children, 0)
 
         if child_hwnd.value:
             return int(child_hwnd.value)
 
-        # Fallback: return the main window
+        # Priority 3: fallback to main window
         return int(main_hwnd.value)
 
     def connect(self) -> None:
