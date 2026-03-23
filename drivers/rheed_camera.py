@@ -142,40 +142,66 @@ class ScreenGrabCamera(RheedCamera):
         self._capture_method: Optional[str] = None
 
     @staticmethod
-    def _find_window_by_substring(substring: str, exclude: str = "kSA 400 -") -> int:
-        """Find the first window whose title contains *substring* but does
-        NOT start with *exclude* (case-insensitive).
+    def _find_live_video_window(search_term: str = "Live Video") -> int:
+        """Find the kSA Live Video child window handle.
 
-        This distinguishes the actual kSA Live Video child window from the
-        main kSA application window.  The main window title is always
-        ``"kSA 400 - {active pane title}"`` so it mirrors whatever child
-        window is focused.  By excluding titles that start with "kSA 400 -"
-        we reliably grab the small Live Video window.
+        kSA 400 is an MDI application — the Live Video pane is a child
+        window embedded inside the main frame, not a standalone top-level
+        window.  ``EnumWindows`` only sees top-level windows, so we:
 
-        Returns the HWND (int) or 0 if not found.
+        1. Find the main "kSA 400" top-level window via EnumWindows.
+        2. Search its children via EnumChildWindows for the Live Video pane.
+        3. Fall back to the main window if no child is found.
+
+        Returns the HWND (int) or 0 if kSA 400 is not running.
         """
         import ctypes
         import ctypes.wintypes
 
-        result = ctypes.c_void_p(0)
-        target = substring.lower()
-        exclude_lower = exclude.lower()
+        search_lower = search_term.lower()
+        user32 = ctypes.windll.user32
+
+        # --- Step 1: find the main kSA 400 top-level window ---
+        main_hwnd = ctypes.c_void_p(0)
 
         @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-        def enum_cb(hwnd, _lparam):
-            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        def _find_main(hwnd, _lp):
+            length = user32.GetWindowTextLengthW(hwnd)
             if length == 0:
                 return True
             buf = ctypes.create_unicode_buffer(length + 1)
-            ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
-            title = buf.value.lower()
-            if target in title and not title.startswith(exclude_lower):
-                result.value = hwnd
-                return False  # stop enumeration
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            if buf.value.lower().startswith("ksa 400"):
+                main_hwnd.value = hwnd
+                return False
             return True
 
-        ctypes.windll.user32.EnumWindows(enum_cb, 0)
-        return int(result.value) if result.value else 0
+        user32.EnumWindows(_find_main, 0)
+        if not main_hwnd.value:
+            return 0
+
+        # --- Step 2: search children for the Live Video pane ---
+        child_hwnd = ctypes.c_void_p(0)
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        def _find_child(hwnd, _lp):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            if search_lower in buf.value.lower():
+                child_hwnd.value = hwnd
+                return False
+            return True
+
+        user32.EnumChildWindows(int(main_hwnd.value), _find_child, 0)
+
+        if child_hwnd.value:
+            return int(child_hwnd.value)
+
+        # Fallback: return the main window
+        return int(main_hwnd.value)
 
     def connect(self) -> None:
         # Try platform-specific window capture
@@ -221,14 +247,12 @@ class ScreenGrabCamera(RheedCamera):
         import ctypes.wintypes
         import mss
 
-        # Find window by partial title match.
-        # kSA Live Video title format: "{CameraName} Live Video [live]"
-        # e.g. "AVT Manta_G-033B (E0022060) 10 Live Video [live]"
-        hwnd = self._find_window_by_substring(self._window_title)
+        # Find the Live Video child window inside kSA 400's MDI frame.
+        hwnd = self._find_live_video_window(self._window_title)
         if not hwnd:
             raise RuntimeError(
-                f"No window containing '{self._window_title}' found. "
-                "Check that kSA 400 Live Video is open."
+                "kSA 400 not found. Check that kSA 400 is running "
+                "with the Live Video window open."
             )
 
         # Get window rectangle
