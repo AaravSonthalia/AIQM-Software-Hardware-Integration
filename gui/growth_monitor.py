@@ -583,32 +583,33 @@ class GrowthMonitor(QWidget):
     def add_sensor_log_row(self, time_str: str, temp: Optional[float],
                            voltage: Optional[float] = None,
                            current: Optional[float] = None):
-        """Add a row to the Sensor Log table (called by GrowthApp timer)."""
+        """Add a row to the Sensor Log table (newest at top)."""
         table = self.sensor_log_table
 
-        # Cap rows to prevent UI lag during long sessions
+        # Cap oldest rows (at bottom) to prevent UI lag during long sessions
         if table.rowCount() >= MAX_SENSOR_DISPLAY_ROWS:
-            table.removeRow(0)
+            table.removeRow(table.rowCount() - 1)
 
-        row = table.rowCount()
-        table.insertRow(row)
-        table.setItem(row, 0, QTableWidgetItem(time_str))
+        # Insert at row 0 so newest entry is always at top.
+        # This also avoids resetting the user's scroll position —
+        # their view shifts down by one row rather than jumping.
+        table.insertRow(0)
+        table.setItem(0, 0, QTableWidgetItem(time_str))
         table.setItem(
-            row, 1, QTableWidgetItem(
+            0, 1, QTableWidgetItem(
                 f"{temp:.1f}" if temp is not None else "---"
             )
         )
         table.setItem(
-            row, 2, QTableWidgetItem(
+            0, 2, QTableWidgetItem(
                 f"{voltage:.3f}" if voltage is not None else "---"
             )
         )
         table.setItem(
-            row, 3, QTableWidgetItem(
+            0, 3, QTableWidgetItem(
                 f"{current:.3f}" if current is not None else "---"
             )
         )
-        table.scrollToBottom()
 
     # ----- Config helpers -------------------------------------------------
 

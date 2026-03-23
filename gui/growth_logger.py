@@ -39,7 +39,8 @@ class GrowthLogger:
 
     @property
     def active(self) -> bool:
-        return self._session_dir is not None
+        """True while CSV files are open and accepting writes."""
+        return self._sensor_writer is not None
 
     @property
     def session_dir(self) -> Optional[Path]:
@@ -47,6 +48,9 @@ class GrowthLogger:
 
     def start_session(self, sample_id: str):
         """Create session directory and open CSV files."""
+        # Clear any previous session data
+        self._session_dir = None
+        self._entries = []
         tag = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_id = sample_id.strip().replace(" ", "_") or "unnamed"
         prefix = self._filename_prefix or "growth"
@@ -249,7 +253,7 @@ class GrowthLogger:
         return str(export_path)
 
     def end_session(self):
-        """Close CSV files."""
+        """Close CSV files. Preserves session_dir and entries for post-stop export."""
         for f in (self._sensor_file, self._commit_file):
             if f and not f.closed:
                 f.close()
@@ -257,4 +261,5 @@ class GrowthLogger:
         self._sensor_writer = None
         self._commit_file = None
         self._commit_writer = None
-        self._session_dir = None
+        # NOTE: _session_dir and _entries intentionally preserved
+        # so Export Growth Log works after STOP.

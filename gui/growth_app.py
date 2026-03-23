@@ -115,17 +115,26 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot()
     def _on_stop(self):
-        """End a growth session — stop logging and save metadata."""
+        """End a growth session — save metadata, auto-export, stop logging."""
         self._sensor_log_timer.stop()
 
+        metadata = self.monitor.get_session_metadata()
+
         # Save session metadata
-        self.growth_log.save_session_metadata(
-            self.monitor.get_session_metadata(),
-        )
+        self.growth_log.save_session_metadata(metadata)
+
+        # Auto-export growth log before closing session files
+        path = self.growth_log.export_growth_log(metadata)
 
         self.growth_log.end_session()
         self.monitor.set_state("armed")
-        self.statusBar().showMessage("Stopped \u2014 session saved")
+
+        if path:
+            self.statusBar().showMessage(
+                f"Session saved \u2014 growth log: {path}", 8000,
+            )
+        else:
+            self.statusBar().showMessage("Stopped \u2014 session saved")
 
     # --- LOG ENTRY ---------------------------------------------------------
 
