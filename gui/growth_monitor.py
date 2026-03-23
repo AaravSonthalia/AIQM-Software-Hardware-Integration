@@ -264,7 +264,7 @@ class GrowthMonitor(QWidget):
         self.log_note_input = QTextEdit()
         self.log_note_input.setPlaceholderText("What's happening now?")
         self.log_note_input.setStyleSheet(
-            "QTextEdit { font-size: 15px; padding: 8px; }"
+            "QTextEdit { font-size: 15px; padding: 8px; font-family: Arial; }"
         )
         right.addWidget(self.log_note_input, 1)  # stretch to fill
 
@@ -510,10 +510,13 @@ class GrowthMonitor(QWidget):
 
     def _display_frame(self, frame: np.ndarray):
         h, w = frame.shape[:2]
+        # Ensure contiguous memory layout and convert to bytes for PyQt6
+        frame = np.ascontiguousarray(frame)
+        data = frame.tobytes()
         if frame.ndim == 2:
-            qimg = QImage(frame.data, w, h, w, QImage.Format.Format_Grayscale8)
+            qimg = QImage(data, w, h, w, QImage.Format.Format_Grayscale8)
         else:
-            qimg = QImage(frame.data, w, h, 3 * w, QImage.Format.Format_RGB888)
+            qimg = QImage(data, w, h, 3 * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg).scaled(
             self.rheed_image_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
