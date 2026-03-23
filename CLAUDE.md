@@ -20,60 +20,70 @@
 | `scripts/psu_diagnostic.py` | PSU connectivity check |
 | `scripts/owon_self_test.py` | OWON self-test |
 
-## GUI (PyQt6) — Growth Monitor v1
-Launch: `python growth_monitor_app.py` (optional PSU port arg)
+## GUI (PyQt6) — OMBE Growth Log Assistant
+Launch: `python growth_monitor_app.py`
 
-**v1 = Display + Manual Logging MVP** (PI meeting Mar 6, 2026):
-- ML disabled (classifier not loaded), AI widgets grayed out
-- Human classification: **checkboxes** (not sliders) — multiple can be checked for transitional states
-- SAVE OBSERVATION button (Ctrl+S) — saves frame PNG + commit_log.csv entry
-- Collapsible Config panel: recording interval, save folder, filename prefix, camera/pyrometer mode, PSU resource
-- Sensor logging at configurable interval (default 1s) to sensor_log.csv
+**Current version (v2): Growth log assistant** — automates OMBE growth log data capture.
+Reads RHEED from kSA 400 (screengrab) + pyrometer temp from TemperaSure (screengrab),
+auto-timestamps grower notes, and exports partially-filled growth logs.
 
+### Layout
+- **Top bar (always visible):** Grower name, Sample ID, ARM / START / STOP
+- **Monitor tab:** Value displays (elapsed, temp, V, I), live RHEED image, expanding note text box, LOG ENTRY button (Ctrl+S)
+- **Session tab:** Config (upper-left), Sensor Log interval reads (upper-right), Growth Notes grower commits (bottom half), Export Growth Log button
+
+### Key Files
 | File | Purpose |
 |------|---------|
 | `growth_monitor_app.py` | Launcher |
-| `gui/growth_monitor.py` | Dashboard widget: RHEED display, human checkboxes, AI widgets (disabled), config panel |
-| `gui/growth_app.py` | Orchestrator: ARM/DISARM/START/STOP, worker lifecycle, config wiring |
-| `gui/growth_logger.py` | Session logging: sensor CSV, commit CSV, auto-capture CSV, frame PNGs |
-| `gui/classifier_bridge.py` | Loads Classifier2 model — NOT used in v1, kept for v3 |
-| `gui/auto_capture.py` | Auto-capture engine — disabled in v1 |
-| `gui/rheed_tab.py` | RHEED display tab (MainWindow, not Growth Monitor) |
-| `gui/pyrometer_tab.py` | Pyrometer tab (MainWindow) |
-| `gui/config_tab.py` | Config tab (MainWindow) |
+| `gui/growth_monitor.py` | Two-tab UI: Monitor (RHEED + notes) and Session (config + logs + export) |
+| `gui/growth_app.py` | Orchestrator: ARM/DISARM/START/STOP, worker lifecycle, sensor logging |
+| `gui/growth_logger.py` | Session logging: sensor CSV, commit CSV, frame PNGs, JSON metadata, xlsx/CSV export |
+| `gui/classifier_bridge.py` | Loads Classifier2 model — NOT used in v2, kept for v3 |
+| `gui/auto_capture.py` | Auto-capture engine — NOT used in v2, kept for v3 |
 | `gui/state.py` | Shared state dataclasses |
-| `gui/workers.py` | Background worker threads |
+| `gui/workers.py` | Background worker threads (camera, pyrometer, PSU, thermocouple) |
+| `gui/widgets.py` | Reusable widgets (ValueDisplay, ControlPanel, ProtectionPanel) |
+| `drivers/` | Camera + pyrometer driver ABCs with dummy/screengrab/direct implementations |
+
+### Session Output
+Each session creates a directory under `logs/growths/` containing:
+- `sensor_log.csv` — periodic temperature readings at configured interval
+- `commit_log.csv` — timestamped grower entries with notes, temp, V, I
+- `frames/` — RHEED frame PNGs captured at each LOG ENTRY
+- `session_metadata.json` — grower, sample ID, date, entry count
+- `growth_log.xlsx` — OMBE growth log export (on Export or session end)
+
+### Config Defaults
+- Recording interval: 1s minimum (prevents faster-than-hardware commits)
+- Camera mode: dummy (Mac) / screengrab (Bulbasaur)
+- Pyrometer mode: dummy (Mac) / screengrab (Bulbasaur)
 
 ### Phased Roadmap
-- **v1:** Display + manual logging, dummy drivers, test on Mac — **DONE**
-- **v2 (current):** Deploy to Bulbasaur, connect real hardware
-  - [x] Python 3.12 installed on Bulbasaur
-  - [x] GUI launches on Bulbasaur (`python gui.py`)
-  - [x] RHEED screengrab connects to kSA 400 window (gun was off — needs live pattern test)
-  - [x] Pyrometer screengrab reads live temp from TemperaSure — values verified
-  - [x] Pyrometer Modbus on COM4 (blocked when TemperaSure holds port — expected)
-  - [ ] OWON PSU on Bulbasaur (not yet plugged in / enumerated)
-  - [ ] RHEED with gun on — verify live pattern displays
-  - [ ] Full end-to-end growth session test (Growth Monitor app)
-- **v3:** Re-enable Classifier2, live AI confidence, invite Justin
+- **v1:** Classification-centric display + manual logging — **DONE** (archived)
+- **v2 (current):** Growth log assistant for OMBE
+  - [x] Python 3.12 on Bulbasaur, GUI launches
+  - [x] RHEED screengrab connects to kSA 400 (gun was off — needs live test)
+  - [x] Pyrometer screengrab reads live temp from TemperaSure — verified
+  - [x] Growth-log-centric UI with two-tab layout
+  - [x] OMBE growth log export (xlsx + CSV fallback)
+  - [ ] Full end-to-end growth session test on Bulbasaur
+  - [ ] Investigate kSA window for V/I readings (may be in screengrab)
+- **v3:** Add reconstruction classification checkboxes + Classifier2 ML confidence
 - **v4:** RL policy, PID loop, closed-loop AI-Scientist mode
+- **Deferred:** OWON PSU on Bulbasaur, PID step tests, auto-capture, ChMBE variant
 
 ## MBE Hardware Control
-- **Scienta Omicron MISTRAL** controls all MBE hardware (pumps, valves, heaters, manipulators) via touch-screen panels. GUI-based, no serial API. Future interaction requires pywinauto/screen scraping. Not needed for v1-v2.
-- **OWON PSU** is our controllable heater bypass (separate from MISTRAL) for AI-Scientist mode.
+- **Scienta Omicron MISTRAL** controls all MBE hardware (pumps, valves, heaters, manipulators) via touch-screen panels. GUI-based, no serial API. Not needed for v2.
+- **OWON PSU** is our controllable heater bypass for AI-Scientist mode (v4). Deprioritized per PI.
 - CPU inference benchmarked at **13ms/frame** — no GPU/cluster needed.
 
 ## Deployment Target
 - **Bulbasaur** (lab PC, Windows): Python 3.12.10 installed, GUI verified 2026-03-12
   - Displays: 1920x1200 + 1920x1080
   - COM4: Prolific PL2303GS → pyrometer RS-422 (IFD-5)
-  - OWON PSU: not yet connected on Bulbasaur
+  - OWON PSU: not yet connected on Bulbasaur (deprioritized)
   - TeamViewer: ID 1 756 871 318
-
-## Safety
-- PID has hard temperature limits (`--max-temp-hard`) and voltage step limits
-- Always use safety shield when testing with real hardware
-- Step test currently blocked on thermocouple contact with ceramic boat
 
 ## Setup
 ```bash
@@ -82,5 +92,5 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install pyvisa pyvisa-py pyserial PyQt6 pyqtgraph numpy
 
 # Bulbasaur (Windows) — no venv, system Python
-pip install PyQt6 pyqtgraph numpy pyvisa pyvisa-py pyserial mss Pillow pywinauto pymodbus
+pip install PyQt6 pyqtgraph numpy pyvisa pyvisa-py pyserial mss Pillow pywinauto pymodbus openpyxl
 ```
