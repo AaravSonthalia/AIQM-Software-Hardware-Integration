@@ -142,18 +142,24 @@ class ScreenGrabCamera(RheedCamera):
         self._capture_method: Optional[str] = None
 
     @staticmethod
-    def _find_window_by_substring(substring: str) -> int:
-        """Find the first window whose title contains *substring* (case-insensitive).
+    def _find_window_by_substring(substring: str, exclude: str = "kSA 400 -") -> int:
+        """Find the first window whose title contains *substring* but does
+        NOT start with *exclude* (case-insensitive).
 
-        Returns the HWND (int) or 0 if not found.  Uses EnumWindows so it
-        works even when the full kSA title includes camera model, serial
-        number, and state tags like '[live]'.
+        This distinguishes the actual kSA Live Video child window from the
+        main kSA application window.  The main window title is always
+        ``"kSA 400 - {active pane title}"`` so it mirrors whatever child
+        window is focused.  By excluding titles that start with "kSA 400 -"
+        we reliably grab the small Live Video window.
+
+        Returns the HWND (int) or 0 if not found.
         """
         import ctypes
         import ctypes.wintypes
 
         result = ctypes.c_void_p(0)
         target = substring.lower()
+        exclude_lower = exclude.lower()
 
         @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
         def enum_cb(hwnd, _lparam):
@@ -162,7 +168,8 @@ class ScreenGrabCamera(RheedCamera):
                 return True
             buf = ctypes.create_unicode_buffer(length + 1)
             ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
-            if target in buf.value.lower():
+            title = buf.value.lower()
+            if target in title and not title.startswith(exclude_lower):
                 result.value = hwnd
                 return False  # stop enumeration
             return True
