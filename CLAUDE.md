@@ -15,7 +15,7 @@
 |--------|---------|
 | `owon_power_supply.py` | OWON SPE interface (SCPI) |
 | `dracal_thermocouple_reader.py` | Dracal TC reader (VCP) |
-| `temperature_pid_control.py` | PID loop: OWON + Dracal |
+| `temperature_pid_control.py` | PID loop: OWON + Dracal (uses `simple-pid` library) |
 | `scripts/heater_step_test.py` | Step response test for PID tuning |
 | `scripts/psu_diagnostic.py` | PSU connectivity check |
 | `scripts/owon_self_test.py` | OWON self-test |
@@ -80,7 +80,7 @@ Default search term: `"Live Video"`. Uses `EnumWindows` + `EnumChildWindows` wit
 ### Known Issues / TODO
 - RHEED capture includes kSA title bar + status bar — crop to image region only (cosmetic)
 - Image very dim at idle (Pixel Int: 0.7%) — will be brighter during actual growth
-- V/I displays show "---" — no source connected yet (investigate kSA Temperature Control or Analog Input)
+- V/I displays show "---" — no source connected yet. Possible paths: kSA Temperature Control module (reads Eurotherm/ULVAC/Watlow via serial), kSA Analog Input Board (not currently installed), or direct from OWON in AI-Scientist mode (v4)
 - Edge case testing needed: empty fields, rapid commits, multiple sessions, close-while-running
 
 ### Phased Roadmap
@@ -104,6 +104,31 @@ Default search term: `"Live Video"`. Uses `EnumWindows` + `EnumChildWindows` wit
 - **v4:** RL policy, PID loop, closed-loop AI-Scientist mode
 - **Deferred:** OWON PSU on Bulbasaur, PID step tests, auto-capture
 
+## PID Control (updated Mar 26, 2026)
+**Library:** `simple-pid` (pip install simple-pid) — replaces custom PID math in both:
+- `temperature_pid_control.py` (CLI) and `gui/pid_controller.py` (GUI)
+- Same `RobustPID` wrapper interface. All safety code (cutoffs, slew limits, fault states) unchanged.
+
+**Dummy loop status:** COMPLETED as proof of concept. Software stack validated.
+**Gains do NOT transfer to MBE** — different thermal dynamics. Retune on MBE when ready.
+
+**Key lesson:** Safety constraints must target the RIGHT variable. Voltage slew rate limiting (0.5V/s) prevented PID from cutting power fast enough → 32°C overshoot (targeted 60°C, hit 92.5°C). The hard temperature cutoff is the real safety net. Increase `--max-voltage-step` to allow responsive control.
+
+**Recommended next test:**
+```
+python temperature_pid_control.py --target 60 --hold-minutes 2 \
+  --kp 0.3 --ki 0.02 --kd 0.0 --max-voltage 10 --max-temp-hard 150 \
+  --max-temp-rate 300 --max-voltage-step 2.0 --no-prompt
+```
+
+**Hardware limits (actual):** Heater=400°C, ceramic boat=600°C, high-temp tape=250-300°C (limiting factor), OWON=24V/1A.
+
+**GUI launch (Mac):**
+```
+export QT_QPA_PLATFORM_PLUGIN_PATH=/opt/anaconda3/lib/python3.13/site-packages/PyQt6/Qt6/plugins/platforms
+python gui.py
+```
+
 ## kSA 400 Configuration (Bulbasaur)
 - **Camera:** AVT Manta_G-033B (E0022060) 10, model AVT Vimba
 - **Live Video title:** `AVT Manta_G-033B (E0022060) 10 Live Video [live]`
@@ -112,10 +137,41 @@ Default search term: `"Live Video"`. Uses `EnumWindows` + `EnumChildWindows` wit
 - **Chamber Interface:** Set to `<None>`, options available: kSAModBus32, kSAComm, Automation, kSADigitalControl
 - **User manual:** `C:\Users\Lab10\Documents\kSA\kSA 400\Help\` (PDF + HTML)
 
+### kSA Data Paths (from manual analysis, Mar 30 2026)
+- **Auto Export Data:** Enable in Advanced Acquisition Options > Document Generation > "All data to text." kSA writes ASCII `.txt` alongside `.kdt` for every acquisition. Our GUI can file-watch the Output directory.
+- **Temperature Control Module:** Natively reads Eurotherm/ULVAC/Watlow controllers via serial. Shows temp, setpoint, output power (%). Records in `.kdt`. Need to check if OMBE heater controller is compatible.
+- **Chamber Interface TCP/IP:** Under-documented in user guide. Options likely enable Modbus-TCP, proprietary, or automation protocol. Need docs from k-Space.
+- **Phase-Locked Epitaxy (PLE):** Built-in closed-loop RHEED oscillation → shutter control. Relevant to v4 RL design.
+- **Image Batch Export:** Can export RHEED frames as lossless TIFF/PNG — better than screengrab for ML training data.
+- **Analog Input Board:** Supported but NOT installed on Bulbasaur. No analog input module in lab.
+- **Key directories:** Data at `C:\Users\Lab10\Documents\kSA\kSA 400\Data\`, Logs at `...\Logs\`
+
+## Pyrometer Direct Access (from manual analysis, Mar 30 2026)
+- **Direct Modbus RTU:** Default mode on power-up. COM4, 115200/8N1, slave 0x01. Temp at regs 0x0000-0x0001 (IEEE-754 float big-endian). Current at 0x0004-0x0005. ~10 rd/s polling.
+- **TemperaSure switches pyrometer out of Modbus** into proprietary Exactus Protocol. Cannot run both simultaneously. Power-cycle probe to return to Modbus.
+- **No analog output module (IFA-5) in lab** — only digital IFD-5.
+- **TemperaSure Macro Mode:** Auto-exports CSV to `C:\BASF\Macro Data`. File-watch option that keeps TemperaSure running.
+- **v3 plan:** Replace TemperaSure with direct Modbus reads from Python. Requires building pyrometer display in Growth Monitor.
+
+### Lab Visit Checklist (Next Bulbasaur Session)
+- [ ] kSA: Enable "Auto Export Data" > "All data to text", run acquisition, check `.txt` output
+- [ ] kSA: Try each Chamber Interface option, note behavior
+- [ ] kSA: Check View > Temperature Control — is it configured?
+- [ ] kSA: Check existing data in `...\Data\` and `...\Logs\` directories
+- [ ] kSA: Batch export saved RHEED frames as TIFF, compare vs screengrab quality
+- [ ] TemperaSure: Set up Macro Mode auto-export, check file format/timing
+- [ ] Pyrometer: Close TemperaSure, power-cycle probe, test direct Modbus read via pymodbus
+- [ ] Identify exact Eurotherm model on OMBE (check front panel — likely 3508)
+- [ ] Find Eurotherm IP on instrument subnet (try `10.0.42.x` range or check MISTRAL config)
+- [ ] Test Modbus TCP read from Bulbasaur: `python -c "from pymodbus.client import ModbusTcpClient; c=ModbusTcpClient('IP',502); c.connect(); print(c.read_holding_registers(1,1).registers[0]/10)"`
+- [ ] Research kSA Chamber Interface TCP/IP documentation (k-Space Associates — email requestinfo@k-space.com, or ask lab members for kb.k-space.com credentials)
+
 ## MBE Hardware Control
 - **Scienta Omicron MISTRAL** controls all MBE hardware (pumps, valves, heaters, manipulators) via touch-screen panels. GUI-based, no serial API. Not needed for v2.
+- **Eurotherm Temperature Controller** (likely model 3508) — controls substrate heater. Speaks **Modbus TCP on port 502**. IP likely on instrument subnet (`10.0.42.x` or `10.120.40.170`). Python driver already exists at `/Users/aj/test-claude/projects/research-lab/src/control/temp_pid.py`. Key registers: PV temp (reg 1, /10), setpoint (reg 2), current SP (reg 5), output power rate (reg 36). Safety limits 20-930°C. **This is how we get V/I and heater temp into the Growth Monitor — over Ethernet, no port conflicts.**
 - **OWON PSU** is our controllable heater bypass for AI-Scientist mode (v4). Deprioritized per PI.
 - CPU inference benchmarked at **13ms/frame** — no GPU/cluster needed.
+- **Note:** Eurotherm is now owned by Watlow (acquisition completed Oct 2022). kSA 400's support for both "Eurotherm" and "Watlow" covers the same product line.
 
 ## Deployment Target
 - **Bulbasaur** (lab PC, Windows): Python 3.12.10 installed, GUI verified 2026-03-23

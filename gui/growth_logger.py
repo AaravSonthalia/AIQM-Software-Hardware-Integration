@@ -23,6 +23,8 @@ class GrowthLogger:
     COMMIT_FIELDS = [
         "timestamp", "time_display", "elapsed_s", "sample_id", "grower",
         "pyrometer_temp_C", "voltage_V", "current_A",
+        "recon_1x1", "recon_Twinned (2x1)", "recon_c(6x2)",
+        "recon_rt13xrt13", "recon_HTR",
         "note", "frame_path",
     ]
 
@@ -103,7 +105,7 @@ class GrowthLogger:
             return ""
         self._commit_counter += 1
         ts = timestamp or datetime.now().strftime("%H%M%S")
-        fname = f"entry_{self._commit_counter:03d}_{ts}.png"
+        fname = f"entry_{self._commit_counter:03d}_{ts}.bmp"
         path = self._session_dir / "frames" / fname
 
         try:

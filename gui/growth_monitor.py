@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLineEdit, QTextEdit, QSizePolicy, QFrame,
     QDoubleSpinBox, QComboBox, QFormLayout, QFileDialog,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QGroupBox,
+    QAbstractItemView, QGroupBox, QSlider,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QFont, QShortcut, QKeySequence
@@ -252,11 +252,54 @@ class GrowthMonitor(QWidget):
         )
         content.addWidget(self.rheed_image_label, 2)
 
-        # --- Right: Note input + LOG ENTRY ---
+        # --- Right: Recon sliders + Note input + LOG ENTRY ---
         right = QVBoxLayout()
-        right.setSpacing(10)
+        right.setSpacing(8)
 
-        # Note input — prominent, expands to fill available space
+        # Reconstruction estimate sliders
+        recon_label = QLabel("Reconstruction Estimate (%)")
+        recon_label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        right.addWidget(recon_label)
+
+        self._recon_sliders: dict[str, QSlider] = {}
+        self._recon_value_labels: dict[str, QLabel] = {}
+        recon_names = ["1x1", "Twinned (2x1)", "c(6x2)", "rt13xrt13", "HTR"]
+        recon_grid = QHBoxLayout()
+        recon_grid.setSpacing(6)
+        for name in recon_names:
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            lbl = QLabel(name)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("font-size: 11px;")
+            col.addWidget(lbl)
+            slider = QSlider(Qt.Orientation.Vertical)
+            slider.setRange(0, 100)
+            slider.setValue(0)
+            slider.setTickPosition(QSlider.TickPosition.TicksRight)
+            slider.setTickInterval(25)
+            slider.setFixedHeight(90)
+            slider.setStyleSheet(
+                "QSlider::groove:vertical { background: #333; width: 6px; }"
+                "QSlider::handle:vertical { background: #0d9488; height: 12px; "
+                "margin: 0 -4px; border-radius: 6px; }"
+                "QSlider::sub-page:vertical { background: #555; }"
+                "QSlider::add-page:vertical { background: #0d9488; }"
+            )
+            col.addWidget(slider, alignment=Qt.AlignmentFlag.AlignHCenter)
+            val_lbl = QLabel("0%")
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            val_lbl.setStyleSheet("font-size: 11px; color: #0d9488;")
+            col.addWidget(val_lbl)
+            recon_grid.addLayout(col)
+            self._recon_sliders[name] = slider
+            self._recon_value_labels[name] = val_lbl
+            slider.valueChanged.connect(
+                lambda v, n=name: self._recon_value_labels[n].setText(f"{v}%")
+            )
+        right.addLayout(recon_grid)
+
+        # Note input
         note_label = QLabel("Log Entry")
         note_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         right.addWidget(note_label)
@@ -556,11 +599,19 @@ class GrowthMonitor(QWidget):
             "note": self.log_note_input.toPlainText().strip(),
         }
 
+        # Capture reconstruction estimates from sliders
+        for name, slider in self._recon_sliders.items():
+            entry[f"recon_{name}"] = str(slider.value())
+
         # Add row to Growth Notes table
         self._add_growth_note_row(entry)
 
         # Clear the note input for next entry
         self.log_note_input.clear()
+
+        # Reset sliders to 0 after commit
+        for slider in self._recon_sliders.values():
+            slider.setValue(0)
 
         self.commit_requested.emit(entry)
 
