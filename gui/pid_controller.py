@@ -77,8 +77,22 @@ class PIDRunState:
 # PID algorithm (extracted from temperature_pid_control.py)
 # ------------------------------------------------------------------
 
+try:
+    from simple_pid import PID as SimplePID
+except ImportError:
+    raise ImportError(
+        "simple-pid is required. Install with: pip install simple-pid"
+    )
+
+
 class _RobustPID:
-    """Incremental PID with anti-windup clamp and filtered derivative."""
+    """PID wrapper around simple-pid with gain scheduling support.
+
+    Hardware-agnostic — same class works for dummy loop, MBE, or any future system.
+    Gains and limits are the only things that change between hardware configurations.
+
+    Install: pip install simple-pid
+    """
 
     def __init__(
         self,
@@ -91,41 +105,52 @@ class _RobustPID:
         integral_max: float = 200.0,
         derivative_alpha: float = 0.2,
     ):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.output_min = output_min
-        self.output_max = output_max
-        self.integral_min = integral_min
-        self.integral_max = integral_max
-        self.derivative_alpha = max(0.0, min(1.0, derivative_alpha))
-        self._integral = 0.0
-        self._last_error: Optional[float] = None
-        self._last_derivative = 0.0
+        self._pid = SimplePID(
+            Kp=kp,
+            Ki=ki,
+            Kd=kd,
+            setpoint=0.0,
+            output_limits=(output_min, output_max),
+            sample_time=None,
+            differential_on_measurement=True,
+        )
+
+    @property
+    def kp(self) -> float:
+        return self._pid.Kp
+
+    @kp.setter
+    def kp(self, value: float) -> None:
+        self._pid.Kp = value
+
+    @property
+    def ki(self) -> float:
+        return self._pid.Ki
+
+    @ki.setter
+    def ki(self, value: float) -> None:
+        self._pid.Ki = value
+
+    @property
+    def kd(self) -> float:
+        return self._pid.Kd
+
+    @kd.setter
+    def kd(self, value: float) -> None:
+        self._pid.Kd = value
 
     def reset(self):
-        self._integral = 0.0
-        self._last_error = None
-        self._last_derivative = 0.0
+        self._pid.reset()
+
+    @property
+    def components(self) -> tuple:
+        """Return (P, I, D) terms — useful for logging and tuning."""
+        return self._pid.components
 
     def update(self, setpoint: float, measured: float, dt: float) -> float:
         dt = max(dt, 1e-3)
-        error = setpoint - measured
-
-        self._integral = max(
-            self.integral_min,
-            min(self.integral_max, self._integral + error * dt),
-        )
-
-        raw_d = (error - self._last_error) / dt if self._last_error is not None else 0.0
-        self._last_derivative = (
-            self.derivative_alpha * raw_d
-            + (1.0 - self.derivative_alpha) * self._last_derivative
-        )
-        self._last_error = error
-
-        out = self.kp * error + self.ki * self._integral + self.kd * self._last_derivative
-        return max(self.output_min, min(self.output_max, out))
+        self._pid.setpoint = setpoint
+        return self._pid(measured, dt=dt)
 
 
 def _lerp(a: float, b: float, r: float) -> float:

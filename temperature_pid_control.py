@@ -81,8 +81,24 @@ class LoopSnapshot:
     message: str
 
 
+try:
+    from simple_pid import PID as SimplePID
+except ImportError:
+    raise ImportError(
+        "simple-pid is required. Install with: pip install simple-pid"
+    )
+
+
 class RobustPID:
-    """PID with anti-windup clamp and filtered derivative."""
+    """PID wrapper around simple-pid with gain scheduling support.
+
+    Provides the same interface as the original custom PID (setpoint, measured, dt)
+    while leveraging simple-pid's built-in anti-windup, derivative-on-measurement,
+    and time handling. This wrapper is hardware-agnostic — the same class works for
+    the dummy loop, the MBE system, or any future system by changing gains and limits.
+
+    Install: pip install simple-pid
+    """
 
     def __init__(
         self,
@@ -95,52 +111,56 @@ class RobustPID:
         integral_max: float = 200.0,
         derivative_alpha: float = 0.2,
     ):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.output_min = output_min
-        self.output_max = output_max
-        self.integral_min = integral_min
-        self.integral_max = integral_max
-        self.derivative_alpha = max(0.0, min(1.0, derivative_alpha))
+        self._pid = SimplePID(
+            Kp=kp,
+            Ki=ki,
+            Kd=kd,
+            setpoint=0.0,
+            output_limits=(output_min, output_max),
+            sample_time=None,  # We pass dt explicitly
+            differential_on_measurement=True,  # Avoids derivative kick on setpoint change
+        )
+        # Store for gain scheduling access
+        self._output_min = output_min
+        self._output_max = output_max
 
-        self._integral = 0.0
-        self._last_error: Optional[float] = None
-        self._last_derivative = 0.0
+    @property
+    def kp(self) -> float:
+        return self._pid.Kp
+
+    @kp.setter
+    def kp(self, value: float) -> None:
+        self._pid.Kp = value
+
+    @property
+    def ki(self) -> float:
+        return self._pid.Ki
+
+    @ki.setter
+    def ki(self, value: float) -> None:
+        self._pid.Ki = value
+
+    @property
+    def kd(self) -> float:
+        return self._pid.Kd
+
+    @kd.setter
+    def kd(self, value: float) -> None:
+        self._pid.Kd = value
 
     def reset(self) -> None:
-        self._integral = 0.0
-        self._last_error = None
-        self._last_derivative = 0.0
+        self._pid.reset()
+
+    @property
+    def components(self) -> tuple:
+        """Return (P, I, D) terms from last computation — useful for logging."""
+        return self._pid.components
 
     def update(self, setpoint: float, measured: float, dt: float) -> float:
         if dt <= 0:
             dt = 1e-3
-
-        error = setpoint - measured
-
-        # Integrator with clamp anti-windup.
-        self._integral += error * dt
-        self._integral = max(self.integral_min, min(self.integral_max, self._integral))
-
-        raw_derivative = 0.0
-        if self._last_error is not None:
-            raw_derivative = (error - self._last_error) / dt
-
-        # Exponential smoothing on derivative term to suppress noise spikes.
-        self._last_derivative = (
-            self.derivative_alpha * raw_derivative
-            + (1.0 - self.derivative_alpha) * self._last_derivative
-        )
-
-        output = (
-            self.kp * error
-            + self.ki * self._integral
-            + self.kd * self._last_derivative
-        )
-
-        self._last_error = error
-        return max(self.output_min, min(self.output_max, output))
+        self._pid.setpoint = setpoint
+        return self._pid(measured, dt=dt)
 
 
 class CsvRunLogger:
