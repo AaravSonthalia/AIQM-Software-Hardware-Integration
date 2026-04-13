@@ -7,11 +7,16 @@ saved RHEED frames, session metadata JSON, and growth log export.
 
 import csv
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+from drivers.frame_quality import check_frame_quality, FrameQualityResult
+
+log = logging.getLogger(__name__)
 
 
 class GrowthLogger:
@@ -25,6 +30,9 @@ class GrowthLogger:
         "pyrometer_temp_C", "voltage_V", "current_A",
         "recon_1x1", "recon_Twinned (2x1)", "recon_c(6x2)",
         "recon_rt13xrt13", "recon_HTR",
+        "classifier_predicted", "classifier_is_bad",
+        "classifier_(1x1)", "classifier_Tw(2x1)", "classifier_c(6x2)",
+        "classifier_rt13", "classifier_HTR",
         "note", "frame_path",
     ]
 
@@ -99,13 +107,35 @@ class GrowthLogger:
         self._commit_file.flush()
         self._entries.append(entry)
 
-    def save_frame(self, frame: np.ndarray, timestamp: str = "") -> str:
-        """Save frame as PNG to session frames/ subdir, return path."""
+    def save_frame(
+        self,
+        frame: np.ndarray,
+        timestamp: str = "",
+        temperature: Optional[float] = None,
+    ) -> str:
+        """Save frame as BMP to session frames/ subdir with quality checks.
+
+        Filename format: entry_NNN_HHMMSS_TTT°C.bmp
+        where TTT is the pyrometer temperature (if available).
+
+        Returns the file path, or empty string if save failed or frame
+        was rejected by quality checks.
+        """
         if self._session_dir is None:
             return ""
+
+        # Quality gate — reject bad frames before saving
+        quality = check_frame_quality(frame)
+        if not quality.passed:
+            log.info("Frame rejected: %s", quality.reason)
+            return ""
+
         self._commit_counter += 1
         ts = timestamp or datetime.now().strftime("%H%M%S")
-        fname = f"entry_{self._commit_counter:03d}_{ts}.bmp"
+
+        # Build descriptive filename with temperature
+        temp_part = f"_{temperature:.0f}C" if temperature is not None else ""
+        fname = f"entry_{self._commit_counter:03d}_{ts}{temp_part}.bmp"
         path = self._session_dir / "frames" / fname
 
         try:
@@ -117,8 +147,18 @@ class GrowthLogger:
                 import cv2
                 cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             except ImportError:
+                log.warning("No image library available (PIL or cv2)")
                 return ""
 
+        # Post-save verification: confirm file exists and is non-trivial
+        if not path.exists() or path.stat().st_size < 100:
+            log.warning("Frame save verification failed: %s", path)
+            return ""
+
+        log.debug(
+            "Frame saved: %s (mean=%.1f, std=%.1f)",
+            fname, quality.mean_intensity, quality.std_intensity,
+        )
         return str(path)
 
     def save_session_metadata(self, metadata: dict):
@@ -199,6 +239,12 @@ class GrowthLogger:
         ws['C10'].font = bold
         ws['D10'] = 'Operation'
         ws['D10'].font = bold
+        ws['E10'] = 'Recon Estimate (%)'
+        ws['E10'].font = bold
+        ws['F10'] = 'AI Classification'
+        ws['F10'].font = bold
+        ws['G10'] = 'Frame Path'
+        ws['G10'].font = bold
 
         # Pre/post annealing headers
         ws['C11'] = 'Pre-growth annealing T (\u2103)'
@@ -210,19 +256,42 @@ class GrowthLogger:
         for i, entry in enumerate(self._entries):
             row = 13 + i
             ws.cell(row=row, column=2, value=entry.get('time_display', ''))
+
             temp = entry.get('pyrometer_temp_C', '')
             if temp:
                 try:
                     ws.cell(row=row, column=3, value=float(temp))
                 except ValueError:
                     ws.cell(row=row, column=3, value=temp)
+
             ws.cell(row=row, column=4, value=entry.get('note', ''))
+
+            # Reconstruction estimates (normalized %)
+            recon_parts = []
+            for rname in ['1x1', 'Twinned (2x1)', 'c(6x2)', 'rt13xrt13', 'HTR']:
+                val = entry.get(f'recon_{rname}', '')
+                if val and float(val) > 0:
+                    recon_parts.append(f"{rname}: {val}%")
+            if recon_parts:
+                ws.cell(row=row, column=5, value=', '.join(recon_parts))
+
+            # Classifier prediction
+            predicted = entry.get('classifier_predicted', '')
+            if predicted:
+                ws.cell(row=row, column=6, value=f"AI: {predicted}")
+
+            # Frame path
+            frame_path = entry.get('frame_path', '')
+            if frame_path:
+                ws.cell(row=row, column=7, value=frame_path)
 
         # --- Column widths ---
         ws.column_dimensions['B'].width = 18
         ws.column_dimensions['C'].width = 14
-        ws.column_dimensions['D'].width = 60
-        ws.column_dimensions['G'].width = 22
+        ws.column_dimensions['D'].width = 50
+        ws.column_dimensions['E'].width = 30
+        ws.column_dimensions['F'].width = 18
+        ws.column_dimensions['G'].width = 40
         ws.column_dimensions['I'].width = 20
 
         export_path = self._session_dir / "growth_log.xlsx"

@@ -20,6 +20,17 @@ from gui.workers import RheedCameraWorker, PyrometerWorker
 from gui.growth_monitor import GrowthMonitor
 from gui.growth_logger import GrowthLogger
 
+# Default path to AI_for_quantum repo — override via CLASSIFIER2_ROOT env var
+_DEFAULT_AI_REPO = None
+for _candidate in [
+    Path.home() / "test-claude" / "projects" / "ai-for-quantum",
+    Path.home() / "test-claude" / "AI_for_quantum",
+    Path.home() / "AI_for_quantum",
+]:
+    if (_candidate / "src").is_dir() or (_candidate / "Classifier2").is_dir():
+        _DEFAULT_AI_REPO = _candidate
+        break
+
 
 class GrowthApp(QMainWindow):
     """Main window for the OMBE Growth Monitor application."""
@@ -32,6 +43,7 @@ class GrowthApp(QMainWindow):
         self.camera_worker: Optional[RheedCameraWorker] = None
         self.pyrometer_worker: Optional[PyrometerWorker] = None
         self.growth_log = GrowthLogger()
+        self._classifier = None  # Lazy-loaded ClassifierBridge
 
         # Periodic sensor logging timer (1 second interval while running)
         self._sensor_log_timer = QTimer(self)
@@ -140,13 +152,38 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_commit(self, entry: dict):
-        """Save a timestamped log entry with optional RHEED frame."""
-        # Save frame if available
+        """Save a timestamped log entry with optional RHEED frame + classification."""
         frame = self.monitor.get_current_frame()
         if frame is not None:
             ts = entry.get("timestamp", "").replace(":", "").split(".")[0][-6:]
-            path = self.growth_log.save_frame(frame, ts)
+            # Parse temperature for descriptive filename
+            temp = None
+            temp_str = entry.get("pyrometer_temp_C", "")
+            if temp_str:
+                try:
+                    temp = float(temp_str)
+                except ValueError:
+                    pass
+            path = self.growth_log.save_frame(frame, ts, temperature=temp)
             entry["frame_path"] = path
+
+            if not path:
+                self.statusBar().showMessage(
+                    "Entry logged (frame rejected by quality gate)", 3000,
+                )
+                self.growth_log.log_commit(entry)
+                return
+
+            # Run Classifier2 on the saved frame
+            result = self._classify_frame(frame)
+            if result is not None:
+                entry["classifier_predicted"] = result.get("predicted_class", "")
+                entry["classifier_is_bad"] = str(result.get("is_bad", False))
+                scores = result.get("classification_scores", {})
+                for label, score in scores.items():
+                    entry[f"classifier_{label}"] = f"{score:.3f}"
+                # Update reconstruction sliders in the UI to show AI prediction
+                self.monitor.update_classifier_display(result)
 
         self.growth_log.log_commit(entry)
         self.statusBar().showMessage("Entry logged", 3000)
@@ -193,6 +230,43 @@ class GrowthApp(QMainWindow):
     @pyqtSlot(PyrometerState)
     def _on_pyrometer_state(self, state: PyrometerState):
         self.monitor.update_pyrometer_state(state)
+
+    # --- Classifier -------------------------------------------------------
+
+    def _get_classifier(self):
+        """Lazy-load the Classifier2 bridge. Returns None if unavailable."""
+        if self._classifier is not None:
+            return self._classifier
+
+        import os
+        repo_root = os.environ.get("CLASSIFIER2_ROOT")
+        if repo_root:
+            repo_path = Path(repo_root)
+        elif _DEFAULT_AI_REPO:
+            repo_path = _DEFAULT_AI_REPO
+        else:
+            log.info("Classifier2 repo not found — classification disabled")
+            return None
+
+        try:
+            from gui.classifier_bridge import ClassifierBridge
+            self._classifier = ClassifierBridge(ai_repo_root=repo_path)
+            log.info("Classifier2 loaded from %s", repo_path)
+            return self._classifier
+        except Exception as e:
+            log.warning("Classifier2 failed to load: %s", e)
+            return None
+
+    def _classify_frame(self, frame) -> Optional[dict]:
+        """Run Classifier2 on a frame. Returns result dict or None."""
+        classifier = self._get_classifier()
+        if classifier is None:
+            return None
+        try:
+            return classifier.classify(frame)
+        except Exception as e:
+            log.warning("Classification failed: %s", e)
+            return None
 
     # --- Helpers -----------------------------------------------------------
 

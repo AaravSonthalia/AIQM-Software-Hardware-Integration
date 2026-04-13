@@ -299,6 +299,15 @@ class GrowthMonitor(QWidget):
             )
         right.addLayout(recon_grid)
 
+        # Classifier prediction display (updated on LOG ENTRY)
+        self._classifier_status_label = QLabel("AI: ---")
+        self._classifier_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._classifier_status_label.setStyleSheet(
+            "font-size: 12px; color: #f59e0b; font-weight: bold; "
+            "padding: 4px; border: 1px solid #333; background-color: #1a1a1a;"
+        )
+        right.addWidget(self._classifier_status_label)
+
         # Note input
         note_label = QLabel("Log Entry")
         note_label.setStyleSheet("font-size: 14px; font-weight: bold;")
@@ -599,9 +608,15 @@ class GrowthMonitor(QWidget):
             "note": self.log_note_input.toPlainText().strip(),
         }
 
-        # Capture reconstruction estimates from sliders
-        for name, slider in self._recon_sliders.items():
-            entry[f"recon_{name}"] = str(slider.value())
+        # Capture reconstruction estimates from sliders, normalized to 100%
+        raw_values = {name: slider.value() for name, slider in self._recon_sliders.items()}
+        total = sum(raw_values.values())
+        if total > 0:
+            normalized = {name: round(val / total * 100, 1) for name, val in raw_values.items()}
+        else:
+            normalized = {name: 0.0 for name in raw_values}
+        for name, val in normalized.items():
+            entry[f"recon_{name}"] = str(val)
 
         # Add row to Growth Notes table
         self._add_growth_note_row(entry)
@@ -694,6 +709,31 @@ class GrowthMonitor(QWidget):
             "grower": self.grower_input.text(),
             "sample_id": self.sample_id_input.text(),
         }
+
+    # ----- Classifier display -----------------------------------------------
+
+    def update_classifier_display(self, result: dict):
+        """Update the UI to show Classifier2 prediction alongside sliders.
+
+        Displays the predicted class and confidence scores as a status
+        line below the reconstruction sliders.
+        """
+        predicted = result.get("predicted_class", "")
+        scores = result.get("classification_scores", {})
+        is_bad = result.get("is_bad", False)
+
+        if is_bad:
+            status = "AI: Bad image"
+        elif predicted and scores:
+            confidence = scores.get(predicted, 0.0)
+            status = f"AI: {predicted} ({confidence:.0%})"
+        else:
+            status = "AI: ---"
+
+        # Update the classifier status label (created below if needed)
+        if not hasattr(self, "_classifier_status_label"):
+            return
+        self._classifier_status_label.setText(status)
 
     # ----- Reset -----------------------------------------------------------
 

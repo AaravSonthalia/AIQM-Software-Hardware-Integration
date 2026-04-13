@@ -134,12 +134,33 @@ class ScreenGrabCamera(RheedCamera):
     Over remote desktop: uses OpenCV to grab from a VNC/RDP session.
 
     Falls back to full-screen capture with window title search.
+
+    Parameters
+    ----------
+    window_title : str
+        Substring to search for in window titles (default "Live Video").
+    crop_title_bar : bool
+        If True, crop the kSA title bar and status bar from screengrab
+        to get just the RHEED image region. Default True.
+    title_bar_px : int
+        Pixels to crop from the top (kSA title bar). Default 30.
+    status_bar_px : int
+        Pixels to crop from the bottom (kSA status bar). Default 20.
     """
 
-    def __init__(self, window_title: str = "Live Video"):
+    def __init__(
+        self,
+        window_title: str = "Live Video",
+        crop_title_bar: bool = True,
+        title_bar_px: int = 30,
+        status_bar_px: int = 20,
+    ):
         self._window_title = window_title
         self._connected = False
         self._capture_method: Optional[str] = None
+        self._crop_title_bar = crop_title_bar
+        self._title_bar_px = title_bar_px
+        self._status_bar_px = status_bar_px
 
     @staticmethod
     def _find_live_video_window(search_term: str = "Live Video") -> int:
@@ -242,6 +263,17 @@ class ScreenGrabCamera(RheedCamera):
         except ImportError:
             raise ImportError("mss required for screen capture: pip install mss")
 
+    def _crop_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Crop kSA title bar and status bar from the screengrab."""
+        if not self._crop_title_bar:
+            return frame
+        h = frame.shape[0]
+        top = self._title_bar_px
+        bottom = h - self._status_bar_px
+        if bottom <= top or top < 0:
+            return frame  # Invalid crop bounds, return unchanged
+        return frame[top:bottom, :]
+
     def read_frame(self) -> np.ndarray:
         if not self._connected:
             raise RuntimeError("Screen grab not connected.")
@@ -249,9 +281,10 @@ class ScreenGrabCamera(RheedCamera):
         import sys
 
         if sys.platform == "win32":
-            return self._grab_win32()
+            raw = self._grab_win32()
         else:
-            return self._grab_cross_platform()
+            raw = self._grab_cross_platform()
+        return self._crop_frame(raw)
 
     def _grab_win32(self) -> np.ndarray:
         """Capture kSA window on Windows using win32gui + mss."""
