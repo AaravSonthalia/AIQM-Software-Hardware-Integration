@@ -16,11 +16,12 @@ from drivers.ocr import capture_window, find_window, ocr_crop
 
 # Crop for the 'Pressure' label + value in the MBE column, (x, y, w, h).
 # Measured on Bulbasaur at 1497x567 window size. x start is deliberately
-# offset past the LabVIEW panel's 3D-inset bezel on the left — the gray
-# vertical stroke of that bezel reads as a phantom leading '1' to tesseract
-# ~20% of the time, producing spurious values like 12.4E-10 (= 1.24e-9)
-# instead of 2.4E-10.
-PRESSURE_BBOX = (15, 130, 105, 50)
+# set past the LabVIEW panel's 3D-inset bezel, which occupies x=9..16
+# (two stacked 4-px gradients — outer and inner bevel). The first green
+# pixel of the '2' digit is at x=19-20, so x=18 leaves ~2 px of clean
+# black interior before the text. Earlier shifts (x=8, x=15) still
+# captured bezel pixels that tesseract read as a phantom leading '1'.
+PRESSURE_BBOX = (18, 130, 100, 50)
 
 OCR_CONFIG = (
     "--psm 6 "
