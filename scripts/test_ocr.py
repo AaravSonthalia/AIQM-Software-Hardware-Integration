@@ -55,7 +55,7 @@ def test_mistral() -> None:
     frame = capture_window(drv.hwnd)
     print(f"  window frame shape: {frame.shape}")
 
-    raw = ocr_crop(frame, VI_BBOX, MISTRAL_CONFIG)
+    raw = ocr_crop(frame, VI_BBOX, MISTRAL_CONFIG, label="mistral")
     print(f"  raw OCR ({len(raw)} chars):")
     for line in raw.splitlines():
         print(f"    | {line}")
@@ -82,7 +82,7 @@ def test_evap() -> None:
     frame = capture_window(drv.hwnd)
     print(f"  window frame shape: {frame.shape}")
 
-    raw = ocr_crop(frame, PRESSURE_BBOX, EVAP_CONFIG)
+    raw = ocr_crop(frame, PRESSURE_BBOX, EVAP_CONFIG, label="evap")
     print(f"  raw OCR ({len(raw)} chars):")
     for line in raw.splitlines():
         print(f"    | {line}")

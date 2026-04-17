@@ -61,7 +61,7 @@ class EvapControl:
         except Exception:
             return result
 
-        text = ocr_crop(frame, self._bbox, OCR_CONFIG)
+        text = ocr_crop(frame, self._bbox, OCR_CONFIG, label="evap")
         if not text:
             return result
 

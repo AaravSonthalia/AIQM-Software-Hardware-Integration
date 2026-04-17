@@ -217,6 +217,9 @@ class GrowthApp(QMainWindow):
         self.monitor.add_sensor_log_row(
             datetime.now().strftime("%H:%M:%S"),
             pyro_temp,
+            voltage=m.v_actual if mistral_ok else None,
+            current=m.i_actual if mistral_ok else None,
+            pressure=e.chamber_pressure_mbar if evap_ok else None,
         )
 
     # --- Worker state fan-out to monitor -----------------------------------

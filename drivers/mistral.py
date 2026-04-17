@@ -82,7 +82,7 @@ class MistralGui:
         except Exception:
             return result
 
-        text = ocr_crop(frame, self._bbox, OCR_CONFIG)
+        text = ocr_crop(frame, self._bbox, OCR_CONFIG, label="mistral")
         if not text:
             return result
 

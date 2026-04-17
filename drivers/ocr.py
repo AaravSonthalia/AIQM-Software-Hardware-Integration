@@ -8,6 +8,8 @@ installer did not add it (common case on Bulbasaur).
 
 import ctypes
 import ctypes.wintypes
+import os
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +20,10 @@ TESSERACT_PATHS = [
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
     r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
 ]
+
+# Set AIQM_OCR_DEBUG=1 to print raw OCR output to stderr on every read.
+# Use for diagnosing wrong/blank pressure or V/I readings.
+DEBUG = os.environ.get("AIQM_OCR_DEBUG", "").strip().lower() in ("1", "true", "yes")
 
 
 def configure_tesseract() -> Optional[str]:
@@ -85,10 +91,15 @@ def ocr_crop(
     image: np.ndarray,
     bbox: tuple[int, int, int, int],
     config: str = "",
+    label: str = "",
 ) -> str:
     """Crop image to bbox=(x, y, w, h) and run tesseract on the crop.
 
     Returns stripped OCR output, or empty string on failure.
+
+    If AIQM_OCR_DEBUG=1 is set in the environment, prints the raw OCR
+    result to stderr tagged with `label` (e.g., "mistral", "evap"), so
+    the caller doesn't need to wire its own debug path.
     """
     import pytesseract
     from PIL import Image
@@ -97,9 +108,16 @@ def ocr_crop(
     x, y, w, h = bbox
     crop = image[y:y + h, x:x + w]
     if crop.size == 0:
+        if DEBUG:
+            print(f"[OCR {label}] empty crop for bbox={bbox}", file=sys.stderr, flush=True)
         return ""
     pil = Image.fromarray(crop)
     try:
-        return pytesseract.image_to_string(pil, config=config).strip()
-    except Exception:
+        text = pytesseract.image_to_string(pil, config=config).strip()
+        if DEBUG:
+            print(f"[OCR {label}] {text!r}", file=sys.stderr, flush=True)
+        return text
+    except Exception as e:
+        if DEBUG:
+            print(f"[OCR {label}] EXCEPTION: {e}", file=sys.stderr, flush=True)
         return ""

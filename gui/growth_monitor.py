@@ -412,9 +412,9 @@ class GrowthMonitor(QWidget):
         sensor_label.setStyleSheet("font-weight: bold; font-size: 13px;")
         sensor_container.addWidget(sensor_label)
 
-        self.sensor_log_table = QTableWidget(0, 4)
+        self.sensor_log_table = QTableWidget(0, 5)
         self.sensor_log_table.setHorizontalHeaderLabels(
-            ["Time", "Temp (\u2103)", "V (V)", "I (A)"]
+            ["Time", "Temp (\u2103)", "V (V)", "I (A)", "P (mbar)"]
         )
         s_header = self.sensor_log_table.horizontalHeader()
         s_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -682,17 +682,14 @@ class GrowthMonitor(QWidget):
 
     def add_sensor_log_row(self, time_str: str, temp: Optional[float],
                            voltage: Optional[float] = None,
-                           current: Optional[float] = None):
+                           current: Optional[float] = None,
+                           pressure: Optional[float] = None):
         """Add a row to the Sensor Log table (newest at top)."""
         table = self.sensor_log_table
 
-        # Cap oldest rows (at bottom) to prevent UI lag during long sessions
         if table.rowCount() >= MAX_SENSOR_DISPLAY_ROWS:
             table.removeRow(table.rowCount() - 1)
 
-        # Insert at row 0 so newest entry is always at top.
-        # This also avoids resetting the user's scroll position —
-        # their view shifts down by one row rather than jumping.
         table.insertRow(0)
         table.setItem(0, 0, QTableWidgetItem(time_str))
         table.setItem(
@@ -708,6 +705,11 @@ class GrowthMonitor(QWidget):
         table.setItem(
             0, 3, QTableWidgetItem(
                 f"{current:.3f}" if current is not None else "---"
+            )
+        )
+        table.setItem(
+            0, 4, QTableWidgetItem(
+                f"{pressure:.2e}" if pressure is not None else "---"
             )
         )
 
