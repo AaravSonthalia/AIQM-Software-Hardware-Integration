@@ -19,6 +19,9 @@ class GrowthLogger:
 
     SENSOR_FIELDS = [
         "timestamp", "elapsed_s", "pyrometer_temp_C",
+        "mistral_v_set_V", "mistral_v_actual_V",
+        "mistral_i_set_A", "mistral_i_actual_A",
+        "chamber_pressure_mbar",
     ]
     COMMIT_FIELDS = [
         "timestamp", "time_display", "elapsed_s", "sample_id", "grower",
@@ -77,16 +80,30 @@ class GrowthLogger:
         self._commit_counter = 0
         self._entries = []
 
-    def log_sensors(self, pyro_temp, elapsed_s):
-        """Append a row to sensor_log.csv."""
+    def log_sensors(
+        self, pyro_temp, elapsed_s,
+        v_set=None, v_actual=None, i_set=None, i_actual=None,
+        chamber_pressure_mbar=None,
+    ):
+        """Append a row to sensor_log.csv. All values may be None."""
         if not self._sensor_writer:
             return
+
+        def _f(val, places):
+            return f"{val:.{places}f}" if val is not None else ""
+
+        def _sci(val):
+            return f"{val:.3e}" if val is not None else ""
+
         self._sensor_writer.writerow({
             "timestamp": datetime.now().isoformat(),
             "elapsed_s": f"{elapsed_s:.2f}",
-            "pyrometer_temp_C": (
-                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
-            ),
+            "pyrometer_temp_C": _f(pyro_temp, 1),
+            "mistral_v_set_V":    _f(v_set, 3),
+            "mistral_v_actual_V": _f(v_actual, 3),
+            "mistral_i_set_A":    _f(i_set, 3),
+            "mistral_i_actual_A": _f(i_actual, 3),
+            "chamber_pressure_mbar": _sci(chamber_pressure_mbar),
         })
         self._sensor_file.flush()
 

@@ -9,7 +9,10 @@ import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 import pyvisa
 
-from gui.state import PowerSupplyState, TemperatureState, CameraState, PyrometerState
+from gui.state import (
+    CameraState, EvapControlState, MistralState, PowerSupplyState,
+    PyrometerState, TemperatureState,
+)
 from owon_power_supply import OWONPowerSupply
 
 
@@ -405,4 +408,130 @@ class PyrometerWorker(QThread):
 
     def stop(self):
         """Stop the pyrometer worker thread."""
+        self.running = False
+
+
+class MistralWorker(QThread):
+    """Background thread for MistralGui V/I OCR polling.
+
+    Uses lazy connect — if MISTRAL isn't running when the worker starts,
+    the loop keeps trying each cycle until the window appears. Same
+    behavior if MISTRAL is closed mid-session.
+    """
+
+    state_updated = pyqtSignal(MistralState)
+
+    def __init__(self, mode: str = "screengrab", poll_interval: float = 1.0):
+        super().__init__()
+        self.mode = mode
+        self.poll_interval = poll_interval
+        self.running = False
+        self._driver = None
+
+    def run(self):
+        self.running = True
+        state = MistralState(mode=self.mode)
+        self._driver = self._create_driver()
+
+        while self.running:
+            if not self._driver.connected:
+                try:
+                    self._driver.connect()
+                    state.connected = True
+                    state.error = ""
+                except Exception as e:
+                    state.connected = False
+                    state.error = str(e)
+                    self.state_updated.emit(state)
+                    time.sleep(self.poll_interval)
+                    continue
+
+            try:
+                vals = self._driver.read()
+                state.v_set = vals.get("v_set")
+                state.v_actual = vals.get("v_actual")
+                state.i_set = vals.get("i_set")
+                state.i_actual = vals.get("i_actual")
+                state.connected = True
+                state.error = ""
+            except Exception as e:
+                state.error = str(e)
+
+            self.state_updated.emit(state)
+            time.sleep(self.poll_interval)
+
+        if self._driver is not None:
+            try:
+                self._driver.disconnect()
+            except Exception:
+                pass
+
+    def _create_driver(self):
+        if self.mode == "screengrab":
+            from drivers.mistral import MistralGui
+            return MistralGui()
+        else:
+            from drivers.mistral import DummyMistralGui
+            return DummyMistralGui()
+
+    def stop(self):
+        self.running = False
+
+
+class EvapControlWorker(QThread):
+    """Background thread for Evap Control chamber pressure OCR polling."""
+
+    state_updated = pyqtSignal(EvapControlState)
+
+    def __init__(self, mode: str = "screengrab", poll_interval: float = 1.0):
+        super().__init__()
+        self.mode = mode
+        self.poll_interval = poll_interval
+        self.running = False
+        self._driver = None
+
+    def run(self):
+        self.running = True
+        state = EvapControlState(mode=self.mode)
+        self._driver = self._create_driver()
+
+        while self.running:
+            if not self._driver.connected:
+                try:
+                    self._driver.connect()
+                    state.connected = True
+                    state.error = ""
+                except Exception as e:
+                    state.connected = False
+                    state.error = str(e)
+                    self.state_updated.emit(state)
+                    time.sleep(self.poll_interval)
+                    continue
+
+            try:
+                vals = self._driver.read()
+                state.chamber_pressure_mbar = vals.get("chamber_pressure_mbar")
+                state.connected = True
+                state.error = ""
+            except Exception as e:
+                state.error = str(e)
+
+            self.state_updated.emit(state)
+            time.sleep(self.poll_interval)
+
+        if self._driver is not None:
+            try:
+                self._driver.disconnect()
+            except Exception:
+                pass
+
+    def _create_driver(self):
+        if self.mode == "screengrab":
+            from drivers.evap_control import EvapControl
+            return EvapControl()
+        else:
+            from drivers.evap_control import DummyEvapControl
+            return DummyEvapControl()
+
+    def stop(self):
         self.running = False

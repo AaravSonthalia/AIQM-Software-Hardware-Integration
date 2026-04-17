@@ -15,8 +15,10 @@ from PyQt6.QtCore import pyqtSlot, QTimer
 
 log = logging.getLogger(__name__)
 
-from gui.state import CameraState, PyrometerState
-from gui.workers import RheedCameraWorker, PyrometerWorker
+from gui.state import CameraState, EvapControlState, MistralState, PyrometerState
+from gui.workers import (
+    EvapControlWorker, MistralWorker, PyrometerWorker, RheedCameraWorker,
+)
 from gui.growth_monitor import GrowthMonitor
 from gui.growth_logger import GrowthLogger
 
@@ -31,6 +33,8 @@ class GrowthApp(QMainWindow):
 
         self.camera_worker: Optional[RheedCameraWorker] = None
         self.pyrometer_worker: Optional[PyrometerWorker] = None
+        self.mistral_worker: Optional[MistralWorker] = None
+        self.evap_worker: Optional[EvapControlWorker] = None
         self.growth_log = GrowthLogger()
 
         # Periodic sensor logging timer (1 second interval while running)
@@ -54,11 +58,12 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot()
     def _on_arm(self):
-        """Connect camera and pyrometer workers."""
+        """Connect camera, pyrometer, MISTRAL, and Evap Control workers."""
         camera_mode = self.monitor.config_camera_mode.currentText()
         pyrometer_mode = self.monitor.config_pyrometer_mode.currentText()
+        mistral_mode = self.monitor.config_mistral_mode.currentText()
+        evap_mode = self.monitor.config_evap_mode.currentText()
 
-        # Camera
         if not self.camera_worker or not self.camera_worker.isRunning():
             self.camera_worker = RheedCameraWorker(
                 mode=camera_mode, poll_interval=1.0,
@@ -66,13 +71,26 @@ class GrowthApp(QMainWindow):
             self.camera_worker.state_updated.connect(self._on_camera_state)
             self.camera_worker.start()
 
-        # Pyrometer
         if not self.pyrometer_worker or not self.pyrometer_worker.isRunning():
             self.pyrometer_worker = PyrometerWorker(
                 mode=pyrometer_mode, poll_interval=0.5,
             )
             self.pyrometer_worker.state_updated.connect(self._on_pyrometer_state)
             self.pyrometer_worker.start()
+
+        if not self.mistral_worker or not self.mistral_worker.isRunning():
+            self.mistral_worker = MistralWorker(
+                mode=mistral_mode, poll_interval=1.0,
+            )
+            self.mistral_worker.state_updated.connect(self._on_mistral_state)
+            self.mistral_worker.start()
+
+        if not self.evap_worker or not self.evap_worker.isRunning():
+            self.evap_worker = EvapControlWorker(
+                mode=evap_mode, poll_interval=1.0,
+            )
+            self.evap_worker.state_updated.connect(self._on_evap_state)
+            self.evap_worker.start()
 
         self.monitor.set_state("armed")
         self.statusBar().showMessage("Armed \u2014 live readings active")
@@ -85,6 +103,12 @@ class GrowthApp(QMainWindow):
 
         self._stop_worker(self.pyrometer_worker)
         self.pyrometer_worker = None
+
+        self._stop_worker(self.mistral_worker)
+        self.mistral_worker = None
+
+        self._stop_worker(self.evap_worker)
+        self.evap_worker = None
 
         self.monitor.reset_displays()
         self.monitor.set_state("idle")
@@ -173,11 +197,22 @@ class GrowthApp(QMainWindow):
             if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
             else None
         )
+        m = self.monitor._latest_mistral
+        e = self.monitor._latest_evap
+        mistral_ok = m is not None and m.connected
+        evap_ok = e is not None and e.connected
         self.growth_log.log_sensors(
-            pyro_temp, self.monitor.get_elapsed_seconds(),
+            pyro_temp,
+            self.monitor.get_elapsed_seconds(),
+            v_set=m.v_set if mistral_ok else None,
+            v_actual=m.v_actual if mistral_ok else None,
+            i_set=m.i_set if mistral_ok else None,
+            i_actual=m.i_actual if mistral_ok else None,
+            chamber_pressure_mbar=(
+                e.chamber_pressure_mbar if evap_ok else None
+            ),
         )
 
-        # Update sensor log table in UI
         from datetime import datetime
         self.monitor.add_sensor_log_row(
             datetime.now().strftime("%H:%M:%S"),
@@ -193,6 +228,14 @@ class GrowthApp(QMainWindow):
     @pyqtSlot(PyrometerState)
     def _on_pyrometer_state(self, state: PyrometerState):
         self.monitor.update_pyrometer_state(state)
+
+    @pyqtSlot(MistralState)
+    def _on_mistral_state(self, state: MistralState):
+        self.monitor.update_mistral_state(state)
+
+    @pyqtSlot(EvapControlState)
+    def _on_evap_state(self, state: EvapControlState):
+        self.monitor.update_evap_state(state)
 
     # --- Helpers -----------------------------------------------------------
 
@@ -213,4 +256,6 @@ class GrowthApp(QMainWindow):
             self.growth_log.end_session()
         self._stop_worker(self.camera_worker)
         self._stop_worker(self.pyrometer_worker)
+        self._stop_worker(self.mistral_worker)
+        self._stop_worker(self.evap_worker)
         event.accept()

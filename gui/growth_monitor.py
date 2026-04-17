@@ -24,7 +24,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QFont, QShortcut, QKeySequence
 
-from gui.state import PowerSupplyState, CameraState, PyrometerState
+from gui.state import (
+    CameraState, EvapControlState, MistralState,
+    PowerSupplyState, PyrometerState,
+)
 from gui.widgets import ValueDisplay
 
 
@@ -151,6 +154,8 @@ class GrowthMonitor(QWidget):
         self._latest_psu: Optional[PowerSupplyState] = None
         self._latest_pyro: Optional[PyrometerState] = None
         self._latest_camera: Optional[CameraState] = None
+        self._latest_mistral: Optional[MistralState] = None
+        self._latest_evap: Optional[EvapControlState] = None
         self._current_frame: Optional[np.ndarray] = None
 
         self._build_ui()
@@ -227,8 +232,10 @@ class GrowthMonitor(QWidget):
         self.temp_display = ValueDisplay("Temperature", "\u2103", 0)
         self.voltage_display = ValueDisplay("Voltage", "V", 2)
         self.current_display = ValueDisplay("Current", "A", 3)
+        self.pressure_display = ValueDisplay("Pressure", "mbar", 2)
         for d in (self.elapsed_display, self.temp_display,
-                  self.voltage_display, self.current_display):
+                  self.voltage_display, self.current_display,
+                  self.pressure_display):
             d.setStyleSheet(
                 "QFrame { border: 1px solid #555; } "
                 "QLabel { background: transparent; }"
@@ -386,6 +393,16 @@ class GrowthMonitor(QWidget):
         self.config_pyrometer_mode.addItems(["dummy", "modbus", "screengrab"])
         config_form.addRow("Pyrometer mode:", self.config_pyrometer_mode)
 
+        self.config_mistral_mode = QComboBox()
+        self.config_mistral_mode.addItems(["dummy", "screengrab"])
+        self.config_mistral_mode.setCurrentText("screengrab")
+        config_form.addRow("MISTRAL mode:", self.config_mistral_mode)
+
+        self.config_evap_mode = QComboBox()
+        self.config_evap_mode.addItems(["dummy", "screengrab"])
+        self.config_evap_mode.setCurrentText("screengrab")
+        config_form.addRow("Evap Control mode:", self.config_evap_mode)
+
         top_half.addWidget(config_group)
 
         # --- Sensor Log (upper-right) ---
@@ -542,6 +559,25 @@ class GrowthMonitor(QWidget):
             self.temp_display.value.setText(f"{state.temperature:.0f} \u2103")
         else:
             self.temp_display.value.setText("---")
+
+    def update_mistral_state(self, state: MistralState):
+        self._latest_mistral = state
+        if state.connected and state.v_actual is not None:
+            self.voltage_display.set_value(state.v_actual)
+        else:
+            self.voltage_display.value.setText("---")
+        if state.connected and state.i_actual is not None:
+            self.current_display.set_value(state.i_actual)
+        else:
+            self.current_display.value.setText("---")
+
+    def update_evap_state(self, state: EvapControlState):
+        self._latest_evap = state
+        p = state.chamber_pressure_mbar
+        if state.connected and p is not None:
+            self.pressure_display.value.setText(f"{p:.2e} mbar")
+        else:
+            self.pressure_display.value.setText("---")
 
     def update_camera_state(self, state: CameraState):
         self._latest_camera = state
@@ -703,9 +739,12 @@ class GrowthMonitor(QWidget):
         self.temp_display.value.setText("---")
         self.voltage_display.value.setText("---")
         self.current_display.value.setText("---")
+        self.pressure_display.value.setText("---")
         self.rheed_image_label.clear()
         self._start_time = None
         self._current_frame = None
         self._latest_psu = None
         self._latest_pyro = None
         self._latest_camera = None
+        self._latest_mistral = None
+        self._latest_evap = None

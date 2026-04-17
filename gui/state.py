@@ -63,6 +63,27 @@ class PyrometerState:
 
 
 @dataclass
+class MistralState:
+    """Current state of the MistralGui cell V/I readout (OCR-scraped)."""
+    v_set: Optional[float] = None
+    v_actual: Optional[float] = None
+    i_set: Optional[float] = None
+    i_actual: Optional[float] = None
+    connected: bool = False
+    error: str = ""
+    mode: str = ""  # "screengrab" or "dummy"
+
+
+@dataclass
+class EvapControlState:
+    """Current state of the Evap Control MBE chamber pressure (OCR-scraped)."""
+    chamber_pressure_mbar: Optional[float] = None
+    connected: bool = False
+    error: str = ""
+    mode: str = ""  # "screengrab" or "dummy"
+
+
+@dataclass
 class ActionLogEntry:
     """A single entry in the action log."""
     timestamp: datetime = field(default_factory=datetime.now)

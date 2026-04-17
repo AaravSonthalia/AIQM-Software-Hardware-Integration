@@ -92,3 +92,37 @@ class EvapControl:
     @property
     def hwnd(self) -> int:
         return self._hwnd
+
+
+class DummyEvapControl:
+    """Synthetic driver for offline GUI development — slowly varying pressure."""
+
+    def __init__(self, base_mbar: float = 1e-9):
+        self._base = base_mbar
+        self._connected = False
+        self._read_count = 0
+
+    def connect(self) -> None:
+        self._connected = True
+        self._read_count = 0
+
+    def read(self) -> dict[str, Optional[float]]:
+        if not self._connected:
+            return {"chamber_pressure_mbar": None}
+
+        import math
+        import random
+        self._read_count += 1
+        drift = 0.1 * math.sin(self._read_count * 0.02)
+        return {"chamber_pressure_mbar": self._base * (1.0 + drift + random.gauss(0, 0.01))}
+
+    def disconnect(self) -> None:
+        self._connected = False
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    @property
+    def hwnd(self) -> int:
+        return 0

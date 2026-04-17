@@ -110,3 +110,45 @@ class MistralGui:
     @property
     def hwnd(self) -> int:
         return self._hwnd
+
+
+class DummyMistralGui:
+    """Synthetic driver for offline GUI development — slowly varying values."""
+
+    def __init__(self, base_v: float = 10.0, base_i: float = 2.0):
+        self._base_v = base_v
+        self._base_i = base_i
+        self._connected = False
+        self._read_count = 0
+
+    def connect(self) -> None:
+        self._connected = True
+        self._read_count = 0
+
+    def read(self) -> dict[str, Optional[float]]:
+        if not self._connected:
+            return {"v_set": None, "v_actual": None,
+                    "i_set": None, "i_actual": None}
+
+        import math
+        import random
+        self._read_count += 1
+        drift_v = 0.5 * math.sin(self._read_count * 0.05)
+        drift_i = 0.1 * math.sin(self._read_count * 0.03)
+        return {
+            "v_set": self._base_v,
+            "v_actual": self._base_v + drift_v + random.gauss(0, 0.02),
+            "i_set": self._base_i,
+            "i_actual": self._base_i + drift_i + random.gauss(0, 0.01),
+        }
+
+    def disconnect(self) -> None:
+        self._connected = False
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    @property
+    def hwnd(self) -> int:
+        return 0
