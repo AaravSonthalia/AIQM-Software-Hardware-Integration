@@ -2,25 +2,33 @@
 """Offline RHEED change-point detector.
 
 Reads a directory of RHEED frames in chronological filename order, computes
-mean-absolute-pixel-difference between consecutive frames, smooths the signal
-with a rolling mean, and flags frames where the smoothed diff exceeds a
-threshold. Outputs a per-frame CSV, a timeseries plot, and groups flagged
-frames into discrete "events".
+a mean-absolute-pixel-difference signal under one of two comparison modes,
+smooths it with a rolling mean, and flags frames where the smoothed diff
+exceeds a threshold. Outputs a per-frame CSV, a timeseries plot, and groups
+flagged frames into discrete "events".
 
-This is the offline test harness for the Intelligent Capture mode planned for
-Growth Monitor v3 (per AI-MBE meeting 2026-04-17). Tune the threshold here
-against a reference dataset before wiring the same detector into the live GUI.
+Comparison modes:
+    previous    — diff against the immediately preceding frame
+                  (catches sharp transitions; the original mode)
+    buffer-mean — diff against the mean of the last N frames in a FIFO
+                  buffer (mirrors the PixelDiffChangeDetector in the
+                  live GUI, AI-MBE meeting 2026-04-17 design)
+
+Tune threshold here against a reference dataset before wiring the same
+algorithm into the live GUI.
 
 Usage:
     python rheed_change_detector.py <frames_dir> [options]
 
-Example:
-    python rheed_change_detector.py ~/data/rahim_dataset --threshold 6.0
+Examples:
+    python rheed_change_detector.py ~/data/rahim --mode previous --threshold 1.5
+    python rheed_change_detector.py ~/data/rahim --mode buffer-mean --buffer-size 20
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import sys
 from dataclasses import dataclass
@@ -78,7 +86,9 @@ def load_frame_grayscale(path: Path, prefer_green: bool = True) -> np.ndarray:
     return arr.astype(np.float32)
 
 
-def compute_diffs(frames: list[Path], prefer_green: bool = True) -> np.ndarray:
+def compute_diffs_previous(
+    frames: list[Path], prefer_green: bool = True
+) -> np.ndarray:
     """Mean absolute pixel difference between frame[i] and frame[i-1].
 
     diffs[0] is defined as 0.0 (no predecessor). Frames with mismatched shape
@@ -101,6 +111,68 @@ def compute_diffs(frames: list[Path], prefer_green: bool = True) -> np.ndarray:
         diffs[i] = float(np.mean(np.abs(curr - prev)))
         prev = curr
     return diffs
+
+
+def compute_diffs_buffer_mean(
+    frames: list[Path], buffer_size: int, prefer_green: bool = True
+) -> np.ndarray:
+    """Mean absolute pixel difference between frame[i] and the mean of the
+    FIFO buffer of the preceding ``buffer_size`` frames.
+
+    Mirrors the PixelDiffChangeDetector in gui/auto_capture.py used by the
+    live GUI. Compared to ``compute_diffs_previous``, this catches sustained
+    *shifts* (full transition magnitude) rather than just instantaneous
+    *rate of change* — peaks for the same transition are larger because we
+    compare against an older, stable reference.
+
+    diffs[0] is 0.0. For frames before the buffer is full, the comparison
+    is against the partial buffer of all frames so far.
+    """
+    diffs = np.zeros(len(frames), dtype=np.float32)
+    buffer: collections.deque[np.ndarray] = collections.deque(maxlen=buffer_size)
+    sum_arr: np.ndarray | None = None
+
+    first = load_frame_grayscale(frames[0], prefer_green)
+    buffer.append(first)
+    sum_arr = first.copy()
+
+    for i in range(1, len(frames)):
+        curr = load_frame_grayscale(frames[i], prefer_green)
+        if sum_arr is not None and curr.shape != sum_arr.shape:
+            print(
+                f"  warning: shape mismatch at frame {i} ({frames[i].name}), "
+                f"resetting buffer",
+                file=sys.stderr,
+            )
+            buffer.clear()
+            buffer.append(curr)
+            sum_arr = curr.copy()
+            diffs[i] = 0.0
+            continue
+
+        buffer_mean = sum_arr / len(buffer)
+        diffs[i] = float(np.mean(np.abs(curr - buffer_mean)))
+
+        if len(buffer) == buffer_size:
+            sum_arr -= buffer[0]
+        buffer.append(curr)
+        sum_arr += curr
+
+    return diffs
+
+
+def compute_diffs(
+    frames: list[Path],
+    mode: str = "previous",
+    buffer_size: int = 20,
+    prefer_green: bool = True,
+) -> np.ndarray:
+    """Dispatch to the chosen comparison mode."""
+    if mode == "previous":
+        return compute_diffs_previous(frames, prefer_green)
+    if mode == "buffer-mean":
+        return compute_diffs_buffer_mean(frames, buffer_size, prefer_green)
+    raise ValueError(f"unknown mode: {mode!r} (expected 'previous' or 'buffer-mean')")
 
 
 def smooth(signal: np.ndarray, window: int) -> np.ndarray:
@@ -224,6 +296,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Convert RGB frames via luminance instead of taking the green channel",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["previous", "buffer-mean"],
+        default="previous",
+        help=(
+            "Comparison mode: 'previous' diffs against frame[i-1]; "
+            "'buffer-mean' diffs against the mean of the last N frames "
+            "(mirrors the live GUI detector). Default: previous"
+        ),
+    )
+    parser.add_argument(
+        "--buffer-size",
+        type=int,
+        default=20,
+        help="FIFO buffer size for --mode buffer-mean (default: 20)",
+    )
     return parser.parse_args()
 
 
@@ -244,9 +332,22 @@ def main() -> int:
         return 1
 
     print(f"loaded {len(frames)} frames from {args.frames_dir}")
-    print(f"computing diffs (threshold={args.threshold}, smooth_window={args.smooth_window})...")
+    mode_desc = (
+        f"buffer-mean (N={args.buffer_size})"
+        if args.mode == "buffer-mean"
+        else "previous-frame"
+    )
+    print(
+        f"computing diffs: mode={mode_desc}, "
+        f"threshold={args.threshold}, smooth_window={args.smooth_window}..."
+    )
 
-    raw = compute_diffs(frames, prefer_green=not args.no_prefer_green)
+    raw = compute_diffs(
+        frames,
+        mode=args.mode,
+        buffer_size=args.buffer_size,
+        prefer_green=not args.no_prefer_green,
+    )
     smoothed = smooth(raw, args.smooth_window)
     flagged = smoothed > args.threshold
     flagged[0] = False

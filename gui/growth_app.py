@@ -25,11 +25,21 @@ from gui.growth_monitor import GrowthMonitor
 from gui.growth_logger import GrowthLogger
 
 
-# Tuned against Rahim's 2022_02_04 STO trajectory using diff-vs-previous-frame
-# (baseline ~0.5, smallest real event peak ~2.5). Diff-vs-buffer-mean produces
-# larger peaks for the same transitions, so 2.0 is a moderately conservative
-# starting point. Re-tune with the buffer-mean variant before treating this
-# as final.
+# Tuned against Rahim's 2022_02_04 STO trajectory.
+#
+# Rahim's data was captured at ~30 s cadence (manual). At our 1 Hz live
+# cadence, a 20-frame buffer covers 20 s — much shorter than Rahim's
+# 10-minute equivalent — so slow ramp drift contributes negligibly to
+# the live baseline. That makes our live buffer-mean(20)@1Hz behaviorally
+# closer to Rahim's *previous-frame* mode than to his *buffer-mean(20)*:
+#   - previous-frame on Rahim:   baseline 0.5,  peaks 2.5-9.0 → threshold 1.5
+#   - buffer-mean(5) on Rahim:   baseline 0.70, peaks 6.4-9.0 → similar
+#   - buffer-mean(20) on Rahim:  baseline 1.15, peaks 4.9-8.5 (loses small
+#                                events) — NOT representative of live behavior
+# We expect live baseline ~0.5-1.0; smallest real transitions ~2.5+. A
+# threshold of 2.0 sits ~3x above the expected baseline and below the
+# smallest expected event. First lab session is the real ground truth —
+# adjust after reviewing auto_capture_events.csv vs grower notes.
 AUTO_CAPTURE_THRESHOLD = 2.0
 AUTO_CAPTURE_BUFFER_SIZE = 20
 AUTO_CAPTURE_COOLDOWN_S = 10.0
