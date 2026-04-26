@@ -52,6 +52,13 @@ AUTO_CAPTURE_COOLDOWN_S = 10.0
 # anchors, leaving room for ~6-26 detector-flagged frames.
 HEARTBEAT_INTERVAL_MIN = 10.0
 
+# MISTRAL set-V/I change detection — derives "operator pressed Set Voltage /
+# Set Current" events from successive OCR'd setpoint values changing.
+# Tolerances are larger than typical OCR jitter but smaller than any
+# meaningful operator-commanded change.
+SET_V_CHANGE_TOLERANCE = 0.05  # volts
+SET_I_CHANGE_TOLERANCE = 0.01  # amps
+
 
 class GrowthApp(QMainWindow):
     """Main window for the OMBE Growth Monitor application."""
@@ -93,6 +100,12 @@ class GrowthApp(QMainWindow):
             self._on_auto_capture_event,
         )
         self._auto_capture_event_count = 0
+
+        # Tracking for MISTRAL set V/I change detection. Initialised to None
+        # at construction; reset to None in _on_start so each session detects
+        # changes relative to its own first reading, not the previous session.
+        self._last_v_set: Optional[float] = None
+        self._last_i_set: Optional[float] = None
 
         # Central widget
         self.monitor = GrowthMonitor()
@@ -193,6 +206,11 @@ class GrowthApp(QMainWindow):
         self.monitor.set_auto_capture_status(
             "Auto-capture: armed (warmup)"
         )
+
+        # Reset MISTRAL set-tracking so we don't fire a false change event
+        # against the previous session's last value.
+        self._last_v_set = None
+        self._last_i_set = None
 
         # Start heartbeat anchor capture (first fire after HEARTBEAT_INTERVAL_MIN;
         # we don't fire-on-start to avoid saving a black frame before the
@@ -371,6 +389,56 @@ class GrowthApp(QMainWindow):
     @pyqtSlot(MistralState)
     def _on_mistral_state(self, state: MistralState):
         self.monitor.update_mistral_state(state)
+
+        if not self.growth_log.active or not state.connected:
+            return
+
+        # Detect operator setpoint changes (Set Voltage / Set Current button
+        # presses on MISTRAL). OCR jitter can produce sub-tolerance noise on
+        # an unchanged setpoint, so only fire when the change exceeds the
+        # configured tolerance. Ignore None readings (transient OCR failures).
+        elapsed = self.monitor.get_elapsed_seconds()
+        pyro_temp = (
+            self.monitor._latest_pyro.temperature
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            else None
+        )
+
+        if state.v_set is not None:
+            if (
+                self._last_v_set is not None
+                and abs(state.v_set - self._last_v_set) > SET_V_CHANGE_TOLERANCE
+            ):
+                self.growth_log.log_set_change_event(
+                    elapsed_s=elapsed,
+                    channel="voltage",
+                    old_value=self._last_v_set,
+                    new_value=state.v_set,
+                    pyro_temp=pyro_temp,
+                )
+                self.statusBar().showMessage(
+                    f"Set Voltage changed: {self._last_v_set:.2f} → {state.v_set:.2f} V",
+                    3000,
+                )
+            self._last_v_set = state.v_set
+
+        if state.i_set is not None:
+            if (
+                self._last_i_set is not None
+                and abs(state.i_set - self._last_i_set) > SET_I_CHANGE_TOLERANCE
+            ):
+                self.growth_log.log_set_change_event(
+                    elapsed_s=elapsed,
+                    channel="current",
+                    old_value=self._last_i_set,
+                    new_value=state.i_set,
+                    pyro_temp=pyro_temp,
+                )
+                self.statusBar().showMessage(
+                    f"Set Current changed: {self._last_i_set:.3f} → {state.i_set:.3f} A",
+                    3000,
+                )
+            self._last_i_set = state.i_set
 
     @pyqtSlot(EvapControlState)
     def _on_evap_state(self, state: EvapControlState):

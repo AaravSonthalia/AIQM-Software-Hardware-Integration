@@ -38,6 +38,11 @@ class GrowthLogger:
         "timestamp", "elapsed_s", "heartbeat_idx",
         "pyrometer_temp_C", "frame_path",
     ]
+    SET_CHANGE_FIELDS = [
+        "timestamp", "elapsed_s", "event_idx",
+        "channel", "old_value", "new_value", "delta",
+        "pyrometer_temp_C",
+    ]
 
     def __init__(self, base_dir: str = "logs/growths"):
         self._base_dir = Path(base_dir)
@@ -51,8 +56,11 @@ class GrowthLogger:
         self._auto_capture_writer = None
         self._heartbeat_file = None
         self._heartbeat_writer = None
+        self._set_change_file = None
+        self._set_change_writer = None
         self._commit_counter = 0
         self._heartbeat_counter = 0
+        self._set_change_counter = 0
         self._entries: list[dict] = []  # Accumulated entries for export
 
     @property
@@ -104,8 +112,16 @@ class GrowthLogger:
         )
         self._heartbeat_writer.writeheader()
 
+        set_change_path = self._session_dir / "set_change_events.csv"
+        self._set_change_file = open(set_change_path, "w", newline="")
+        self._set_change_writer = csv.DictWriter(
+            self._set_change_file, fieldnames=self.SET_CHANGE_FIELDS,
+        )
+        self._set_change_writer.writeheader()
+
         self._commit_counter = 0
         self._heartbeat_counter = 0
+        self._set_change_counter = 0
         self._entries = []
 
     def log_sensors(
@@ -185,6 +201,37 @@ class GrowthLogger:
                 return ""
 
         return str(path)
+
+    def log_set_change_event(
+        self,
+        elapsed_s: float,
+        channel: str,
+        old_value: float,
+        new_value: float,
+        pyro_temp: Optional[float] = None,
+    ):
+        """Append a row to set_change_events.csv.
+
+        Pairs operator setpoint changes (Set Voltage / Set Current button
+        presses on the MISTRAL GUI) with timestamps, so the model can
+        learn from when V/I are deliberately adjusted vs drifting.
+        """
+        if not self._set_change_writer:
+            return
+        self._set_change_counter += 1
+        self._set_change_writer.writerow({
+            "timestamp": datetime.now().isoformat(),
+            "elapsed_s": f"{elapsed_s:.2f}",
+            "event_idx": self._set_change_counter,
+            "channel": channel,
+            "old_value": f"{old_value:.4f}",
+            "new_value": f"{new_value:.4f}",
+            "delta": f"{new_value - old_value:+.4f}",
+            "pyrometer_temp_C": (
+                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
+            ),
+        })
+        self._set_change_file.flush()
 
     def log_heartbeat(
         self,
@@ -414,6 +461,7 @@ class GrowthLogger:
         for f in (
             self._sensor_file, self._commit_file,
             self._auto_capture_file, self._heartbeat_file,
+            self._set_change_file,
         ):
             if f and not f.closed:
                 f.close()
@@ -425,5 +473,7 @@ class GrowthLogger:
         self._auto_capture_writer = None
         self._heartbeat_file = None
         self._heartbeat_writer = None
+        self._set_change_file = None
+        self._set_change_writer = None
         # NOTE: _session_dir and _entries intentionally preserved
         # so Export Growth Log works after STOP.
