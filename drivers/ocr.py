@@ -10,6 +10,7 @@ import ctypes
 import ctypes.wintypes
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -21,9 +22,12 @@ TESSERACT_PATHS = [
     r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
 ]
 
-# Set AIQM_OCR_DEBUG=1 to print raw OCR output to stderr on every read.
-# Use for diagnosing wrong/blank pressure or V/I readings.
+# Set AIQM_OCR_DEBUG=1 to print raw OCR output to stderr on every read AND
+# save each crop PNG to logs/ocr_debug/. Use for diagnosing wrong/blank
+# pressure or V/I readings — the saved crops give a per-call corpus you
+# can replay against alternate preprocessing pipelines / PSM modes.
 DEBUG = os.environ.get("AIQM_OCR_DEBUG", "").strip().lower() in ("1", "true", "yes")
+DEBUG_CROP_DIR = Path("logs/ocr_debug")
 
 
 def configure_tesseract() -> Optional[str]:
@@ -112,6 +116,10 @@ def ocr_crop(
             print(f"[OCR {label}] empty crop for bbox={bbox}", file=sys.stderr, flush=True)
         return ""
     pil = Image.fromarray(crop)
+
+    if DEBUG:
+        _save_debug_crop(pil, label)
+
     try:
         text = pytesseract.image_to_string(pil, config=config).strip()
         if DEBUG:
@@ -121,3 +129,23 @@ def ocr_crop(
         if DEBUG:
             print(f"[OCR {label}] EXCEPTION: {e}", file=sys.stderr, flush=True)
         return ""
+
+
+def _save_debug_crop(pil_image, label: str) -> None:
+    """Save a crop to logs/ocr_debug/ for offline analysis.
+
+    Filename: ``{label}_{YYYYMMDD_HHMMSS_mmm}.png``. Failures are logged to
+    stderr but otherwise swallowed — diagnostic saves must not break the
+    OCR read path.
+    """
+    try:
+        DEBUG_CROP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        path = DEBUG_CROP_DIR / f"{label or 'ocr'}_{ts}.png"
+        pil_image.save(str(path))
+    except Exception as e:
+        print(
+            f"[OCR {label}] failed to save debug crop: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
