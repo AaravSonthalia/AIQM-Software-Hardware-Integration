@@ -134,12 +134,39 @@ class ScreenGrabCamera(RheedCamera):
     Over remote desktop: uses OpenCV to grab from a VNC/RDP session.
 
     Falls back to full-screen capture with window title search.
+
+    Parameters
+    ----------
+    window_title : str
+        Substring to search for in window titles (default "Live Video").
+    crop_chrome : bool
+        If True, crop kSA window chrome (title bar + menu + toolbar above,
+        status bar below) from the captured frame so the detector only
+        sees the actual RHEED image area. Default True.
+    chrome_top_px : int
+        Pixels to crop from the top. Default 75 — measured from the
+        kSA 400 - AVT Manta_G live-video window screenshot 2026-04-25
+        (title=29 + menu=22 + toolbar=24 = 75; covers all chrome above
+        the image content). Set crop_chrome=False if the value drifts
+        on Bulbasaur (different DPI / theme).
+    chrome_bottom_px : int
+        Pixels to crop from the bottom. Default 30 — covers the kSA
+        status bar ("Exposure: ... NUM") plus the bottom window border.
     """
 
-    def __init__(self, window_title: str = "Live Video"):
+    def __init__(
+        self,
+        window_title: str = "Live Video",
+        crop_chrome: bool = True,
+        chrome_top_px: int = 75,
+        chrome_bottom_px: int = 30,
+    ):
         self._window_title = window_title
         self._connected = False
         self._capture_method: Optional[str] = None
+        self._crop_chrome = crop_chrome
+        self._chrome_top_px = chrome_top_px
+        self._chrome_bottom_px = chrome_bottom_px
 
     @staticmethod
     def _find_live_video_window(search_term: str = "Live Video") -> int:
@@ -248,10 +275,24 @@ class ScreenGrabCamera(RheedCamera):
 
         import sys
 
-        if sys.platform == "win32":
-            return self._grab_win32()
-        else:
-            return self._grab_cross_platform()
+        frame = self._grab_win32() if sys.platform == "win32" else self._grab_cross_platform()
+        return self._crop_chrome_pixels(frame)
+
+    def _crop_chrome_pixels(self, frame: np.ndarray) -> np.ndarray:
+        """Crop title/menu/toolbar above and status bar below the RHEED image.
+
+        Defensive: if the configured crop bounds are invalid for this frame
+        (e.g., window much smaller than expected), returns the frame
+        unchanged rather than producing an empty array.
+        """
+        if not self._crop_chrome:
+            return frame
+        h = frame.shape[0]
+        top = max(0, self._chrome_top_px)
+        bottom = h - max(0, self._chrome_bottom_px)
+        if bottom <= top:
+            return frame
+        return frame[top:bottom, :]
 
     def _grab_win32(self) -> np.ndarray:
         """Capture kSA window on Windows using win32gui + mss."""
