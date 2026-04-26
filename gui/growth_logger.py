@@ -157,12 +157,33 @@ class GrowthLogger:
         self._auto_capture_file.flush()
 
     def save_frame(self, frame: np.ndarray, timestamp: str = "") -> str:
-        """Save frame as PNG to session frames/ subdir, return path."""
+        """Save frame as PNG to session frames/ subdir, return path.
+
+        Runs the frame quality gate first — black/saturated/uniform/
+        undersized frames are rejected with a stderr warning and an
+        empty path returned. Callers should treat "" as "no frame saved"
+        (current convention).
+        """
         if self._session_dir is None:
             return ""
+
+        try:
+            from drivers.frame_quality import check_frame_quality
+            qa = check_frame_quality(frame)
+            if not qa.passed:
+                import sys
+                print(
+                    f"[GrowthLogger] frame rejected by quality gate: {qa.reason}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return ""
+        except ImportError:
+            pass  # Quality gate optional; degrade to old always-save behavior.
+
         self._commit_counter += 1
         ts = timestamp or datetime.now().strftime("%H%M%S")
-        fname = f"entry_{self._commit_counter:03d}_{ts}.bmp"
+        fname = f"entry_{self._commit_counter:03d}_{ts}.png"
         path = self._session_dir / "frames" / fname
 
         try:
