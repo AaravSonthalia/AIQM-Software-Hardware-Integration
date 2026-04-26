@@ -30,6 +30,10 @@ class GrowthLogger:
         "recon_rt13xrt13", "recon_HTR",
         "note", "frame_path",
     ]
+    AUTO_CAPTURE_FIELDS = [
+        "timestamp", "elapsed_s", "event_idx",
+        "change_score", "pyrometer_temp_C",
+    ]
 
     def __init__(self, base_dir: str = "logs/growths"):
         self._base_dir = Path(base_dir)
@@ -39,6 +43,8 @@ class GrowthLogger:
         self._sensor_writer = None
         self._commit_file = None
         self._commit_writer = None
+        self._auto_capture_file = None
+        self._auto_capture_writer = None
         self._commit_counter = 0
         self._entries: list[dict] = []  # Accumulated entries for export
 
@@ -76,6 +82,13 @@ class GrowthLogger:
             self._commit_file, fieldnames=self.COMMIT_FIELDS,
         )
         self._commit_writer.writeheader()
+
+        auto_capture_path = self._session_dir / "auto_capture_events.csv"
+        self._auto_capture_file = open(auto_capture_path, "w", newline="")
+        self._auto_capture_writer = csv.DictWriter(
+            self._auto_capture_file, fieldnames=self.AUTO_CAPTURE_FIELDS,
+        )
+        self._auto_capture_writer.writeheader()
 
         self._commit_counter = 0
         self._entries = []
@@ -115,6 +128,33 @@ class GrowthLogger:
         self._commit_writer.writerow(row)
         self._commit_file.flush()
         self._entries.append(entry)
+
+    def log_auto_capture_event(
+        self,
+        event_idx: int,
+        score: float,
+        elapsed_s: float,
+        pyro_temp: Optional[float] = None,
+    ):
+        """Append a row to auto_capture_events.csv for shadow-mode logging.
+
+        Called by GrowthApp when AutoCaptureEngine emits frame_captured.
+        Writes timestamp + change score + temp at trigger time, so the
+        flagged moments can be cross-referenced against grower notes
+        and pyrometer trajectory after the session.
+        """
+        if not self._auto_capture_writer:
+            return
+        self._auto_capture_writer.writerow({
+            "timestamp": datetime.now().isoformat(),
+            "elapsed_s": f"{elapsed_s:.2f}",
+            "event_idx": event_idx,
+            "change_score": f"{score:.4f}",
+            "pyrometer_temp_C": (
+                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
+            ),
+        })
+        self._auto_capture_file.flush()
 
     def save_frame(self, frame: np.ndarray, timestamp: str = "") -> str:
         """Save frame as PNG to session frames/ subdir, return path."""
@@ -273,12 +313,14 @@ class GrowthLogger:
 
     def end_session(self):
         """Close CSV files. Preserves session_dir and entries for post-stop export."""
-        for f in (self._sensor_file, self._commit_file):
+        for f in (self._sensor_file, self._commit_file, self._auto_capture_file):
             if f and not f.closed:
                 f.close()
         self._sensor_file = None
         self._sensor_writer = None
         self._commit_file = None
         self._commit_writer = None
+        self._auto_capture_file = None
+        self._auto_capture_writer = None
         # NOTE: _session_dir and _entries intentionally preserved
         # so Export Growth Log works after STOP.

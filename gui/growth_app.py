@@ -10,17 +10,29 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from PyQt6.QtWidgets import QMainWindow
 from PyQt6.QtCore import pyqtSlot, QTimer
 
 log = logging.getLogger(__name__)
 
+from gui.auto_capture import AutoCaptureEngine, PixelDiffChangeDetector
 from gui.state import CameraState, EvapControlState, MistralState, PyrometerState
 from gui.workers import (
     EvapControlWorker, MistralWorker, PyrometerWorker, RheedCameraWorker,
 )
 from gui.growth_monitor import GrowthMonitor
 from gui.growth_logger import GrowthLogger
+
+
+# Tuned against Rahim's 2022_02_04 STO trajectory using diff-vs-previous-frame
+# (baseline ~0.5, smallest real event peak ~2.5). Diff-vs-buffer-mean produces
+# larger peaks for the same transitions, so 2.0 is a moderately conservative
+# starting point. Re-tune with the buffer-mean variant before treating this
+# as final.
+AUTO_CAPTURE_THRESHOLD = 2.0
+AUTO_CAPTURE_BUFFER_SIZE = 20
+AUTO_CAPTURE_COOLDOWN_S = 10.0
 
 
 class GrowthApp(QMainWindow):
@@ -41,6 +53,22 @@ class GrowthApp(QMainWindow):
         self._sensor_log_timer = QTimer(self)
         self._sensor_log_timer.setInterval(1000)
         self._sensor_log_timer.timeout.connect(self._log_sensors)
+
+        # Auto-capture engine — shadow-mode pixel-diff change detection.
+        # Engine is disarmed at construction; armed in _on_start, disarmed
+        # in _on_stop. Frame ingestion happens in _on_camera_state.
+        self.auto_capture_engine = AutoCaptureEngine(
+            threshold=AUTO_CAPTURE_THRESHOLD,
+            cooldown_s=AUTO_CAPTURE_COOLDOWN_S,
+            warmup_frames=AUTO_CAPTURE_BUFFER_SIZE,
+        )
+        self.auto_capture_engine.set_detector(
+            PixelDiffChangeDetector(buffer_size=AUTO_CAPTURE_BUFFER_SIZE),
+        )
+        self.auto_capture_engine.frame_captured.connect(
+            self._on_auto_capture_event,
+        )
+        self._auto_capture_event_count = 0
 
         # Central widget
         self.monitor = GrowthMonitor()
@@ -134,6 +162,14 @@ class GrowthApp(QMainWindow):
         self._sensor_log_timer.setInterval(interval_ms)
         self._sensor_log_timer.start()
 
+        # Arm shadow-mode auto-capture for this session
+        self.auto_capture_engine.reset()
+        self.auto_capture_engine.enabled = True
+        self._auto_capture_event_count = 0
+        self.monitor.set_auto_capture_status(
+            "Auto-capture: armed (warmup)"
+        )
+
         self.monitor.set_state("running")
         self.statusBar().showMessage(f"Running \u2014 {sample_id}")
 
@@ -141,6 +177,14 @@ class GrowthApp(QMainWindow):
     def _on_stop(self):
         """End a growth session — save metadata, auto-export, stop logging."""
         self._sensor_log_timer.stop()
+
+        # Disarm auto-capture; engine state cleaned up so the next session
+        # starts fresh in _on_start.
+        self.auto_capture_engine.enabled = False
+        self.monitor.set_auto_capture_status(
+            f"Auto-capture: idle "
+            f"({self._auto_capture_event_count} events this session)"
+        )
 
         metadata = self.monitor.get_session_metadata()
 
@@ -227,6 +271,38 @@ class GrowthApp(QMainWindow):
     @pyqtSlot(CameraState)
     def _on_camera_state(self, state: CameraState):
         self.monitor.update_camera_state(state)
+
+        # Feed the auto-capture engine. Engine internally guards on `enabled`,
+        # so this is a no-op outside an active session.
+        if state.frame is not None and state.connected:
+            self.auto_capture_engine.evaluate(state.frame)
+            if self.auto_capture_engine.enabled:
+                self.monitor.set_auto_capture_status(
+                    f"Auto-capture: armed | "
+                    f"score: {self.auto_capture_engine.latest_score:.2f} | "
+                    f"events: {self._auto_capture_event_count}"
+                )
+
+    @pyqtSlot(np.ndarray, float)
+    def _on_auto_capture_event(self, frame: np.ndarray, score: float):
+        """Engine flagged a frame — log to auto_capture_events.csv.
+
+        Shadow mode: we only record the event metadata, not the frame
+        bytes. Cross-reference this CSV against grower notes + sensor_log
+        after the session to validate detector behavior.
+        """
+        self._auto_capture_event_count += 1
+        pyro_temp = (
+            self.monitor._latest_pyro.temperature
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            else None
+        )
+        self.growth_log.log_auto_capture_event(
+            event_idx=self._auto_capture_event_count,
+            score=score,
+            elapsed_s=self.monitor.get_elapsed_seconds(),
+            pyro_temp=pyro_temp,
+        )
 
     @pyqtSlot(PyrometerState)
     def _on_pyrometer_state(self, state: PyrometerState):

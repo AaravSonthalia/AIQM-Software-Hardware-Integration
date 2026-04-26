@@ -9,6 +9,7 @@ in without refactoring.
 """
 from __future__ import annotations
 
+import collections
 import time
 from abc import ABC, abstractmethod
 
@@ -28,7 +29,11 @@ class ChangeDetector(ABC):
 
     @abstractmethod
     def compute_score(self, frame: np.ndarray) -> float:
-        """Return a 0-1 score indicating how different this frame is from reference."""
+        """Return a score indicating how different this frame is from reference.
+
+        Score range is detector-specific. Tier 1/2 detectors return values on
+        the 0-255 absolute pixel-intensity scale; Tier 3 returns 0-1.
+        """
         ...
 
 
@@ -50,6 +55,83 @@ class IntensityChangeDetector(ChangeDetector):
         delta = abs(current - self._reference_intensity) / max(self._reference_intensity, 1e-6)
         self._reference_intensity = current  # rolling reference
         return delta
+
+
+class PixelDiffChangeDetector(ChangeDetector):
+    """Tier 1.5: Mean absolute pixel diff against a FIFO buffer of recent frames.
+
+    Maintains a deque of the last ``buffer_size`` grayscale frames. Each new
+    frame is scored as the mean absolute pixel difference between it and the
+    *mean* of the buffer. Score is then smoothed by a rolling mean over the
+    last ``smooth_window`` raw scores.
+
+    Compared to ``IntensityChangeDetector`` (mean intensity only), this
+    catches spatial pattern changes — the actual signal in reconstruction
+    transitions — not just global brightness shifts.
+
+    Threshold tuning notes (against Rahim's 2022_02_04 STO trajectory using
+    diff-vs-previous-frame): baseline ~0.5, real reconstruction events peak
+    at 2.5-9.0. Diff-vs-buffer-mean produces *larger* peaks for the same
+    transitions (full delta vs rate of delta), so an in-GUI threshold of
+    2.0-2.5 is a reasonable starting point. Re-tune offline against the
+    same dataset with the buffer-mean variant before relying on the value.
+    """
+
+    def __init__(self, buffer_size: int = 20, smooth_window: int = 3):
+        self._buffer_size = buffer_size
+        self._smooth_window = smooth_window
+        self._buffer: collections.deque[np.ndarray] = collections.deque(
+            maxlen=buffer_size,
+        )
+        # Running sum of buffer contents — O(1) buffer-mean updates rather
+        # than O(buffer_size) per frame.
+        self._sum: np.ndarray | None = None
+        self._recent_scores: collections.deque[float] = collections.deque(
+            maxlen=max(1, smooth_window),
+        )
+
+    def reset(self) -> None:
+        self._buffer.clear()
+        self._sum = None
+        self._recent_scores.clear()
+
+    def compute_score(self, frame: np.ndarray) -> float:
+        gray = self._to_gray(frame)
+
+        # Defensive reset if the camera resolution changed mid-session;
+        # the running sum is invalid against a different shape.
+        if self._sum is not None and gray.shape != self._sum.shape:
+            self.reset()
+
+        if not self._buffer:
+            self._buffer.append(gray)
+            self._sum = gray.copy()
+            self._recent_scores.append(0.0)
+            return 0.0
+
+        buffer_mean = self._sum / len(self._buffer)
+        raw_score = float(np.mean(np.abs(gray - buffer_mean)))
+
+        # Update running sum: subtract the about-to-be-evicted frame
+        # before deque.append silently drops it.
+        if len(self._buffer) == self._buffer_size:
+            self._sum -= self._buffer[0]
+        self._buffer.append(gray)
+        self._sum += gray
+
+        self._recent_scores.append(raw_score)
+        return float(sum(self._recent_scores) / len(self._recent_scores))
+
+    @staticmethod
+    def _to_gray(frame: np.ndarray) -> np.ndarray:
+        """Convert frame to float32 grayscale.
+
+        For RGB inputs (kSA false-color screengrabs), takes the green
+        channel — RHEED intensity lives there per project convention.
+        """
+        if frame.ndim == 2:
+            return frame.astype(np.float32)
+        return frame[:, :, 1].astype(np.float32)
 
 
 # Future Tier 2:

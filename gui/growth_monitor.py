@@ -336,6 +336,17 @@ class GrowthMonitor(QWidget):
         content.addLayout(right, 1)
         layout.addLayout(content, 1)
 
+        # Thin diagnostic footer for the auto-capture engine. Stays out of
+        # the way during normal use; growers can ignore it unless they want
+        # to see the live change-score / event count.
+        self.auto_capture_label = QLabel("Auto-capture: idle")
+        self.auto_capture_label.setStyleSheet(
+            "color: #888; font-size: 11px; padding: 4px 8px; "
+            "background-color: #1a1a1a; border-top: 1px solid #333;"
+        )
+        self.auto_capture_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.auto_capture_label)
+
         self._tabs.addTab(tab, "Monitor")
 
     # ----- Session Tab -----------------------------------------------------
@@ -725,6 +736,11 @@ class GrowthMonitor(QWidget):
     def get_current_frame(self) -> Optional[np.ndarray]:
         return self._current_frame
 
+    def set_auto_capture_status(self, text: str):
+        """Update the auto-capture footer label. Called by GrowthApp on
+        each evaluated frame and on session start/stop."""
+        self.auto_capture_label.setText(text)
+
     def get_session_metadata(self) -> dict:
         """Return session metadata for growth log export."""
         return {
@@ -743,6 +759,7 @@ class GrowthMonitor(QWidget):
         self.current_display.value.setText("---")
         self.pressure_display.value.setText("---")
         self.rheed_image_label.clear()
+        self.auto_capture_label.setText("Auto-capture: idle")
         self._start_time = None
         self._current_frame = None
         self._latest_psu = None
