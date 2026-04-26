@@ -44,6 +44,14 @@ AUTO_CAPTURE_THRESHOLD = 2.0
 AUTO_CAPTURE_BUFFER_SIZE = 20
 AUTO_CAPTURE_COOLDOWN_S = 10.0
 
+# Heartbeat anchor capture: every N minutes during a session, save the
+# latest RHEED frame regardless of detector flags. Gives every session a
+# coarse temporal scaffold so the team can review "what was happening at
+# minute X" even if the detector missed transitions. Per Justin's 30-50
+# total-frames-per-trajectory budget: at 10 min × 4 hr session = 24
+# anchors, leaving room for ~6-26 detector-flagged frames.
+HEARTBEAT_INTERVAL_MIN = 10.0
+
 
 class GrowthApp(QMainWindow):
     """Main window for the OMBE Growth Monitor application."""
@@ -63,6 +71,12 @@ class GrowthApp(QMainWindow):
         self._sensor_log_timer = QTimer(self)
         self._sensor_log_timer.setInterval(1000)
         self._sensor_log_timer.timeout.connect(self._log_sensors)
+
+        # Heartbeat anchor-capture timer — fires every N minutes during a
+        # session and saves whatever the latest RHEED frame is.
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(int(HEARTBEAT_INTERVAL_MIN * 60 * 1000))
+        self._heartbeat_timer.timeout.connect(self._on_heartbeat)
 
         # Auto-capture engine — shadow-mode pixel-diff change detection.
         # Engine is disarmed at construction; armed in _on_start, disarmed
@@ -180,6 +194,11 @@ class GrowthApp(QMainWindow):
             "Auto-capture: armed (warmup)"
         )
 
+        # Start heartbeat anchor capture (first fire after HEARTBEAT_INTERVAL_MIN;
+        # we don't fire-on-start to avoid saving a black frame before the
+        # camera has produced anything useful).
+        self._heartbeat_timer.start()
+
         self.monitor.set_state("running")
         self.statusBar().showMessage(f"Running \u2014 {sample_id}")
 
@@ -187,6 +206,7 @@ class GrowthApp(QMainWindow):
     def _on_stop(self):
         """End a growth session — save metadata, auto-export, stop logging."""
         self._sensor_log_timer.stop()
+        self._heartbeat_timer.stop()
 
         # Disarm auto-capture; engine state cleaned up so the next session
         # starts fresh in _on_start.
@@ -293,6 +313,36 @@ class GrowthApp(QMainWindow):
                     f"events: {self._auto_capture_event_count}"
                 )
 
+    def _on_heartbeat(self):
+        """Heartbeat timer tick — save the latest RHEED frame as an anchor.
+
+        Skips silently if no frame is available yet (camera worker hasn't
+        emitted, or session just started). Bad frames (rejected by the
+        quality gate inside save_heartbeat_frame) are also skipped — the
+        gate prints to stderr.
+        """
+        if not self.growth_log.active:
+            return
+        frame = self.monitor.get_current_frame()
+        if frame is None:
+            return
+        path = self.growth_log.save_heartbeat_frame(frame)
+        if not path:
+            return  # Quality gate rejected, or save failed
+        pyro_temp = (
+            self.monitor._latest_pyro.temperature
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            else None
+        )
+        self.growth_log.log_heartbeat(
+            elapsed_s=self.monitor.get_elapsed_seconds(),
+            pyro_temp=pyro_temp,
+            frame_path=path,
+        )
+        self.statusBar().showMessage(
+            f"Heartbeat anchor saved (#{self.growth_log._heartbeat_counter})", 3000,
+        )
+
     @pyqtSlot(np.ndarray, float)
     def _on_auto_capture_event(self, frame: np.ndarray, score: float):
         """Engine flagged a frame — log to auto_capture_events.csv.
@@ -338,6 +388,7 @@ class GrowthApp(QMainWindow):
 
     def closeEvent(self, event):
         self._sensor_log_timer.stop()
+        self._heartbeat_timer.stop()
         if self.growth_log.active:
             self.growth_log.save_session_metadata(
                 self.monitor.get_session_metadata(),

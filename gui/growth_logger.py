@@ -34,6 +34,10 @@ class GrowthLogger:
         "timestamp", "elapsed_s", "event_idx",
         "change_score", "pyrometer_temp_C",
     ]
+    HEARTBEAT_FIELDS = [
+        "timestamp", "elapsed_s", "heartbeat_idx",
+        "pyrometer_temp_C", "frame_path",
+    ]
 
     def __init__(self, base_dir: str = "logs/growths"):
         self._base_dir = Path(base_dir)
@@ -45,7 +49,10 @@ class GrowthLogger:
         self._commit_writer = None
         self._auto_capture_file = None
         self._auto_capture_writer = None
+        self._heartbeat_file = None
+        self._heartbeat_writer = None
         self._commit_counter = 0
+        self._heartbeat_counter = 0
         self._entries: list[dict] = []  # Accumulated entries for export
 
     @property
@@ -90,7 +97,15 @@ class GrowthLogger:
         )
         self._auto_capture_writer.writeheader()
 
+        heartbeat_path = self._session_dir / "heartbeat_log.csv"
+        self._heartbeat_file = open(heartbeat_path, "w", newline="")
+        self._heartbeat_writer = csv.DictWriter(
+            self._heartbeat_file, fieldnames=self.HEARTBEAT_FIELDS,
+        )
+        self._heartbeat_writer.writeheader()
+
         self._commit_counter = 0
+        self._heartbeat_counter = 0
         self._entries = []
 
     def log_sensors(
@@ -128,6 +143,68 @@ class GrowthLogger:
         self._commit_writer.writerow(row)
         self._commit_file.flush()
         self._entries.append(entry)
+
+    def save_heartbeat_frame(
+        self, frame: np.ndarray, timestamp: str = ""
+    ) -> str:
+        """Save a heartbeat anchor frame as ``heartbeat_NNN_HHMMSS.png``.
+
+        Same quality gate as ``save_frame``; failed frames return "" and
+        are not counted toward the heartbeat counter.
+        """
+        if self._session_dir is None:
+            return ""
+
+        try:
+            from drivers.frame_quality import check_frame_quality
+            qa = check_frame_quality(frame)
+            if not qa.passed:
+                import sys
+                print(
+                    f"[GrowthLogger] heartbeat frame rejected: {qa.reason}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return ""
+        except ImportError:
+            pass
+
+        self._heartbeat_counter += 1
+        ts = timestamp or datetime.now().strftime("%H%M%S")
+        fname = f"heartbeat_{self._heartbeat_counter:03d}_{ts}.png"
+        path = self._session_dir / "frames" / fname
+
+        try:
+            from PIL import Image
+            Image.fromarray(frame).save(str(path))
+        except ImportError:
+            try:
+                import cv2
+                cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            except ImportError:
+                return ""
+
+        return str(path)
+
+    def log_heartbeat(
+        self,
+        elapsed_s: float,
+        pyro_temp: Optional[float] = None,
+        frame_path: str = "",
+    ):
+        """Append a row to heartbeat_log.csv. Pairs with save_heartbeat_frame."""
+        if not self._heartbeat_writer:
+            return
+        self._heartbeat_writer.writerow({
+            "timestamp": datetime.now().isoformat(),
+            "elapsed_s": f"{elapsed_s:.2f}",
+            "heartbeat_idx": self._heartbeat_counter,
+            "pyrometer_temp_C": (
+                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
+            ),
+            "frame_path": frame_path,
+        })
+        self._heartbeat_file.flush()
 
     def log_auto_capture_event(
         self,
@@ -334,7 +411,10 @@ class GrowthLogger:
 
     def end_session(self):
         """Close CSV files. Preserves session_dir and entries for post-stop export."""
-        for f in (self._sensor_file, self._commit_file, self._auto_capture_file):
+        for f in (
+            self._sensor_file, self._commit_file,
+            self._auto_capture_file, self._heartbeat_file,
+        ):
             if f and not f.closed:
                 f.close()
         self._sensor_file = None
@@ -343,5 +423,7 @@ class GrowthLogger:
         self._commit_writer = None
         self._auto_capture_file = None
         self._auto_capture_writer = None
+        self._heartbeat_file = None
+        self._heartbeat_writer = None
         # NOTE: _session_dir and _entries intentionally preserved
         # so Export Growth Log works after STOP.
