@@ -222,6 +222,10 @@ class AutoCaptureEngine(QObject):
         cooldown_s: float = 5.0,
         warmup_frames: int = 30,
         context_buffer_size: int = 20,
+        adaptive_sigma: float | None = None,
+        adaptive_history: int = 100,
+        adaptive_warmup: int = 20,
+        adaptive_floor: float = 1.0,
         parent=None,
     ):
         super().__init__(parent)
@@ -245,6 +249,21 @@ class AutoCaptureEngine(QObject):
             maxlen=context_buffer_size,
         )
 
+        # Adaptive thresholding: when adaptive_sigma is set, the trigger
+        # threshold becomes max(adaptive_floor, μ + Nσ) over a rolling
+        # window of recent below-threshold scores. Cross-dataset validation
+        # on Rahim's STO trajectories showed real events varying by an
+        # order of magnitude in raw score, with stable baselines — adaptive
+        # generalizes better than a fixed cutoff. Set to None to keep the
+        # original fixed-threshold behavior.
+        self._adaptive_sigma = adaptive_sigma
+        self._adaptive_history = adaptive_history
+        self._adaptive_warmup = adaptive_warmup
+        self._adaptive_floor = adaptive_floor
+        self._baseline_scores: collections.deque[float] = collections.deque(
+            maxlen=adaptive_history,
+        )
+
     # -- Public API ---------------------------------------------------------
 
     @property
@@ -257,11 +276,35 @@ class AutoCaptureEngine(QObject):
 
     @property
     def threshold(self) -> float:
+        """The fixed-threshold value (used when adaptive is off, or as a
+        fallback during the adaptive warmup)."""
         return self._threshold
 
     @threshold.setter
     def threshold(self, value: float) -> None:
         self._threshold = value
+
+    @property
+    def effective_threshold(self) -> float:
+        """The threshold actually applied this cycle.
+
+        Adaptive (μ + Nσ over the rolling baseline) when adaptive_sigma is
+        configured AND the baseline has filled to at least adaptive_warmup
+        samples. Falls back to the fixed threshold during warmup so the
+        detector behaves predictably in the first ~30 frames of a session.
+        Always clamped to adaptive_floor to prevent runaway sensitivity in
+        pathologically quiet sessions.
+        """
+        if (
+            self._adaptive_sigma is None
+            or len(self._baseline_scores) < self._adaptive_warmup
+        ):
+            return self._threshold
+        arr = np.asarray(self._baseline_scores, dtype=np.float64)
+        return max(
+            self._adaptive_floor,
+            float(arr.mean() + self._adaptive_sigma * arr.std()),
+        )
 
     @property
     def latest_score(self) -> float:
@@ -288,6 +331,7 @@ class AutoCaptureEngine(QObject):
         self._debounce_count = 0
         self._latest_score = 0.0
         self._context_buffer.clear()
+        self._baseline_scores.clear()
 
     def evaluate(self, frame: np.ndarray) -> None:
         """Called once per camera frame. Emits *frame_captured* if triggered."""
@@ -309,10 +353,16 @@ class AutoCaptureEngine(QObject):
         self._latest_score = score
         now = time.time()
 
-        if score >= self._threshold:
+        threshold = self.effective_threshold
+        if score >= threshold:
             self._debounce_count += 1
         else:
             self._debounce_count = 0
+            # Only non-flagged scores feed the adaptive baseline — events
+            # would pollute the rolling mean and pull the threshold up
+            # behind their own peak. The fixed-mode path appends too,
+            # which is harmless (the deque is just unused).
+            self._baseline_scores.append(score)
 
         if (
             self._debounce_count >= self._debounce_required

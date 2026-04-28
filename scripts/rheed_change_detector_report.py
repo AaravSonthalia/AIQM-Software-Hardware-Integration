@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import io
 import re
 import sys
@@ -148,6 +149,48 @@ def array_to_b64_png(arr: np.ndarray, cmap: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Adaptive thresholding (mirrors AutoCaptureEngine.effective_threshold)
+# ---------------------------------------------------------------------------
+
+def adaptive_threshold_per_frame(
+    smoothed: np.ndarray,
+    sigma: float,
+    floor: float = 1.0,
+    history: int = 100,
+    warmup: int = 30,
+    fallback_threshold: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-frame adaptive thresholds and a flag mask.
+
+    Mirrors the live engine's logic: a rolling FIFO of the last ``history``
+    *non-flagged* scores; once it has at least ``warmup`` samples, the
+    threshold for the next frame is ``max(floor, μ + sigma·σ)`` over the
+    rolling baseline. During the warmup the fixed ``fallback_threshold``
+    is used so the algorithm doesn't fire spuriously on its first frames.
+
+    The "exclude flagged from baseline" trick keeps events from polluting
+    the rolling mean — otherwise a sustained event would pull the
+    threshold up behind its own peak and the algorithm would self-suppress.
+    """
+    n = len(smoothed)
+    thresholds = np.full(n, fallback_threshold, dtype=float)
+    flagged = np.zeros(n, dtype=bool)
+    baseline: collections.deque[float] = collections.deque(maxlen=history)
+
+    for i, score in enumerate(smoothed):
+        if len(baseline) >= warmup:
+            arr = np.asarray(baseline, dtype=np.float64)
+            thresholds[i] = max(floor, float(arr.mean() + sigma * arr.std()))
+        # else: thresholds[i] keeps the fallback set by np.full
+
+        flagged[i] = score > thresholds[i]
+        if not flagged[i]:
+            baseline.append(float(score))
+
+    return thresholds, flagged
+
+
+# ---------------------------------------------------------------------------
 # Section builders — each returns an HTML string
 # ---------------------------------------------------------------------------
 
@@ -164,6 +207,9 @@ class ReportInputs:
     buffer_size: int
     primary_mode: str
     flagged: np.ndarray
+    # Adaptive bookkeeping — None when running in fixed-threshold mode.
+    adaptive_sigma: float | None = None
+    adaptive_thresholds: np.ndarray | None = None  # per-frame, len == flagged
 
 
 def build_summary(inp: ReportInputs) -> str:
@@ -174,6 +220,20 @@ def build_summary(inp: ReportInputs) -> str:
     baseline = raw[~flagged_mask][1:]  # exclude first 0.0 and any flagged points
     events = group_events(inp.flagged, raw, inp.frames)
 
+    if inp.adaptive_thresholds is not None and inp.adaptive_sigma is not None:
+        post_warmup = inp.adaptive_thresholds[inp.adaptive_thresholds < inp.threshold]
+        adaptive_summary = (
+            f"adaptive μ + {inp.adaptive_sigma:g}σ — "
+            f"min {post_warmup.min():.2f}, "
+            f"median {float(np.median(post_warmup)):.2f}, "
+            f"max {post_warmup.max():.2f}"
+            if post_warmup.size else
+            f"adaptive μ + {inp.adaptive_sigma:g}σ — never warmed up"
+        )
+        threshold_label = f"fixed fallback {inp.threshold:.2f}; {adaptive_summary}"
+    else:
+        threshold_label = f"fixed {inp.threshold:.2f}"
+
     rows = [
         ("Frames directory", str(inp.frames_dir)),
         ("Frame count", f"{len(inp.frames)}"),
@@ -181,7 +241,7 @@ def build_summary(inp: ReportInputs) -> str:
         ("Primary mode", inp.primary_mode),
         ("Buffer size", f"{inp.buffer_size}" if inp.primary_mode == "buffer-mean" else "n/a"),
         ("Smooth window", f"{inp.smooth_window}"),
-        ("Threshold", f"{inp.threshold:.2f}"),
+        ("Threshold", threshold_label),
         ("Baseline (non-flagged) mean ± std", f"{baseline.mean():.2f} ± {baseline.std():.2f}"),
         ("Score range (raw)", f"{nonzero.min():.2f} – {nonzero.max():.2f}"),
         ("Flagged frames", f"{int(flagged_mask.sum())} ({100 * flagged_mask.mean():.1f}%)"),
@@ -204,8 +264,20 @@ def build_histogram(inp: ReportInputs) -> str:
     bins = np.linspace(0, max(scores.max() * 1.05, inp.threshold * 2), 60)
     ax.hist(scores[~flagged_mask], bins=bins, color="steelblue", alpha=0.85, label="below threshold")
     ax.hist(scores[flagged_mask], bins=bins, color="crimson", alpha=0.85, label="flagged")
-    ax.axvline(inp.threshold, color="black", linestyle="--", linewidth=1.2,
-               label=f"threshold = {inp.threshold:.2f}")
+    if inp.adaptive_thresholds is not None and inp.adaptive_sigma is not None:
+        # Show the adaptive threshold's range as a shaded band + median line
+        # — a single dashed line would lie about a varying threshold.
+        post_warmup = inp.adaptive_thresholds[inp.adaptive_thresholds < inp.threshold]
+        if post_warmup.size:
+            t_med = float(np.median(post_warmup))
+            t_min, t_max = float(post_warmup.min()), float(post_warmup.max())
+            ax.axvspan(t_min, t_max, color="black", alpha=0.10,
+                       label=f"adaptive range [{t_min:.2f}, {t_max:.2f}]")
+            ax.axvline(t_med, color="black", linestyle="--", linewidth=1.2,
+                       label=f"adaptive median {t_med:.2f}")
+    else:
+        ax.axvline(inp.threshold, color="black", linestyle="--", linewidth=1.2,
+                   label=f"threshold = {inp.threshold:.2f}")
     ax.set_xlabel("smoothed mean abs pixel diff (0–255)")
     ax.set_ylabel("frame count")
     ax.set_title("Score distribution — does the threshold sit in a clean gap?")
@@ -229,8 +301,12 @@ def build_timeseries(inp: ReportInputs) -> str:
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.plot(raw, color="lightgray", linewidth=0.6, label="raw |Δ|")
     ax.plot(smoothed, color="steelblue", linewidth=1.5, label="smoothed |Δ|")
-    ax.axhline(inp.threshold, color="crimson", linestyle="--", linewidth=1,
-               label=f"threshold = {inp.threshold:.2f}")
+    if inp.adaptive_thresholds is not None and inp.adaptive_sigma is not None:
+        ax.plot(inp.adaptive_thresholds, color="crimson", linestyle="--",
+                linewidth=1.2, label=f"adaptive (μ + {inp.adaptive_sigma:g}σ)")
+    else:
+        ax.axhline(inp.threshold, color="crimson", linestyle="--", linewidth=1,
+                   label=f"threshold = {inp.threshold:.2f}")
     for ev in events:
         ax.axvspan(ev.start_idx - 0.5, ev.end_idx + 0.5, color="crimson", alpha=0.18)
     ax.set_xlabel("frame index (chronological)")
@@ -490,6 +566,20 @@ def parse_args() -> argparse.Namespace:
                    help=f"Comma-separated frame extensions (default: {','.join(DEFAULT_EXTENSIONS)}).")
     p.add_argument("--output", type=Path, default=None,
                    help="Output HTML path (default: <frames_dir>/../validation_report.html).")
+    p.add_argument("--adaptive-sigma", type=float, default=None,
+                   help="If set, use adaptive μ + Nσ thresholding instead of the fixed --threshold. "
+                        "Mirrors the live AutoCaptureEngine when configured the same way. "
+                        "Common values: 3.0 (3σ above noise; defensible by stats) or 4.0 (more conservative).")
+    p.add_argument("--adaptive-floor", type=float, default=1.0,
+                   help="Lower bound on the adaptive threshold (default 1.0). Prevents runaway "
+                        "sensitivity in pathologically quiet sessions where σ is tiny.")
+    p.add_argument("--adaptive-history", type=int, default=100,
+                   help="Rolling-window size for the adaptive baseline (default 100 frames).")
+    p.add_argument("--adaptive-warmup", type=int, default=20,
+                   help="Frames required in the rolling baseline before adaptive kicks in. "
+                        "During warmup, --threshold is used as a fallback. Default 20 — "
+                        "tuned against Rahim's 02_06 dataset where the first real event "
+                        "occurs around frame 25; warmup=30 misses it entirely.")
     return p.parse_args()
 
 
@@ -514,8 +604,26 @@ def main() -> int:
 
     primary_raw = raw_prev if args.mode == "previous" else raw_buf
     smoothed = smooth(primary_raw, args.smooth_window)
-    flagged = smoothed > args.threshold
-    flagged[0] = False
+
+    adaptive_thresholds = None
+    if args.adaptive_sigma is not None:
+        print(
+            f"computing adaptive thresholds (μ + {args.adaptive_sigma}σ, "
+            f"floor={args.adaptive_floor}, history={args.adaptive_history}, "
+            f"warmup={args.adaptive_warmup})..."
+        )
+        adaptive_thresholds, flagged = adaptive_threshold_per_frame(
+            smoothed,
+            sigma=args.adaptive_sigma,
+            floor=args.adaptive_floor,
+            history=args.adaptive_history,
+            warmup=args.adaptive_warmup,
+            fallback_threshold=args.threshold,
+        )
+        flagged[0] = False
+    else:
+        flagged = smoothed > args.threshold
+        flagged[0] = False
 
     inputs = ReportInputs(
         frames_dir=args.frames_dir,
@@ -529,6 +637,8 @@ def main() -> int:
         buffer_size=args.buffer_size,
         primary_mode=args.mode,
         flagged=flagged,
+        adaptive_sigma=args.adaptive_sigma,
+        adaptive_thresholds=adaptive_thresholds,
     )
 
     print("rendering HTML...")
