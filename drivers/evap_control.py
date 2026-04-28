@@ -22,6 +22,28 @@ from drivers.ocr import capture_window, find_window, ocr_crop
 # black interior before the text. Earlier shifts (x=8, x=15) still
 # captured bezel pixels that tesseract read as a phantom leading '1'.
 PRESSURE_BBOX = (18, 130, 100, 50)
+CALIBRATION_WINDOW_SIZE = (1497, 567)
+
+
+def scale_bbox_to_window(
+    calibration_bbox: tuple[int, int, int, int],
+    calibration_size: tuple[int, int],
+    current_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Scale a calibrated bbox proportionally to the current window size.
+
+    Same shape-uniform-stretch assumption as the matching helper in
+    drivers.mistral. If the LabVIEW panel reflows on resize (the Pressure
+    cell moves to a different relative position), this won't help — that
+    needs anchor-based detection (template-match the label, crop relative
+    to it), tracked as a future improvement.
+    """
+    cur_w, cur_h = current_size
+    cal_w, cal_h = calibration_size
+    x, y, w, h = calibration_bbox
+    sx = cur_w / cal_w
+    sy = cur_h / cal_h
+    return (round(x * sx), round(y * sy), round(w * sx), round(h * sy))
 
 OCR_CONFIG = (
     "--psm 6 "
@@ -40,8 +62,11 @@ class EvapControl:
     def __init__(
         self,
         window_title_substring: str = "Evaporation control",
-        bbox: tuple[int, int, int, int] = PRESSURE_BBOX,
+        bbox: Optional[tuple[int, int, int, int]] = None,
     ):
+        """``bbox`` overrides the auto-scaled crop. Default ``None`` =
+        scale ``PRESSURE_BBOX`` proportionally to the captured window
+        size at each read."""
         self._substring = window_title_substring
         self._bbox = bbox
         self._hwnd = 0
@@ -66,7 +91,14 @@ class EvapControl:
         except Exception:
             return result
 
-        text = ocr_crop(frame, self._bbox, OCR_CONFIG, label="evap")
+        if self._bbox is not None:
+            bbox = self._bbox
+        else:
+            h, w = frame.shape[:2]
+            bbox = scale_bbox_to_window(
+                PRESSURE_BBOX, CALIBRATION_WINDOW_SIZE, (w, h),
+            )
+        text = ocr_crop(frame, bbox, OCR_CONFIG, label="evap")
         if not text:
             return result
 

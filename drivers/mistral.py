@@ -17,8 +17,31 @@ from drivers.ocr import capture_window, find_window, ocr_crop
 
 
 # V/I block crop (x, y, w, h), relative to the MistralGui window top-left.
-# Measured on Bulbasaur at 1793x1039 window size.
+# Measured on Bulbasaur at 1793x1039 window size — see CALIBRATION_WINDOW_SIZE.
 VI_BBOX = (970, 90, 585, 80)
+CALIBRATION_WINDOW_SIZE = (1793, 1039)
+
+
+def scale_bbox_to_window(
+    calibration_bbox: tuple[int, int, int, int],
+    calibration_size: tuple[int, int],
+    current_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Scale a calibrated bbox proportionally to the current window size.
+
+    Handles the common case where a grower resizes the window or where DPI
+    scaling differs between machines. Assumes the OCR target stays in the
+    same proportional location — a uniform stretch. If the window layout
+    *reflows* (the V/I block moves to a different relative position), this
+    won't help; that needs anchor-based detection (template-match the label,
+    crop relative to it), tracked as a future improvement.
+    """
+    cur_w, cur_h = current_size
+    cal_w, cal_h = calibration_size
+    x, y, w, h = calibration_bbox
+    sx = cur_w / cal_w
+    sy = cur_h / cal_h
+    return (round(x * sx), round(y * sy), round(w * sx), round(h * sy))
 
 # PSM 6 = uniform block of text. Whitelist trims OCR search space to the
 # actual characters present in the V/I display.
@@ -53,10 +76,17 @@ class MistralGui:
     def __init__(
         self,
         window_title_substring: str = "MistralGui",
-        bbox: tuple[int, int, int, int] = VI_BBOX,
+        bbox: Optional[tuple[int, int, int, int]] = None,
     ):
+        """Construct a MISTRAL OCR reader.
+
+        ``bbox`` overrides the auto-scaled crop. Pass ``None`` (default)
+        to let the driver scale ``VI_BBOX`` proportionally to the captured
+        window size at each read — the right choice unless you've measured
+        a custom crop yourself.
+        """
         self._substring = window_title_substring
-        self._bbox = bbox
+        self._bbox = bbox  # explicit override; None → auto-scale per read
         self._hwnd = 0
         self._connected = False
 
@@ -82,7 +112,13 @@ class MistralGui:
         except Exception:
             return result
 
-        text = ocr_crop(frame, self._bbox, OCR_CONFIG, label="mistral")
+        # frame.shape is (H, W, C); ocr_crop expects (x, y, w, h) bbox.
+        if self._bbox is not None:
+            bbox = self._bbox
+        else:
+            h, w = frame.shape[:2]
+            bbox = scale_bbox_to_window(VI_BBOX, CALIBRATION_WINDOW_SIZE, (w, h))
+        text = ocr_crop(frame, bbox, OCR_CONFIG, label="mistral")
         if not text:
             return result
 
