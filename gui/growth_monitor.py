@@ -135,6 +135,118 @@ MAX_SENSOR_DISPLAY_ROWS = 500
 # GrowthMonitor
 # ---------------------------------------------------------------------------
 
+class AutoCaptureBanner(QFrame):
+    """Non-modal interrupt banner shown when auto-capture flags an event.
+
+    Default behavior is to *keep* the just-saved context buffer — the
+    countdown auto-confirms keep on timeout. The grower can hit Discard
+    to delete the buffer directory if the flag looks spurious. Discard
+    only deletes the visual frames; the CSV row in
+    ``auto_capture_events.csv`` stays as a record that the detector
+    fired (with `buffer_count` reflecting the original save).
+
+    Apr 17 design — the "progress bar" interrupt mechanism that builds
+    grower trust in the detector's prompt cadence before the
+    classifier-driven version takes over.
+    """
+
+    discard_requested = pyqtSignal(str)  # emits buffer_dir (relative to session)
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(
+            "AutoCaptureBanner { background-color: #fff5e6; "
+            "border-left: 4px solid #d97706; border-radius: 2px; }"
+            "QLabel { color: #333; background: transparent; }"
+            "QPushButton { padding: 4px 14px; font-size: 12px; }"
+        )
+        self.setFixedHeight(44)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(10)
+
+        self._icon_label = QLabel("⚡")  # lightning bolt
+        self._icon_label.setStyleSheet("font-size: 18px; color: #d97706;")
+        layout.addWidget(self._icon_label)
+
+        self._message_label = QLabel("")
+        self._message_label.setStyleSheet("font-size: 13px; font-weight: 600;")
+        layout.addWidget(self._message_label)
+
+        layout.addStretch(1)
+
+        self._countdown_label = QLabel("")
+        self._countdown_label.setStyleSheet("font-size: 12px; color: #666;")
+        layout.addWidget(self._countdown_label)
+
+        self._discard_btn = QPushButton("Discard")
+        self._discard_btn.setStyleSheet(
+            "QPushButton { background-color: #fff; color: #b91c1c; "
+            "border: 1px solid #b91c1c; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #fee2e2; }"
+        )
+        self._discard_btn.clicked.connect(self._on_discard_clicked)
+        layout.addWidget(self._discard_btn)
+
+        self._keep_btn = QPushButton("Keep Now")
+        self._keep_btn.setStyleSheet(
+            "QPushButton { background-color: #fff; color: #15803d; "
+            "border: 1px solid #15803d; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #dcfce7; }"
+        )
+        self._keep_btn.clicked.connect(self._on_keep_clicked)
+        layout.addWidget(self._keep_btn)
+
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.setInterval(1000)
+        self._countdown_timer.timeout.connect(self._tick)
+        self._countdown_remaining = 0
+        self._current_buffer_dir = ""
+        self.hide()
+
+    def show_event(
+        self,
+        event_idx: int,
+        score: float,
+        buffer_dir: str,
+        countdown_s: int = 10,
+    ) -> None:
+        """Display the banner for one flagged event."""
+        self._current_buffer_dir = buffer_dir
+        self._countdown_remaining = max(1, int(countdown_s))
+        self._message_label.setText(
+            f"Auto-capture event #{event_idx} flagged (score {score:.2f})"
+        )
+        self._update_countdown_label()
+        self.show()
+        self._countdown_timer.start()
+
+    def _tick(self) -> None:
+        self._countdown_remaining -= 1
+        if self._countdown_remaining <= 0:
+            self._on_keep_clicked()
+        else:
+            self._update_countdown_label()
+
+    def _update_countdown_label(self) -> None:
+        self._countdown_label.setText(
+            f"Auto-keeping in {self._countdown_remaining}s"
+        )
+
+    def _on_discard_clicked(self) -> None:
+        self._countdown_timer.stop()
+        if self._current_buffer_dir:
+            self.discard_requested.emit(self._current_buffer_dir)
+        self.hide()
+
+    def _on_keep_clicked(self) -> None:
+        self._countdown_timer.stop()
+        self.hide()
+
+
 class GrowthMonitor(QWidget):
     """Main growth monitoring widget — OMBE growth log assistant."""
 
@@ -144,6 +256,10 @@ class GrowthMonitor(QWidget):
     stop_requested = pyqtSignal()
     commit_requested = pyqtSignal(dict)
     export_requested = pyqtSignal()
+    # True = user wants auto-capture paused; False = wants it resumed.
+    auto_capture_pause_toggled = pyqtSignal(bool)
+    # Forwarded from the banner — emits the relative buffer dir to delete.
+    auto_capture_event_discarded = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -224,6 +340,14 @@ class GrowthMonitor(QWidget):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
+
+        # Auto-capture event banner — hidden by default, surfaces when the
+        # detector flags an event and disappears on Keep / Discard / timeout.
+        self.auto_capture_banner = AutoCaptureBanner()
+        self.auto_capture_banner.discard_requested.connect(
+            self._on_auto_capture_discard,
+        )
+        layout.addWidget(self.auto_capture_banner)
 
         # Value displays at top of monitor tab
         vals = QHBoxLayout()
@@ -339,13 +463,35 @@ class GrowthMonitor(QWidget):
         # Thin diagnostic footer for the auto-capture engine. Stays out of
         # the way during normal use; growers can ignore it unless they want
         # to see the live change-score / event count.
+        footer = QHBoxLayout()
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer.setSpacing(8)
         self.auto_capture_label = QLabel("Auto-capture: idle")
         self.auto_capture_label.setStyleSheet(
             "color: #888; font-size: 11px; padding: 4px 8px; "
             "background-color: #1a1a1a; border-top: 1px solid #333;"
         )
         self.auto_capture_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        layout.addWidget(self.auto_capture_label)
+        footer.addWidget(self.auto_capture_label, 1)
+
+        # Pause toggle — soft halt of auto-capture only. Sensor logging,
+        # heartbeat, and frame display all keep running. Emergency stop
+        # (full session halt) remains on the top-bar STOP button.
+        self.pause_auto_capture_btn = QPushButton("Pause Auto-Capture")
+        self.pause_auto_capture_btn.setCheckable(True)
+        self.pause_auto_capture_btn.setEnabled(False)
+        self.pause_auto_capture_btn.setStyleSheet(
+            "QPushButton { background-color: #1a1a1a; color: #aaa; "
+            "border: 1px solid #444; padding: 2px 10px; font-size: 11px; }"
+            "QPushButton:checked { background-color: #7c2d12; color: #fff; "
+            "border: 1px solid #c2410c; }"
+            "QPushButton:disabled { color: #555; border-color: #2a2a2a; }"
+        )
+        self.pause_auto_capture_btn.clicked.connect(
+            self._on_pause_auto_capture_clicked,
+        )
+        footer.addWidget(self.pause_auto_capture_btn, 0)
+        layout.addLayout(footer)
 
         self._tabs.addTab(tab, "Monitor")
 
@@ -740,6 +886,41 @@ class GrowthMonitor(QWidget):
         """Update the auto-capture footer label. Called by GrowthApp on
         each evaluated frame and on session start/stop."""
         self.auto_capture_label.setText(text)
+
+    def show_auto_capture_event(
+        self,
+        event_idx: int,
+        score: float,
+        buffer_dir: str,
+        countdown_s: int = 10,
+    ):
+        """Display the non-modal auto-capture banner for a flagged event."""
+        self.auto_capture_banner.show_event(
+            event_idx, score, buffer_dir, countdown_s,
+        )
+
+    def _on_auto_capture_discard(self, buffer_dir: str):
+        """Re-emit the banner's discard signal at the GrowthMonitor level
+        so GrowthApp can wire the cleanup without knowing about the banner."""
+        self.auto_capture_event_discarded.emit(buffer_dir)
+
+    def set_auto_capture_pause_enabled(self, enabled: bool):
+        """Enable/disable the pause toggle. Called by GrowthApp at session
+        start (enable) and stop (disable + reset to unpaused)."""
+        self.pause_auto_capture_btn.setEnabled(enabled)
+        if not enabled and self.pause_auto_capture_btn.isChecked():
+            # Force the toggle back to "Pause" so a re-armed session starts
+            # in the running state without the button stuck in "Resume".
+            self.pause_auto_capture_btn.setChecked(False)
+            self.pause_auto_capture_btn.setText("Pause Auto-Capture")
+
+    def _on_pause_auto_capture_clicked(self):
+        """Toggle handler — flips label text and emits the request signal."""
+        paused = self.pause_auto_capture_btn.isChecked()
+        self.pause_auto_capture_btn.setText(
+            "Resume Auto-Capture" if paused else "Pause Auto-Capture"
+        )
+        self.auto_capture_pause_toggled.emit(paused)
 
     def get_session_metadata(self) -> dict:
         """Return session metadata for growth log export."""

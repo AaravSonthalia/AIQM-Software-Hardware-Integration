@@ -221,6 +221,7 @@ class AutoCaptureEngine(QObject):
         threshold: float = 0.20,
         cooldown_s: float = 5.0,
         warmup_frames: int = 30,
+        context_buffer_size: int = 20,
         parent=None,
     ):
         super().__init__(parent)
@@ -235,6 +236,14 @@ class AutoCaptureEngine(QObject):
         self._debounce_count = 0
         self._debounce_required = 3  # consecutive frames above threshold
         self._latest_score = 0.0
+
+        # Pre-event ring buffer of full-resolution RGB frames. Maintained
+        # in parallel with the detector's internal grayscale buffer so that
+        # when frame_captured fires we can dump the visual context that
+        # led up to the trigger. Sized in frames; at ~10 Hz, 20 ≈ 2 s.
+        self._context_buffer: collections.deque[np.ndarray] = collections.deque(
+            maxlen=context_buffer_size,
+        )
 
     # -- Public API ---------------------------------------------------------
 
@@ -262,6 +271,15 @@ class AutoCaptureEngine(QObject):
         """Swap in a different detection strategy (Tier 2/3)."""
         self._detector = detector
 
+    def get_recent_frames(self) -> list[np.ndarray]:
+        """Snapshot of the context buffer (oldest → newest), defensively copied.
+
+        Used by the caller after frame_captured to dump the visual context
+        leading up to a flagged event. Returns an empty list before any
+        frames have been evaluated.
+        """
+        return [f.copy() for f in self._context_buffer]
+
     def reset(self) -> None:
         """Reset internal counters (call on session start)."""
         self._detector.reset()
@@ -269,11 +287,17 @@ class AutoCaptureEngine(QObject):
         self._last_capture_time = 0.0
         self._debounce_count = 0
         self._latest_score = 0.0
+        self._context_buffer.clear()
 
     def evaluate(self, frame: np.ndarray) -> None:
         """Called once per camera frame. Emits *frame_captured* if triggered."""
         if not self._enabled:
             return
+
+        # Populate the context buffer regardless of warmup state — when a
+        # trigger fires shortly after warmup ends, we want pre-event context
+        # from the warmup window itself.
+        self._context_buffer.append(frame.copy())
 
         self._frame_count += 1
         if self._frame_count <= self._warmup_frames:

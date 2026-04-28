@@ -34,6 +34,7 @@ class GrowthLogger:
     AUTO_CAPTURE_FIELDS = [
         "timestamp", "elapsed_s", "event_idx",
         "change_score", "pyrometer_temp_C",
+        "buffer_count", "buffer_dir",
     ]
     HEARTBEAT_FIELDS = [
         "timestamp", "elapsed_s", "heartbeat_idx",
@@ -268,13 +269,17 @@ class GrowthLogger:
         score: float,
         elapsed_s: float,
         pyro_temp: Optional[float] = None,
+        buffer_count: int = 0,
+        buffer_dir: str = "",
     ):
         """Append a row to auto_capture_events.csv for shadow-mode logging.
 
         Called by GrowthApp when AutoCaptureEngine emits frame_captured.
         Writes timestamp + change score + temp at trigger time, so the
         flagged moments can be cross-referenced against grower notes
-        and pyrometer trajectory after the session.
+        and pyrometer trajectory after the session. ``buffer_count`` and
+        ``buffer_dir`` capture how many context frames were dumped and
+        where, so post-hoc analysis can locate them.
         """
         if not self._auto_capture_writer:
             return
@@ -286,8 +291,60 @@ class GrowthLogger:
             "pyrometer_temp_C": (
                 f"{pyro_temp:.1f}" if pyro_temp is not None else ""
             ),
+            "buffer_count": buffer_count,
+            "buffer_dir": buffer_dir,
         })
         self._auto_capture_file.flush()
+
+    def save_auto_capture_buffer(
+        self,
+        event_idx: int,
+        frames: list[np.ndarray],
+    ) -> tuple[int, str]:
+        """Save the auto-capture context buffer for a flagged event.
+
+        Each frame is written to a per-event subdirectory under frames/ so
+        that sessions with many events stay browsable. The quality gate is
+        applied per-frame; rejected frames are silently skipped (they don't
+        carry information worth keeping).
+
+        Returns ``(saved_count, relative_dir)``. ``relative_dir`` is empty
+        if no session is active.
+        """
+        if self._session_dir is None or not frames:
+            return 0, ""
+
+        try:
+            from drivers.frame_quality import check_frame_quality
+        except ImportError:
+            check_frame_quality = None
+
+        event_dir = self._session_dir / "frames" / f"auto_event_{event_idx:03d}"
+        event_dir.mkdir(parents=True, exist_ok=True)
+
+        ts_tag = datetime.now().strftime("%H%M%S")
+        saved = 0
+        for pos, frame in enumerate(frames):
+            if check_frame_quality is not None:
+                qa = check_frame_quality(frame)
+                if not qa.passed:
+                    continue
+            fname = f"buf_{pos:02d}_{ts_tag}.png"
+            path = event_dir / fname
+            try:
+                from PIL import Image
+                Image.fromarray(frame).save(str(path))
+                saved += 1
+            except ImportError:
+                try:
+                    import cv2
+                    cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                    saved += 1
+                except ImportError:
+                    break
+
+        rel_dir = str(event_dir.relative_to(self._session_dir))
+        return saved, rel_dir
 
     def save_frame(self, frame: np.ndarray, timestamp: str = "") -> str:
         """Save frame as PNG to session frames/ subdir, return path.

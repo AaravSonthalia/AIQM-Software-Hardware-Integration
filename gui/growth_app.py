@@ -118,6 +118,12 @@ class GrowthApp(QMainWindow):
         self.monitor.stop_requested.connect(self._on_stop)
         self.monitor.commit_requested.connect(self._on_commit)
         self.monitor.export_requested.connect(self._on_export)
+        self.monitor.auto_capture_pause_toggled.connect(
+            self._on_auto_capture_pause_toggled,
+        )
+        self.monitor.auto_capture_event_discarded.connect(
+            self._on_auto_capture_event_discarded,
+        )
 
     # --- ARM / DISARM ------------------------------------------------------
 
@@ -206,6 +212,7 @@ class GrowthApp(QMainWindow):
         self.monitor.set_auto_capture_status(
             "Auto-capture: armed (warmup)"
         )
+        self.monitor.set_auto_capture_pause_enabled(True)
 
         # Reset MISTRAL set-tracking so we don't fire a false change event
         # against the previous session's last value.
@@ -233,6 +240,7 @@ class GrowthApp(QMainWindow):
             f"Auto-capture: idle "
             f"({self._auto_capture_event_count} events this session)"
         )
+        self.monitor.set_auto_capture_pause_enabled(False)
 
         metadata = self.monitor.get_session_metadata()
 
@@ -365,11 +373,13 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot(np.ndarray, float)
     def _on_auto_capture_event(self, frame: np.ndarray, score: float):
-        """Engine flagged a frame — log to auto_capture_events.csv.
+        """Engine flagged a frame — log event + dump pre-event context buffer.
 
-        Shadow mode: we only record the event metadata, not the frame
-        bytes. Cross-reference this CSV against grower notes + sensor_log
-        after the session to validate detector behavior.
+        The CSV row records timestamp, score, and temp at trigger time
+        for cross-referencing against grower notes + sensor_log. The
+        context buffer (last ~20 frames including the flagged one) is
+        dumped to ``frames/auto_event_NNN/`` so post-hoc analysis can see
+        the visual evolution leading up to the trigger.
         """
         self._auto_capture_event_count += 1
         pyro_temp = (
@@ -377,12 +387,76 @@ class GrowthApp(QMainWindow):
             if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
             else None
         )
+        context_frames = self.auto_capture_engine.get_recent_frames()
+        buffer_count, buffer_dir = self.growth_log.save_auto_capture_buffer(
+            event_idx=self._auto_capture_event_count,
+            frames=context_frames,
+        )
         self.growth_log.log_auto_capture_event(
             event_idx=self._auto_capture_event_count,
             score=score,
             elapsed_s=self.monitor.get_elapsed_seconds(),
             pyro_temp=pyro_temp,
+            buffer_count=buffer_count,
+            buffer_dir=buffer_dir,
         )
+        # Surface the banner so the grower can discard if it looks spurious.
+        # Default action (timeout) is to keep — the buffer is already on disk.
+        if buffer_count > 0:
+            self.monitor.show_auto_capture_event(
+                event_idx=self._auto_capture_event_count,
+                score=score,
+                buffer_dir=buffer_dir,
+            )
+
+    @pyqtSlot(str)
+    def _on_auto_capture_event_discarded(self, buffer_dir: str):
+        """Grower hit Discard on the banner — delete the buffer directory.
+
+        The CSV row in auto_capture_events.csv stays as a record that the
+        detector fired (with the original buffer_count); only the visual
+        bytes are removed.
+        """
+        if not buffer_dir or not self.growth_log.session_dir:
+            return
+        target = self.growth_log.session_dir / buffer_dir
+        if not target.is_dir():
+            return
+        import shutil
+        try:
+            shutil.rmtree(target)
+            self.statusBar().showMessage(
+                f"Discarded auto-capture buffer at {buffer_dir}", 3000,
+            )
+        except OSError as e:
+            self.statusBar().showMessage(
+                f"Failed to discard buffer: {e}", 3000,
+            )
+
+    @pyqtSlot(bool)
+    def _on_auto_capture_pause_toggled(self, paused: bool):
+        """Soft-halt auto-capture without touching session-wide logging.
+
+        Pause: disable the engine — sensor log, heartbeat, frame display,
+        manual commits all keep working.
+        Resume: reset the engine first so the (now-stale) context buffer
+        doesn't fire a spurious trigger from the diff between the pre-pause
+        reference and the post-pause first frame.
+        """
+        if paused:
+            self.auto_capture_engine.enabled = False
+            self.monitor.set_auto_capture_status(
+                f"Auto-capture: PAUSED "
+                f"({self._auto_capture_event_count} events this session)"
+            )
+            self.statusBar().showMessage("Auto-capture paused", 3000)
+        else:
+            self.auto_capture_engine.reset()
+            self.auto_capture_engine.enabled = True
+            self.monitor.set_auto_capture_status(
+                "Auto-capture: armed (warmup)"
+            )
+            self.statusBar().showMessage("Auto-capture resumed", 3000)
 
     @pyqtSlot(PyrometerState)
     def _on_pyrometer_state(self, state: PyrometerState):
