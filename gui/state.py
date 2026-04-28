@@ -52,8 +52,17 @@ class CameraState:
 
 @dataclass
 class PyrometerState:
-    """Current state of the pyrometer (separate from thermocouple)."""
+    """Current state of the pyrometer (separate from thermocouple).
+
+    ``temperature`` is the mean of ``temperature_n`` rapid sub-readings
+    taken within a single poll cycle. ``temperature_std`` is the sample
+    standard deviation (0.0 when n=1). Polybot-inspired: a per-poll
+    mean/std gives downstream consumers a cheap statistical-consistency
+    check without requiring a second pass over the sensor log.
+    """
     temperature: float = 0.0
+    temperature_std: float = 0.0
+    temperature_n: int = 1
     emissivity: Optional[float] = None  # 0.0-1.0, from TemperaSure or Modbus
     unit: str = "C"
     connected: bool = False

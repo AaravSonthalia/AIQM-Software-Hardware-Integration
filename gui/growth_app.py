@@ -284,11 +284,11 @@ class GrowthApp(QMainWindow):
     def _log_sensors(self):
         if not self.growth_log.active:
             return
-        pyro_temp = (
-            self.monitor._latest_pyro.temperature
-            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
-            else None
-        )
+        pyro = self.monitor._latest_pyro
+        pyro_ok = pyro is not None and pyro.connected
+        pyro_temp = pyro.temperature if pyro_ok else None
+        pyro_temp_std = pyro.temperature_std if pyro_ok else None
+        pyro_temp_n = pyro.temperature_n if pyro_ok else None
         m = self.monitor._latest_mistral
         e = self.monitor._latest_evap
         mistral_ok = m is not None and m.connected
@@ -303,6 +303,8 @@ class GrowthApp(QMainWindow):
             chamber_pressure_mbar=(
                 e.chamber_pressure_mbar if evap_ok else None
             ),
+            pyro_temp_std=pyro_temp_std,
+            pyro_temp_n=pyro_temp_n,
         )
 
         from datetime import datetime

@@ -18,7 +18,8 @@ class GrowthLogger:
     """Logs sensor data and timestamped entries during a growth session."""
 
     SENSOR_FIELDS = [
-        "timestamp", "elapsed_s", "pyrometer_temp_C",
+        "timestamp", "elapsed_s",
+        "pyrometer_temp_C", "pyrometer_temp_std_C", "pyrometer_temp_n",
         "mistral_v_set_V", "mistral_v_actual_V",
         "mistral_i_set_A", "mistral_i_actual_A",
         "chamber_pressure_mbar",
@@ -128,8 +129,14 @@ class GrowthLogger:
         self, pyro_temp, elapsed_s,
         v_set=None, v_actual=None, i_set=None, i_actual=None,
         chamber_pressure_mbar=None,
+        pyro_temp_std=None, pyro_temp_n=None,
     ):
-        """Append a row to sensor_log.csv. All values may be None."""
+        """Append a row to sensor_log.csv. All values may be None.
+
+        ``pyro_temp_std`` and ``pyro_temp_n`` capture the per-poll
+        statistical spread when the pyrometer worker takes multiple
+        sub-readings per cycle. Empty strings if not provided.
+        """
         if not self._sensor_writer:
             return
 
@@ -142,7 +149,9 @@ class GrowthLogger:
         self._sensor_writer.writerow({
             "timestamp": datetime.now().isoformat(),
             "elapsed_s": f"{elapsed_s:.2f}",
-            "pyrometer_temp_C": _f(pyro_temp, 1),
+            "pyrometer_temp_C":     _f(pyro_temp, 1),
+            "pyrometer_temp_std_C": _f(pyro_temp_std, 2),
+            "pyrometer_temp_n":     pyro_temp_n if pyro_temp_n is not None else "",
             "mistral_v_set_V":    _f(v_set, 3),
             "mistral_v_actual_V": _f(v_actual, 3),
             "mistral_i_set_A":    _f(i_set, 3),

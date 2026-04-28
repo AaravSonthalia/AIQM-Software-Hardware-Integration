@@ -332,10 +332,19 @@ class PyrometerWorker(QThread):
 
     state_updated = pyqtSignal(PyrometerState)
 
-    def __init__(self, mode: str = "dummy", poll_interval: float = 0.5):
+    def __init__(
+        self,
+        mode: str = "dummy",
+        poll_interval: float = 0.5,
+        samples_per_poll: int = 5,
+    ):
         super().__init__()
         self.mode = mode
         self.poll_interval = poll_interval
+        # Number of rapid sub-readings to average per poll cycle. 5 ≈ 0.5 s
+        # at the Exactus default rate (~10 reads/s); for screengrab mode it
+        # samples whatever jitter the GUI exposes between refreshes.
+        self.samples_per_poll = max(1, int(samples_per_poll))
         self.running = False
         self._sensor = None
 
@@ -373,16 +382,31 @@ class PyrometerWorker(QThread):
             return
 
         while self.running:
-            try:
-                state.temperature = self._sensor.read_temperature()
+            # Take N rapid sub-readings within each poll cycle so the
+            # emitted state carries a mean ± std rather than a single
+            # noisy point estimate. Polybot-inspired statistical
+            # consistency without a second analysis pass.
+            readings: list[float] = []
+            for _ in range(self.samples_per_poll):
+                try:
+                    readings.append(self._sensor.read_temperature())
+                except Exception as e:
+                    state.error = str(e)
+                    break
+            if readings:
+                arr = np.asarray(readings, dtype=float)
+                state.temperature = float(arr.mean())
+                state.temperature_std = float(arr.std(ddof=0)) if arr.size > 1 else 0.0
+                state.temperature_n = int(arr.size)
                 state.connected = True
                 state.error = ""
 
-                # Read emissivity if the driver supports it
-                if hasattr(self._sensor, "read_emissivity"):
+            # Emissivity is a slow-moving config value — single read is fine.
+            if hasattr(self._sensor, "read_emissivity"):
+                try:
                     state.emissivity = self._sensor.read_emissivity()
-            except Exception as e:
-                state.error = str(e)
+                except Exception:
+                    pass
 
             self.state_updated.emit(state)
             time.sleep(self.poll_interval)
