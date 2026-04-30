@@ -1,4 +1,23 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
 .venv/
+venv/
+
+# OS / editor
 .DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Session data and run artifacts (per-session output, never in git)
+logs/
+
+# OCR debug crops (set by AIQM_OCR_DEBUG=1, scoped under logs/ but explicit)
+logs/ocr_debug/
+
+# Local-only build outputs
+*.egg-info/
+dist/
+build/

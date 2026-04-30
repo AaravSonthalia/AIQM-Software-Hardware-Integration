@@ -18,7 +18,11 @@ class GrowthLogger:
     """Logs sensor data and timestamped entries during a growth session."""
 
     SENSOR_FIELDS = [
-        "timestamp", "elapsed_s", "pyrometer_temp_C",
+        "timestamp", "elapsed_s",
+        "pyrometer_temp_C", "pyrometer_temp_std_C", "pyrometer_temp_n",
+        "mistral_v_set_V", "mistral_v_actual_V",
+        "mistral_i_set_A", "mistral_i_actual_A",
+        "chamber_pressure_mbar",
     ]
     COMMIT_FIELDS = [
         "timestamp", "time_display", "elapsed_s", "sample_id", "grower",
@@ -26,6 +30,20 @@ class GrowthLogger:
         "recon_1x1", "recon_Twinned (2x1)", "recon_c(6x2)",
         "recon_rt13xrt13", "recon_HTR",
         "note", "frame_path",
+    ]
+    AUTO_CAPTURE_FIELDS = [
+        "timestamp", "elapsed_s", "event_idx",
+        "change_score", "pyrometer_temp_C",
+        "buffer_count", "buffer_dir",
+    ]
+    HEARTBEAT_FIELDS = [
+        "timestamp", "elapsed_s", "heartbeat_idx",
+        "pyrometer_temp_C", "frame_path",
+    ]
+    SET_CHANGE_FIELDS = [
+        "timestamp", "elapsed_s", "event_idx",
+        "channel", "old_value", "new_value", "delta",
+        "pyrometer_temp_C",
     ]
 
     def __init__(self, base_dir: str = "logs/growths"):
@@ -36,7 +54,15 @@ class GrowthLogger:
         self._sensor_writer = None
         self._commit_file = None
         self._commit_writer = None
+        self._auto_capture_file = None
+        self._auto_capture_writer = None
+        self._heartbeat_file = None
+        self._heartbeat_writer = None
+        self._set_change_file = None
+        self._set_change_writer = None
         self._commit_counter = 0
+        self._heartbeat_counter = 0
+        self._set_change_counter = 0
         self._entries: list[dict] = []  # Accumulated entries for export
 
     @property
@@ -74,19 +100,64 @@ class GrowthLogger:
         )
         self._commit_writer.writeheader()
 
+        auto_capture_path = self._session_dir / "auto_capture_events.csv"
+        self._auto_capture_file = open(auto_capture_path, "w", newline="")
+        self._auto_capture_writer = csv.DictWriter(
+            self._auto_capture_file, fieldnames=self.AUTO_CAPTURE_FIELDS,
+        )
+        self._auto_capture_writer.writeheader()
+
+        heartbeat_path = self._session_dir / "heartbeat_log.csv"
+        self._heartbeat_file = open(heartbeat_path, "w", newline="")
+        self._heartbeat_writer = csv.DictWriter(
+            self._heartbeat_file, fieldnames=self.HEARTBEAT_FIELDS,
+        )
+        self._heartbeat_writer.writeheader()
+
+        set_change_path = self._session_dir / "set_change_events.csv"
+        self._set_change_file = open(set_change_path, "w", newline="")
+        self._set_change_writer = csv.DictWriter(
+            self._set_change_file, fieldnames=self.SET_CHANGE_FIELDS,
+        )
+        self._set_change_writer.writeheader()
+
         self._commit_counter = 0
+        self._heartbeat_counter = 0
+        self._set_change_counter = 0
         self._entries = []
 
-    def log_sensors(self, pyro_temp, elapsed_s):
-        """Append a row to sensor_log.csv."""
+    def log_sensors(
+        self, pyro_temp, elapsed_s,
+        v_set=None, v_actual=None, i_set=None, i_actual=None,
+        chamber_pressure_mbar=None,
+        pyro_temp_std=None, pyro_temp_n=None,
+    ):
+        """Append a row to sensor_log.csv. All values may be None.
+
+        ``pyro_temp_std`` and ``pyro_temp_n`` capture the per-poll
+        statistical spread when the pyrometer worker takes multiple
+        sub-readings per cycle. Empty strings if not provided.
+        """
         if not self._sensor_writer:
             return
+
+        def _f(val, places):
+            return f"{val:.{places}f}" if val is not None else ""
+
+        def _sci(val):
+            return f"{val:.3e}" if val is not None else ""
+
         self._sensor_writer.writerow({
             "timestamp": datetime.now().isoformat(),
             "elapsed_s": f"{elapsed_s:.2f}",
-            "pyrometer_temp_C": (
-                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
-            ),
+            "pyrometer_temp_C":     _f(pyro_temp, 1),
+            "pyrometer_temp_std_C": _f(pyro_temp_std, 2),
+            "pyrometer_temp_n":     pyro_temp_n if pyro_temp_n is not None else "",
+            "mistral_v_set_V":    _f(v_set, 3),
+            "mistral_v_actual_V": _f(v_actual, 3),
+            "mistral_i_set_A":    _f(i_set, 3),
+            "mistral_i_actual_A": _f(i_actual, 3),
+            "chamber_pressure_mbar": _sci(chamber_pressure_mbar),
         })
         self._sensor_file.flush()
 
@@ -99,13 +170,210 @@ class GrowthLogger:
         self._commit_file.flush()
         self._entries.append(entry)
 
-    def save_frame(self, frame: np.ndarray, timestamp: str = "") -> str:
-        """Save frame as PNG to session frames/ subdir, return path."""
+    def save_heartbeat_frame(
+        self, frame: np.ndarray, timestamp: str = ""
+    ) -> str:
+        """Save a heartbeat anchor frame as ``heartbeat_NNN_HHMMSS.png``.
+
+        Same quality gate as ``save_frame``; failed frames return "" and
+        are not counted toward the heartbeat counter.
+        """
         if self._session_dir is None:
             return ""
+
+        try:
+            from drivers.frame_quality import check_frame_quality
+            qa = check_frame_quality(frame)
+            if not qa.passed:
+                import sys
+                print(
+                    f"[GrowthLogger] heartbeat frame rejected: {qa.reason}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return ""
+        except ImportError:
+            pass
+
+        self._heartbeat_counter += 1
+        ts = timestamp or datetime.now().strftime("%H%M%S")
+        fname = f"heartbeat_{self._heartbeat_counter:03d}_{ts}.png"
+        path = self._session_dir / "frames" / fname
+
+        try:
+            from PIL import Image
+            Image.fromarray(frame).save(str(path))
+        except ImportError:
+            try:
+                import cv2
+                cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            except ImportError:
+                return ""
+
+        return str(path)
+
+    def log_set_change_event(
+        self,
+        elapsed_s: float,
+        channel: str,
+        old_value: float,
+        new_value: float,
+        pyro_temp: Optional[float] = None,
+    ):
+        """Append a row to set_change_events.csv.
+
+        Pairs operator setpoint changes (Set Voltage / Set Current button
+        presses on the MISTRAL GUI) with timestamps, so the model can
+        learn from when V/I are deliberately adjusted vs drifting.
+        """
+        if not self._set_change_writer:
+            return
+        self._set_change_counter += 1
+        self._set_change_writer.writerow({
+            "timestamp": datetime.now().isoformat(),
+            "elapsed_s": f"{elapsed_s:.2f}",
+            "event_idx": self._set_change_counter,
+            "channel": channel,
+            "old_value": f"{old_value:.4f}",
+            "new_value": f"{new_value:.4f}",
+            "delta": f"{new_value - old_value:+.4f}",
+            "pyrometer_temp_C": (
+                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
+            ),
+        })
+        self._set_change_file.flush()
+
+    def log_heartbeat(
+        self,
+        elapsed_s: float,
+        pyro_temp: Optional[float] = None,
+        frame_path: str = "",
+    ):
+        """Append a row to heartbeat_log.csv. Pairs with save_heartbeat_frame."""
+        if not self._heartbeat_writer:
+            return
+        self._heartbeat_writer.writerow({
+            "timestamp": datetime.now().isoformat(),
+            "elapsed_s": f"{elapsed_s:.2f}",
+            "heartbeat_idx": self._heartbeat_counter,
+            "pyrometer_temp_C": (
+                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
+            ),
+            "frame_path": frame_path,
+        })
+        self._heartbeat_file.flush()
+
+    def log_auto_capture_event(
+        self,
+        event_idx: int,
+        score: float,
+        elapsed_s: float,
+        pyro_temp: Optional[float] = None,
+        buffer_count: int = 0,
+        buffer_dir: str = "",
+    ):
+        """Append a row to auto_capture_events.csv for shadow-mode logging.
+
+        Called by GrowthApp when AutoCaptureEngine emits frame_captured.
+        Writes timestamp + change score + temp at trigger time, so the
+        flagged moments can be cross-referenced against grower notes
+        and pyrometer trajectory after the session. ``buffer_count`` and
+        ``buffer_dir`` capture how many context frames were dumped and
+        where, so post-hoc analysis can locate them.
+        """
+        if not self._auto_capture_writer:
+            return
+        self._auto_capture_writer.writerow({
+            "timestamp": datetime.now().isoformat(),
+            "elapsed_s": f"{elapsed_s:.2f}",
+            "event_idx": event_idx,
+            "change_score": f"{score:.4f}",
+            "pyrometer_temp_C": (
+                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
+            ),
+            "buffer_count": buffer_count,
+            "buffer_dir": buffer_dir,
+        })
+        self._auto_capture_file.flush()
+
+    def save_auto_capture_buffer(
+        self,
+        event_idx: int,
+        frames: list[np.ndarray],
+    ) -> tuple[int, str]:
+        """Save the auto-capture context buffer for a flagged event.
+
+        Each frame is written to a per-event subdirectory under frames/ so
+        that sessions with many events stay browsable. The quality gate is
+        applied per-frame; rejected frames are silently skipped (they don't
+        carry information worth keeping).
+
+        Returns ``(saved_count, relative_dir)``. ``relative_dir`` is empty
+        if no session is active.
+        """
+        if self._session_dir is None or not frames:
+            return 0, ""
+
+        try:
+            from drivers.frame_quality import check_frame_quality
+        except ImportError:
+            check_frame_quality = None
+
+        event_dir = self._session_dir / "frames" / f"auto_event_{event_idx:03d}"
+        event_dir.mkdir(parents=True, exist_ok=True)
+
+        ts_tag = datetime.now().strftime("%H%M%S")
+        saved = 0
+        for pos, frame in enumerate(frames):
+            if check_frame_quality is not None:
+                qa = check_frame_quality(frame)
+                if not qa.passed:
+                    continue
+            fname = f"buf_{pos:02d}_{ts_tag}.png"
+            path = event_dir / fname
+            try:
+                from PIL import Image
+                Image.fromarray(frame).save(str(path))
+                saved += 1
+            except ImportError:
+                try:
+                    import cv2
+                    cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                    saved += 1
+                except ImportError:
+                    break
+
+        rel_dir = str(event_dir.relative_to(self._session_dir))
+        return saved, rel_dir
+
+    def save_frame(self, frame: np.ndarray, timestamp: str = "") -> str:
+        """Save frame as PNG to session frames/ subdir, return path.
+
+        Runs the frame quality gate first — black/saturated/uniform/
+        undersized frames are rejected with a stderr warning and an
+        empty path returned. Callers should treat "" as "no frame saved"
+        (current convention).
+        """
+        if self._session_dir is None:
+            return ""
+
+        try:
+            from drivers.frame_quality import check_frame_quality
+            qa = check_frame_quality(frame)
+            if not qa.passed:
+                import sys
+                print(
+                    f"[GrowthLogger] frame rejected by quality gate: {qa.reason}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return ""
+        except ImportError:
+            pass  # Quality gate optional; degrade to old always-save behavior.
+
         self._commit_counter += 1
         ts = timestamp or datetime.now().strftime("%H%M%S")
-        fname = f"entry_{self._commit_counter:03d}_{ts}.bmp"
+        fname = f"entry_{self._commit_counter:03d}_{ts}.png"
         path = self._session_dir / "frames" / fname
 
         try:
@@ -256,12 +524,22 @@ class GrowthLogger:
 
     def end_session(self):
         """Close CSV files. Preserves session_dir and entries for post-stop export."""
-        for f in (self._sensor_file, self._commit_file):
+        for f in (
+            self._sensor_file, self._commit_file,
+            self._auto_capture_file, self._heartbeat_file,
+            self._set_change_file,
+        ):
             if f and not f.closed:
                 f.close()
         self._sensor_file = None
         self._sensor_writer = None
         self._commit_file = None
         self._commit_writer = None
+        self._auto_capture_file = None
+        self._auto_capture_writer = None
+        self._heartbeat_file = None
+        self._heartbeat_writer = None
+        self._set_change_file = None
+        self._set_change_writer = None
         # NOTE: _session_dir and _entries intentionally preserved
         # so Export Growth Log works after STOP.

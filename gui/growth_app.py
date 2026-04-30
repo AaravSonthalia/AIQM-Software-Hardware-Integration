@@ -10,15 +10,54 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from PyQt6.QtWidgets import QMainWindow
 from PyQt6.QtCore import pyqtSlot, QTimer
 
 log = logging.getLogger(__name__)
 
-from gui.state import CameraState, PyrometerState
-from gui.workers import RheedCameraWorker, PyrometerWorker
+from gui.auto_capture import AutoCaptureEngine, PixelDiffChangeDetector
+from gui.state import CameraState, EvapControlState, MistralState, PyrometerState
+from gui.workers import (
+    EvapControlWorker, MistralWorker, PyrometerWorker, RheedCameraWorker,
+)
 from gui.growth_monitor import GrowthMonitor
 from gui.growth_logger import GrowthLogger
+
+
+# Tuned against Rahim's 2022_02_04 STO trajectory.
+#
+# Rahim's data was captured at ~30 s cadence (manual). At our 1 Hz live
+# cadence, a 20-frame buffer covers 20 s — much shorter than Rahim's
+# 10-minute equivalent — so slow ramp drift contributes negligibly to
+# the live baseline. That makes our live buffer-mean(20)@1Hz behaviorally
+# closer to Rahim's *previous-frame* mode than to his *buffer-mean(20)*:
+#   - previous-frame on Rahim:   baseline 0.5,  peaks 2.5-9.0 → threshold 1.5
+#   - buffer-mean(5) on Rahim:   baseline 0.70, peaks 6.4-9.0 → similar
+#   - buffer-mean(20) on Rahim:  baseline 1.15, peaks 4.9-8.5 (loses small
+#                                events) — NOT representative of live behavior
+# We expect live baseline ~0.5-1.0; smallest real transitions ~2.5+. A
+# threshold of 2.0 sits ~3x above the expected baseline and below the
+# smallest expected event. First lab session is the real ground truth —
+# adjust after reviewing auto_capture_events.csv vs grower notes.
+AUTO_CAPTURE_THRESHOLD = 2.0
+AUTO_CAPTURE_BUFFER_SIZE = 20
+AUTO_CAPTURE_COOLDOWN_S = 10.0
+
+# Heartbeat anchor capture: every N minutes during a session, save the
+# latest RHEED frame regardless of detector flags. Gives every session a
+# coarse temporal scaffold so the team can review "what was happening at
+# minute X" even if the detector missed transitions. Per Justin's 30-50
+# total-frames-per-trajectory budget: at 10 min × 4 hr session = 24
+# anchors, leaving room for ~6-26 detector-flagged frames.
+HEARTBEAT_INTERVAL_MIN = 10.0
+
+# MISTRAL set-V/I change detection — derives "operator pressed Set Voltage /
+# Set Current" events from successive OCR'd setpoint values changing.
+# Tolerances are larger than typical OCR jitter but smaller than any
+# meaningful operator-commanded change.
+SET_V_CHANGE_TOLERANCE = 0.05  # volts
+SET_I_CHANGE_TOLERANCE = 0.01  # amps
 
 
 class GrowthApp(QMainWindow):
@@ -31,12 +70,42 @@ class GrowthApp(QMainWindow):
 
         self.camera_worker: Optional[RheedCameraWorker] = None
         self.pyrometer_worker: Optional[PyrometerWorker] = None
+        self.mistral_worker: Optional[MistralWorker] = None
+        self.evap_worker: Optional[EvapControlWorker] = None
         self.growth_log = GrowthLogger()
 
         # Periodic sensor logging timer (1 second interval while running)
         self._sensor_log_timer = QTimer(self)
         self._sensor_log_timer.setInterval(1000)
         self._sensor_log_timer.timeout.connect(self._log_sensors)
+
+        # Heartbeat anchor-capture timer — fires every N minutes during a
+        # session and saves whatever the latest RHEED frame is.
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(int(HEARTBEAT_INTERVAL_MIN * 60 * 1000))
+        self._heartbeat_timer.timeout.connect(self._on_heartbeat)
+
+        # Auto-capture engine — shadow-mode pixel-diff change detection.
+        # Engine is disarmed at construction; armed in _on_start, disarmed
+        # in _on_stop. Frame ingestion happens in _on_camera_state.
+        self.auto_capture_engine = AutoCaptureEngine(
+            threshold=AUTO_CAPTURE_THRESHOLD,
+            cooldown_s=AUTO_CAPTURE_COOLDOWN_S,
+            warmup_frames=AUTO_CAPTURE_BUFFER_SIZE,
+        )
+        self.auto_capture_engine.set_detector(
+            PixelDiffChangeDetector(buffer_size=AUTO_CAPTURE_BUFFER_SIZE),
+        )
+        self.auto_capture_engine.frame_captured.connect(
+            self._on_auto_capture_event,
+        )
+        self._auto_capture_event_count = 0
+
+        # Tracking for MISTRAL set V/I change detection. Initialised to None
+        # at construction; reset to None in _on_start so each session detects
+        # changes relative to its own first reading, not the previous session.
+        self._last_v_set: Optional[float] = None
+        self._last_i_set: Optional[float] = None
 
         # Central widget
         self.monitor = GrowthMonitor()
@@ -49,16 +118,23 @@ class GrowthApp(QMainWindow):
         self.monitor.stop_requested.connect(self._on_stop)
         self.monitor.commit_requested.connect(self._on_commit)
         self.monitor.export_requested.connect(self._on_export)
+        self.monitor.auto_capture_pause_toggled.connect(
+            self._on_auto_capture_pause_toggled,
+        )
+        self.monitor.auto_capture_event_discarded.connect(
+            self._on_auto_capture_event_discarded,
+        )
 
     # --- ARM / DISARM ------------------------------------------------------
 
     @pyqtSlot()
     def _on_arm(self):
-        """Connect camera and pyrometer workers."""
+        """Connect camera, pyrometer, MISTRAL, and Evap Control workers."""
         camera_mode = self.monitor.config_camera_mode.currentText()
         pyrometer_mode = self.monitor.config_pyrometer_mode.currentText()
+        mistral_mode = self.monitor.config_mistral_mode.currentText()
+        evap_mode = self.monitor.config_evap_mode.currentText()
 
-        # Camera
         if not self.camera_worker or not self.camera_worker.isRunning():
             self.camera_worker = RheedCameraWorker(
                 mode=camera_mode, poll_interval=1.0,
@@ -66,13 +142,26 @@ class GrowthApp(QMainWindow):
             self.camera_worker.state_updated.connect(self._on_camera_state)
             self.camera_worker.start()
 
-        # Pyrometer
         if not self.pyrometer_worker or not self.pyrometer_worker.isRunning():
             self.pyrometer_worker = PyrometerWorker(
                 mode=pyrometer_mode, poll_interval=0.5,
             )
             self.pyrometer_worker.state_updated.connect(self._on_pyrometer_state)
             self.pyrometer_worker.start()
+
+        if not self.mistral_worker or not self.mistral_worker.isRunning():
+            self.mistral_worker = MistralWorker(
+                mode=mistral_mode, poll_interval=1.0,
+            )
+            self.mistral_worker.state_updated.connect(self._on_mistral_state)
+            self.mistral_worker.start()
+
+        if not self.evap_worker or not self.evap_worker.isRunning():
+            self.evap_worker = EvapControlWorker(
+                mode=evap_mode, poll_interval=1.0,
+            )
+            self.evap_worker.state_updated.connect(self._on_evap_state)
+            self.evap_worker.start()
 
         self.monitor.set_state("armed")
         self.statusBar().showMessage("Armed \u2014 live readings active")
@@ -85,6 +174,12 @@ class GrowthApp(QMainWindow):
 
         self._stop_worker(self.pyrometer_worker)
         self.pyrometer_worker = None
+
+        self._stop_worker(self.mistral_worker)
+        self.mistral_worker = None
+
+        self._stop_worker(self.evap_worker)
+        self.evap_worker = None
 
         self.monitor.reset_displays()
         self.monitor.set_state("idle")
@@ -110,6 +205,25 @@ class GrowthApp(QMainWindow):
         self._sensor_log_timer.setInterval(interval_ms)
         self._sensor_log_timer.start()
 
+        # Arm shadow-mode auto-capture for this session
+        self.auto_capture_engine.reset()
+        self.auto_capture_engine.enabled = True
+        self._auto_capture_event_count = 0
+        self.monitor.set_auto_capture_status(
+            "Auto-capture: armed (warmup)"
+        )
+        self.monitor.set_auto_capture_pause_enabled(True)
+
+        # Reset MISTRAL set-tracking so we don't fire a false change event
+        # against the previous session's last value.
+        self._last_v_set = None
+        self._last_i_set = None
+
+        # Start heartbeat anchor capture (first fire after HEARTBEAT_INTERVAL_MIN;
+        # we don't fire-on-start to avoid saving a black frame before the
+        # camera has produced anything useful).
+        self._heartbeat_timer.start()
+
         self.monitor.set_state("running")
         self.statusBar().showMessage(f"Running \u2014 {sample_id}")
 
@@ -117,6 +231,16 @@ class GrowthApp(QMainWindow):
     def _on_stop(self):
         """End a growth session — save metadata, auto-export, stop logging."""
         self._sensor_log_timer.stop()
+        self._heartbeat_timer.stop()
+
+        # Disarm auto-capture; engine state cleaned up so the next session
+        # starts fresh in _on_start.
+        self.auto_capture_engine.enabled = False
+        self.monitor.set_auto_capture_status(
+            f"Auto-capture: idle "
+            f"({self._auto_capture_event_count} events this session)"
+        )
+        self.monitor.set_auto_capture_pause_enabled(False)
 
         metadata = self.monitor.get_session_metadata()
 
@@ -168,20 +292,36 @@ class GrowthApp(QMainWindow):
     def _log_sensors(self):
         if not self.growth_log.active:
             return
-        pyro_temp = (
-            self.monitor._latest_pyro.temperature
-            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
-            else None
-        )
+        pyro = self.monitor._latest_pyro
+        pyro_ok = pyro is not None and pyro.connected
+        pyro_temp = pyro.temperature if pyro_ok else None
+        pyro_temp_std = pyro.temperature_std if pyro_ok else None
+        pyro_temp_n = pyro.temperature_n if pyro_ok else None
+        m = self.monitor._latest_mistral
+        e = self.monitor._latest_evap
+        mistral_ok = m is not None and m.connected
+        evap_ok = e is not None and e.connected
         self.growth_log.log_sensors(
-            pyro_temp, self.monitor.get_elapsed_seconds(),
+            pyro_temp,
+            self.monitor.get_elapsed_seconds(),
+            v_set=m.v_set if mistral_ok else None,
+            v_actual=m.v_actual if mistral_ok else None,
+            i_set=m.i_set if mistral_ok else None,
+            i_actual=m.i_actual if mistral_ok else None,
+            chamber_pressure_mbar=(
+                e.chamber_pressure_mbar if evap_ok else None
+            ),
+            pyro_temp_std=pyro_temp_std,
+            pyro_temp_n=pyro_temp_n,
         )
 
-        # Update sensor log table in UI
         from datetime import datetime
         self.monitor.add_sensor_log_row(
             datetime.now().strftime("%H:%M:%S"),
             pyro_temp,
+            voltage=m.v_actual if mistral_ok else None,
+            current=m.i_actual if mistral_ok else None,
+            pressure=e.chamber_pressure_mbar if evap_ok else None,
         )
 
     # --- Worker state fan-out to monitor -----------------------------------
@@ -190,9 +330,195 @@ class GrowthApp(QMainWindow):
     def _on_camera_state(self, state: CameraState):
         self.monitor.update_camera_state(state)
 
+        # Feed the auto-capture engine. Engine internally guards on `enabled`,
+        # so this is a no-op outside an active session.
+        if state.frame is not None and state.connected:
+            self.auto_capture_engine.evaluate(state.frame)
+            if self.auto_capture_engine.enabled:
+                self.monitor.set_auto_capture_status(
+                    f"Auto-capture: armed | "
+                    f"score: {self.auto_capture_engine.latest_score:.2f} | "
+                    f"events: {self._auto_capture_event_count}"
+                )
+
+    def _on_heartbeat(self):
+        """Heartbeat timer tick — save the latest RHEED frame as an anchor.
+
+        Skips silently if no frame is available yet (camera worker hasn't
+        emitted, or session just started). Bad frames (rejected by the
+        quality gate inside save_heartbeat_frame) are also skipped — the
+        gate prints to stderr.
+        """
+        if not self.growth_log.active:
+            return
+        frame = self.monitor.get_current_frame()
+        if frame is None:
+            return
+        path = self.growth_log.save_heartbeat_frame(frame)
+        if not path:
+            return  # Quality gate rejected, or save failed
+        pyro_temp = (
+            self.monitor._latest_pyro.temperature
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            else None
+        )
+        self.growth_log.log_heartbeat(
+            elapsed_s=self.monitor.get_elapsed_seconds(),
+            pyro_temp=pyro_temp,
+            frame_path=path,
+        )
+        self.statusBar().showMessage(
+            f"Heartbeat anchor saved (#{self.growth_log._heartbeat_counter})", 3000,
+        )
+
+    @pyqtSlot(np.ndarray, float)
+    def _on_auto_capture_event(self, frame: np.ndarray, score: float):
+        """Engine flagged a frame — log event + dump pre-event context buffer.
+
+        The CSV row records timestamp, score, and temp at trigger time
+        for cross-referencing against grower notes + sensor_log. The
+        context buffer (last ~20 frames including the flagged one) is
+        dumped to ``frames/auto_event_NNN/`` so post-hoc analysis can see
+        the visual evolution leading up to the trigger.
+        """
+        self._auto_capture_event_count += 1
+        pyro_temp = (
+            self.monitor._latest_pyro.temperature
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            else None
+        )
+        context_frames = self.auto_capture_engine.get_recent_frames()
+        buffer_count, buffer_dir = self.growth_log.save_auto_capture_buffer(
+            event_idx=self._auto_capture_event_count,
+            frames=context_frames,
+        )
+        self.growth_log.log_auto_capture_event(
+            event_idx=self._auto_capture_event_count,
+            score=score,
+            elapsed_s=self.monitor.get_elapsed_seconds(),
+            pyro_temp=pyro_temp,
+            buffer_count=buffer_count,
+            buffer_dir=buffer_dir,
+        )
+        # Surface the banner so the grower can discard if it looks spurious.
+        # Default action (timeout) is to keep — the buffer is already on disk.
+        if buffer_count > 0:
+            self.monitor.show_auto_capture_event(
+                event_idx=self._auto_capture_event_count,
+                score=score,
+                buffer_dir=buffer_dir,
+            )
+
+    @pyqtSlot(str)
+    def _on_auto_capture_event_discarded(self, buffer_dir: str):
+        """Grower hit Discard on the banner — delete the buffer directory.
+
+        The CSV row in auto_capture_events.csv stays as a record that the
+        detector fired (with the original buffer_count); only the visual
+        bytes are removed.
+        """
+        if not buffer_dir or not self.growth_log.session_dir:
+            return
+        target = self.growth_log.session_dir / buffer_dir
+        if not target.is_dir():
+            return
+        import shutil
+        try:
+            shutil.rmtree(target)
+            self.statusBar().showMessage(
+                f"Discarded auto-capture buffer at {buffer_dir}", 3000,
+            )
+        except OSError as e:
+            self.statusBar().showMessage(
+                f"Failed to discard buffer: {e}", 3000,
+            )
+
+    @pyqtSlot(bool)
+    def _on_auto_capture_pause_toggled(self, paused: bool):
+        """Soft-halt auto-capture without touching session-wide logging.
+
+        Pause: disable the engine — sensor log, heartbeat, frame display,
+        manual commits all keep working.
+        Resume: reset the engine first so the (now-stale) context buffer
+        doesn't fire a spurious trigger from the diff between the pre-pause
+        reference and the post-pause first frame.
+        """
+        if paused:
+            self.auto_capture_engine.enabled = False
+            self.monitor.set_auto_capture_status(
+                f"Auto-capture: PAUSED "
+                f"({self._auto_capture_event_count} events this session)"
+            )
+            self.statusBar().showMessage("Auto-capture paused", 3000)
+        else:
+            self.auto_capture_engine.reset()
+            self.auto_capture_engine.enabled = True
+            self.monitor.set_auto_capture_status(
+                "Auto-capture: armed (warmup)"
+            )
+            self.statusBar().showMessage("Auto-capture resumed", 3000)
+
     @pyqtSlot(PyrometerState)
     def _on_pyrometer_state(self, state: PyrometerState):
         self.monitor.update_pyrometer_state(state)
+
+    @pyqtSlot(MistralState)
+    def _on_mistral_state(self, state: MistralState):
+        self.monitor.update_mistral_state(state)
+
+        if not self.growth_log.active or not state.connected:
+            return
+
+        # Detect operator setpoint changes (Set Voltage / Set Current button
+        # presses on MISTRAL). OCR jitter can produce sub-tolerance noise on
+        # an unchanged setpoint, so only fire when the change exceeds the
+        # configured tolerance. Ignore None readings (transient OCR failures).
+        elapsed = self.monitor.get_elapsed_seconds()
+        pyro_temp = (
+            self.monitor._latest_pyro.temperature
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            else None
+        )
+
+        if state.v_set is not None:
+            if (
+                self._last_v_set is not None
+                and abs(state.v_set - self._last_v_set) > SET_V_CHANGE_TOLERANCE
+            ):
+                self.growth_log.log_set_change_event(
+                    elapsed_s=elapsed,
+                    channel="voltage",
+                    old_value=self._last_v_set,
+                    new_value=state.v_set,
+                    pyro_temp=pyro_temp,
+                )
+                self.statusBar().showMessage(
+                    f"Set Voltage changed: {self._last_v_set:.2f} → {state.v_set:.2f} V",
+                    3000,
+                )
+            self._last_v_set = state.v_set
+
+        if state.i_set is not None:
+            if (
+                self._last_i_set is not None
+                and abs(state.i_set - self._last_i_set) > SET_I_CHANGE_TOLERANCE
+            ):
+                self.growth_log.log_set_change_event(
+                    elapsed_s=elapsed,
+                    channel="current",
+                    old_value=self._last_i_set,
+                    new_value=state.i_set,
+                    pyro_temp=pyro_temp,
+                )
+                self.statusBar().showMessage(
+                    f"Set Current changed: {self._last_i_set:.3f} → {state.i_set:.3f} A",
+                    3000,
+                )
+            self._last_i_set = state.i_set
+
+    @pyqtSlot(EvapControlState)
+    def _on_evap_state(self, state: EvapControlState):
+        self.monitor.update_evap_state(state)
 
     # --- Helpers -----------------------------------------------------------
 
@@ -206,6 +532,7 @@ class GrowthApp(QMainWindow):
 
     def closeEvent(self, event):
         self._sensor_log_timer.stop()
+        self._heartbeat_timer.stop()
         if self.growth_log.active:
             self.growth_log.save_session_metadata(
                 self.monitor.get_session_metadata(),
@@ -213,4 +540,6 @@ class GrowthApp(QMainWindow):
             self.growth_log.end_session()
         self._stop_worker(self.camera_worker)
         self._stop_worker(self.pyrometer_worker)
+        self._stop_worker(self.mistral_worker)
+        self._stop_worker(self.evap_worker)
         event.accept()
