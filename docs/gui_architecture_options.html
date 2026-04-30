@@ -1,0 +1,1002 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Growth Monitor — Integration Architecture Options</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Source+Serif+4:ital,wght@0,300;0,400;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0c10;
+  --surface: #12151c;
+  --surface-2: #1a1e28;
+  --border: #252a36;
+  --text: #c8cdd8;
+  --text-dim: #6b7280;
+  --text-bright: #e8ecf4;
+  --accent-blue: #3b82f6;
+  --accent-green: #10b981;
+  --accent-amber: #f59e0b;
+  --accent-red: #ef4444;
+  --accent-purple: #8b5cf6;
+  --mono: 'JetBrains Mono', monospace;
+  --serif: 'Source Serif 4', Georgia, serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+/* --- Page structure --- */
+.page {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 60px 40px;
+}
+
+/* --- Header --- */
+.header {
+  margin-bottom: 56px;
+  border-left: 3px solid var(--accent-blue);
+  padding-left: 24px;
+}
+
+.header .label {
+  font-size: 11px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--accent-blue);
+  margin-bottom: 8px;
+}
+
+.header h1 {
+  font-family: var(--serif);
+  font-size: 32px;
+  font-weight: 700;
+  color: var(--text-bright);
+  line-height: 1.2;
+  margin-bottom: 8px;
+}
+
+.header .subtitle {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.header .meta {
+  margin-top: 16px;
+  display: flex;
+  gap: 24px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.header .meta span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.header .meta .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+/* --- Context block --- */
+.context {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 28px 32px;
+  margin-bottom: 48px;
+}
+
+.context h2 {
+  font-family: var(--serif);
+  font-size: 18px;
+  color: var(--text-bright);
+  margin-bottom: 16px;
+}
+
+.context p {
+  color: var(--text);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.context .highlight {
+  color: var(--accent-amber);
+  font-weight: 600;
+}
+
+/* --- Architecture diagram --- */
+.diagram-section {
+  margin-bottom: 48px;
+}
+
+.diagram-section h2 {
+  font-family: var(--serif);
+  font-size: 20px;
+  color: var(--text-bright);
+  margin-bottom: 20px;
+}
+
+.arch-diagram {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 32px;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-x: auto;
+}
+
+.arch-diagram pre {
+  color: var(--text);
+  white-space: pre;
+}
+
+.arch-diagram .node-lab {
+  color: var(--accent-amber);
+  font-weight: 600;
+}
+
+.arch-diagram .node-mac {
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+.arch-diagram .node-hw {
+  color: var(--accent-green);
+}
+
+.arch-diagram .node-dim {
+  color: var(--text-dim);
+}
+
+.arch-diagram .arrow {
+  color: var(--accent-purple);
+}
+
+/* --- Options grid --- */
+.options-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 24px;
+  margin-bottom: 48px;
+}
+
+.option-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  transition: border-color 0.2s;
+}
+
+.option-card:hover {
+  border-color: var(--accent-blue);
+}
+
+.option-card.recommended {
+  border-color: var(--accent-green);
+  box-shadow: 0 0 0 1px var(--accent-green);
+}
+
+.option-header {
+  padding: 20px 28px 16px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.option-id {
+  font-size: 11px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  font-weight: 600;
+  flex-shrink: 0;
+  padding: 3px 10px;
+  border-radius: 4px;
+  background: var(--surface-2);
+}
+
+.option-card:nth-child(1) .option-id { color: var(--text-dim); }
+.option-card:nth-child(2) .option-id { color: var(--accent-green); background: rgba(16,185,129,0.1); }
+.option-card:nth-child(3) .option-id { color: var(--accent-blue); }
+.option-card:nth-child(4) .option-id { color: var(--accent-purple); }
+
+.option-title {
+  font-family: var(--serif);
+  font-size: 18px;
+  color: var(--text-bright);
+  flex: 1;
+}
+
+.badge {
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  font-weight: 700;
+  padding: 4px 12px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.badge-rec {
+  background: rgba(16,185,129,0.15);
+  color: var(--accent-green);
+  border: 1px solid rgba(16,185,129,0.3);
+}
+
+.option-body {
+  padding: 0 28px 24px;
+}
+
+.option-desc {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 20px;
+  line-height: 1.7;
+}
+
+.option-diagram {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px 20px;
+  font-size: 11px;
+  margin-bottom: 20px;
+  overflow-x: auto;
+}
+
+.option-diagram pre {
+  color: var(--text-dim);
+  white-space: pre;
+}
+
+.option-diagram .hl { color: var(--accent-blue); }
+.option-diagram .hw { color: var(--accent-green); }
+.option-diagram .warn { color: var(--accent-amber); }
+
+/* Pro/con layout */
+.procon {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 16px;
+}
+
+.procon-col h4 {
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+
+.procon-col.pros h4 { color: var(--accent-green); }
+.procon-col.cons h4 { color: var(--accent-red); }
+.procon-col.reqs h4 { color: var(--accent-amber); }
+
+.procon-col ul {
+  list-style: none;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.procon-col ul li {
+  padding: 3px 0;
+  padding-left: 14px;
+  position: relative;
+}
+
+.procon-col.pros li::before {
+  content: "+";
+  position: absolute;
+  left: 0;
+  color: var(--accent-green);
+  font-weight: 700;
+}
+
+.procon-col.cons li::before {
+  content: "-";
+  position: absolute;
+  left: 0;
+  color: var(--accent-red);
+  font-weight: 700;
+}
+
+.procon-col.reqs li::before {
+  content: ">";
+  position: absolute;
+  left: 0;
+  color: var(--accent-amber);
+  font-weight: 700;
+}
+
+/* --- Comparison table --- */
+.comparison {
+  margin-bottom: 48px;
+}
+
+.comparison h2 {
+  font-family: var(--serif);
+  font-size: 20px;
+  color: var(--text-bright);
+  margin-bottom: 20px;
+}
+
+.comp-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.comp-table th {
+  text-align: left;
+  font-size: 10px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 10px 16px;
+  border-bottom: 2px solid var(--border);
+  font-weight: 600;
+}
+
+.comp-table td {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.comp-table tr:hover td {
+  background: var(--surface);
+}
+
+.comp-table .yes { color: var(--accent-green); font-weight: 600; }
+.comp-table .no { color: var(--accent-red); }
+.comp-table .partial { color: var(--accent-amber); }
+.comp-table .rec-row td {
+  background: rgba(16,185,129,0.04);
+}
+
+/* --- Recommendation --- */
+.recommendation {
+  background: linear-gradient(135deg, rgba(16,185,129,0.08), rgba(59,130,246,0.06));
+  border: 1px solid rgba(16,185,129,0.25);
+  border-radius: 8px;
+  padding: 32px;
+  margin-bottom: 48px;
+}
+
+.recommendation h2 {
+  font-family: var(--serif);
+  font-size: 20px;
+  color: var(--accent-green);
+  margin-bottom: 16px;
+}
+
+.recommendation p {
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 12px;
+  line-height: 1.7;
+}
+
+.recommendation .steps {
+  margin-top: 20px;
+}
+
+.recommendation .step {
+  display: flex;
+  gap: 16px;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  align-items: flex-start;
+}
+
+.recommendation .step:last-child {
+  border-bottom: none;
+}
+
+.step-num {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent-green);
+  background: rgba(16,185,129,0.1);
+  padding: 2px 8px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.step-text {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.step-text strong {
+  color: var(--text-bright);
+}
+
+/* --- Data flow --- */
+.dataflow {
+  margin-bottom: 48px;
+}
+
+.dataflow h2 {
+  font-family: var(--serif);
+  font-size: 20px;
+  color: var(--text-bright);
+  margin-bottom: 20px;
+}
+
+.flow-diagram {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 28px 32px;
+  font-size: 12px;
+  overflow-x: auto;
+}
+
+.flow-diagram pre {
+  color: var(--text);
+  white-space: pre;
+}
+
+.flow-diagram .stage { color: var(--accent-blue); font-weight: 600; }
+.flow-diagram .data { color: var(--accent-green); }
+.flow-diagram .output { color: var(--accent-amber); }
+.flow-diagram .dim { color: var(--text-dim); }
+
+/* --- Footer --- */
+.footer {
+  margin-top: 48px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-dim);
+  display: flex;
+  justify-content: space-between;
+}
+
+/* Print styles */
+@media print {
+  body { background: white; color: #1a1a1a; font-size: 11px; }
+  .page { padding: 20px; }
+  .option-card, .context, .arch-diagram, .recommendation, .flow-diagram, .option-diagram {
+    background: #f8f8f8;
+    border-color: #ddd;
+    break-inside: avoid;
+  }
+  .comp-table th, .comp-table td { border-color: #ddd; }
+  :root {
+    --text: #333;
+    --text-bright: #111;
+    --text-dim: #888;
+  }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="label">AIQM Growth Monitor</div>
+    <h1>Integration Architecture Options</h1>
+    <div class="subtitle">How to connect RHEED camera, pyrometer, ML classifier, and GUI into a live system</div>
+    <div class="meta">
+      <span><span class="dot" style="background:var(--accent-green)"></span> Yang Lab / CS Collaboration</span>
+      <span>Prepared Mar 5, 2026</span>
+      <span>Meeting: Mar 6, 2026</span>
+    </div>
+  </div>
+
+  <!-- Two Modes -->
+  <div class="context">
+    <h2>Two Operating Modes for MBE Growth</h2>
+    <p>
+      The project supports two modes of operation, switchable depending on whether a human
+      scientist or the AI system is driving the growth:
+    </p>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:40px;">
+    <div class="option-card" style="border-color:var(--accent-blue);">
+      <div class="option-header">
+        <div>
+          <div class="option-id" style="color:var(--accent-blue);background:rgba(59,130,246,0.1);">Normal Mode</div>
+          <div class="option-title" style="margin-top:8px;">Human-Driven Growth</div>
+        </div>
+      </div>
+      <div class="option-body">
+        <div class="option-desc" style="font-size:12px;">
+          Standard lab hardware (integrated PSU, not easily programmable). RHEED camera
+          and pyrometer display on screen as usual via kSA 400 and TemperaSure. Human
+          scientist watches patterns, makes judgment calls, manually adjusts temperature.
+          A few key RHEED images are noted throughout the growth &mdash; mostly
+          experience-driven. <strong>Our GUI is not required</strong> in this mode.
+        </div>
+        <div class="option-diagram"><pre>
+<span class="hw">RHEED</span> --> kSA screen     <span class="dim">(human watches)</span>
+<span class="hw">Pyro</span>  --> TemperaSure    <span class="dim">(human reads)</span>
+<span class="hw">PSU</span>   --> manual knobs   <span class="dim">(human adjusts)</span>
+                         <span class="warn">"I hope this works out"</span></pre></div>
+      </div>
+    </div>
+
+    <div class="option-card" style="border-color:var(--accent-green);box-shadow:0 0 0 1px var(--accent-green);">
+      <div class="option-header">
+        <div>
+          <div class="option-id" style="color:var(--accent-green);background:rgba(16,185,129,0.1);">AI-Scientist Mode</div>
+          <div class="option-title" style="margin-top:8px;">Closed-Loop Autonomous Growth</div>
+        </div>
+        <div class="badge badge-rec">Our System</div>
+      </div>
+      <div class="option-body">
+        <div class="option-desc" style="font-size:12px;">
+          OWON PSU swapped in (programmable, serial-controllable). Same RHEED camera and
+          pyrometer, but data is <strong>continuously streamed to our ML pipeline</strong>.
+          Classifier2 identifies the current surface reconstruction every frame. RL policy
+          decides temperature adjustments. PID loop drives the OWON. Human monitors via
+          the Growth Monitor GUI and can override at any time.
+        </div>
+        <div class="option-diagram"><pre>
+<span class="hw">RHEED</span> --> ScreenGrab --> <span class="hl">Classifier2</span> --> <span class="hl">RL Policy</span>
+<span class="hw">Pyro</span>  --> Modbus RTU --->---|                 |
+                              v                 v
+                         <span class="hl">Growth Monitor GUI</span>    <span class="hl">PID --> OWON PSU</span>
+                         <span class="dim">(human monitors,</span>          |
+                         <span class="dim"> can override)</span>          v
+                                          <span class="hw">Substrate heater</span></pre></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Context -->
+  <div class="context">
+    <h2>Current Status</h2>
+    <p>
+      The Growth Monitor GUI is built and functional with dummy drivers. Classifier2 is trained
+      (<strong>100% ideal-split accuracy</strong> with full 159-image reference set across all 4 classes).
+      The RHEED gun is down and pyrometer was off during our last lab visit, so
+      <span class="highlight">no live data testing has been possible yet</span>.
+    </p>
+    <p>
+      The core question: <span class="highlight">where does the GUI + ML pipeline run, and how does it
+      connect to hardware?</span> In AI-Scientist mode, the system must have direct access to the
+      OWON PSU (USB serial), pyrometer (COM4), and RHEED camera (kSA window or GigE) &mdash;
+      all on the same machine. This constrains the architecture.
+    </p>
+  </div>
+
+  <!-- Current hardware map -->
+  <div class="diagram-section">
+    <h2>Hardware Topology (Confirmed Mar 5)</h2>
+    <div class="arch-diagram"><pre>
+<span class="node-lab">BULBASAUR</span> (MBE Lab PC, Windows)          <span class="node-dim">No Python installed (yet)</span>
+<span class="node-dim">  IP: 205.208.25.122 (campus)</span>              <span class="node-dim">Remote: TeamViewer only</span>
+<span class="node-dim">  ├──</span> <span class="node-hw">kSA 400</span> ── RHEED display            <span class="node-dim">Window: "AVT Manta_G Live Video"</span>
+<span class="node-dim">  ├──</span> <span class="node-hw">TemperaSure 5.7</span> ── Pyrometer GUI     <span class="node-dim">Window: "BASF TemperaSure 5.7.0.4"</span>
+<span class="node-dim">  ├──</span> <span class="node-hw">COM4</span> (PL2303GS) ── RS-422 ── <span class="node-hw">BASF Exactus</span> pyrometer
+<span class="node-dim">  ├──</span> <span class="node-hw">GigE</span> ── Allied Vision Manta G-033B (656x492, mono)
+<span class="node-dim">  └──</span> <span class="node-hw">10.0.42.231</span> ── SENA serial-to-Ethernet  <span class="node-dim">(SSH open, purpose TBD)</span>
+
+<span class="node-dim">  AI-Scientist mode adds:</span>
+<span class="node-dim">  ├──</span> <span class="node-hw">OWON PSU</span> ── USB serial ── substrate heater  <span class="node-dim">(swapped in for AI mode)</span>
+<span class="node-dim">  ├──</span> <span class="node-hw">Python 3.12</span> + Growth Monitor GUI            <span class="node-dim">(to be installed)</span>
+<span class="node-dim">  └──</span> <span class="node-hw">Classifier2</span> + PID loop + RL policy           <span class="node-dim">(all run locally)</span>
+
+<span class="arrow">          ~~ TeamViewer / Campus Network (monitoring only) ~~</span>
+
+<span class="node-mac">DEV MAC</span> (Apple Silicon — development + training only)
+<span class="node-dim">  ├──</span> AIQM repo (drivers, GUI, logging) ── develop here, deploy to Bulbasaur
+<span class="node-dim">  ├──</span> AI_for_quantum repo (model training with MPS GPU)
+<span class="node-dim">  └──</span> Trained model artifacts copied to Bulbasaur for inference
+</pre></div>
+  </div>
+
+  <!-- Option Cards -->
+  <h2 style="font-family:var(--serif);font-size:20px;color:var(--text-bright);margin-bottom:20px;">The Four Options</h2>
+  <div class="options-grid">
+
+    <!-- Option A -->
+    <div class="option-card">
+      <div class="option-header">
+        <div>
+          <div class="option-id">Option A</div>
+          <div class="option-title" style="margin-top:8px">Screen-Grab Over TeamViewer</div>
+        </div>
+      </div>
+      <div class="option-body">
+        <div class="option-desc">
+          GUI runs on your Mac. TeamViewer shows Bulbasaur's desktop. The Mac captures its own
+          screen (which shows the TeamViewer window showing the kSA window) using <code>mss</code>.
+          Classifier2 runs locally on MPS. Pyrometer data scraped from the TemperaSure window
+          visible through TeamViewer.
+        </div>
+        <div class="option-diagram"><pre>
+<span class="hw">kSA window</span> (Bulbasaur) <span class="hl">--TeamViewer--></span> Mac screen <span class="hl">--mss--></span> ScreenGrabCamera
+<span class="hw">TemperaSure</span> (Bulbasaur) <span class="hl">--TeamViewer--></span> Mac screen <span class="hl">--OCR?--></span> Pyrometer reading
+                                                       <span class="warn">^^ double-compressed, lossy</span></pre></div>
+        <div class="procon">
+          <div class="procon-col pros">
+            <h4>Pros</h4>
+            <ul>
+              <li>Zero install on Bulbasaur</li>
+              <li>Works today (TeamViewer creds confirmed)</li>
+              <li>ML runs on Mac MPS GPU</li>
+            </ul>
+          </div>
+          <div class="procon-col cons">
+            <h4>Cons</h4>
+            <ul>
+              <li>Double-compressed frames (TeamViewer encoding)</li>
+              <li>Image quality degraded vs training data</li>
+              <li>Manual window positioning required</li>
+              <li>Pyrometer needs OCR or manual read</li>
+              <li>High latency (~1-3s round trip)</li>
+            </ul>
+          </div>
+          <div class="procon-col reqs">
+            <h4>Requirements</h4>
+            <ul>
+              <li>TeamViewer session active</li>
+              <li>kSA window positioned consistently</li>
+              <li>Stable campus network</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Option B -->
+    <div class="option-card recommended">
+      <div class="option-header">
+        <div>
+          <div class="option-id">Option B</div>
+          <div class="option-title" style="margin-top:8px">Install Python on Bulbasaur, Run GUI Locally</div>
+        </div>
+        <div class="badge badge-rec">Recommended</div>
+      </div>
+      <div class="option-body">
+        <div class="option-desc">
+          Install Python + our AIQM code directly on Bulbasaur. <code>ScreenGrabCamera._grab_win32()</code>
+          captures the kSA window natively at full resolution with the exact false-color LUT that
+          Classifier2 was trained on. Pyrometer reads via COM4 Modbus RTU (driver already written).
+          When the MBE power supply replaces the OWON, its control also runs here.
+          This is the production architecture.
+        </div>
+        <div class="option-diagram"><pre>
+<span class="hw">kSA window</span> <span class="hl">--win32gui+mss--></span> ScreenGrabCamera  <span class="hl">(native, lossless)</span>
+<span class="hw">COM4</span> <span class="hl">--Modbus RTU--></span> ModbusPyrometer     <span class="hl">(direct serial, no scraping)</span>
+<span class="hw">MBE PSU</span> <span class="hl">--serial/GPIB--></span> PowerSupplyWorker  <span class="hl">(future, same PC)</span>
+         <span class="hl">|</span>
+         <span class="hl">v</span>
+   Growth Monitor GUI  <span class="hl">--></span>  Classifier2 (CPU)  <span class="hl">--></span>  Auto-capture + Logging</pre></div>
+        <div class="procon">
+          <div class="procon-col pros">
+            <h4>Pros</h4>
+            <ul>
+              <li>Best image quality (matches training data)</li>
+              <li>Direct serial to pyrometer (Modbus RTU)</li>
+              <li>Lowest latency (all local)</li>
+              <li>No network dependency</li>
+              <li>Production-ready for MBE PSU integration</li>
+              <li>Simplest architecture</li>
+            </ul>
+          </div>
+          <div class="procon-col cons">
+            <h4>Cons</h4>
+            <ul>
+              <li>Need permission to install Python</li>
+              <li>No MPS/CUDA GPU (CPU inference only)</li>
+              <li>Must maintain code on lab PC</li>
+            </ul>
+          </div>
+          <div class="procon-col reqs">
+            <h4>Requirements</h4>
+            <ul>
+              <li>Python 3.10+ on Bulbasaur</li>
+              <li>pip install PyQt6, torch (cpu), etc.</li>
+              <li>Admin or user-level install permission</li>
+              <li>~350 MB disk (Python + PyTorch CPU-only + deps)</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Option C -->
+    <div class="option-card">
+      <div class="option-header">
+        <div>
+          <div class="option-id">Option C</div>
+          <div class="option-title" style="margin-top:8px">Frame Server on Bulbasaur, GUI on Mac</div>
+        </div>
+      </div>
+      <div class="option-body">
+        <div class="option-desc">
+          Lightweight Python script on Bulbasaur captures kSA frames + pyrometer serial, streams
+          them over ZMQ or HTTP to your Mac. GUI and Classifier2 run on Mac with MPS acceleration.
+          Hybrid approach: minimal install on lab PC, heavy compute on Mac.
+        </div>
+        <div class="option-diagram"><pre>
+<span class="hw">kSA window</span> <span class="hl">--win32gui--></span> frame_server.py <span class="hl">--ZMQ/HTTP--></span> Mac GUI
+<span class="hw">COM4</span> <span class="hl">--Modbus--></span> frame_server.py <span class="hl">--ZMQ/HTTP--></span> Mac GUI
+                                  <span class="warn">^^ campus network required</span></pre></div>
+        <div class="procon">
+          <div class="procon-col pros">
+            <h4>Pros</h4>
+            <ul>
+              <li>Good image quality (native capture)</li>
+              <li>ML runs on Mac MPS GPU</li>
+              <li>Minimal install on Bulbasaur</li>
+            </ul>
+          </div>
+          <div class="procon-col cons">
+            <h4>Cons</h4>
+            <ul>
+              <li>Still needs Python on Bulbasaur</li>
+              <li>Network latency + firewall issues</li>
+              <li>Two machines to maintain</li>
+              <li>Doesn't scale to MBE PSU control</li>
+            </ul>
+          </div>
+          <div class="procon-col reqs">
+            <h4>Requirements</h4>
+            <ul>
+              <li>Python on Bulbasaur (minimal)</li>
+              <li>Network port open between machines</li>
+              <li>ZMQ or HTTP streaming code</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Option D -->
+    <div class="option-card">
+      <div class="option-header">
+        <div>
+          <div class="option-id">Option D</div>
+          <div class="option-title" style="margin-top:8px">Direct GigE Camera Stream via SENA Device</div>
+        </div>
+      </div>
+      <div class="option-body">
+        <div class="option-desc">
+          Bypass kSA entirely. Tap into the Allied Vision camera's GigE stream through the
+          SENA serial-to-Ethernet bridge at 10.0.42.231, or directly via the instrument
+          subnet. Requires understanding the SENA device's role and possibly reconfiguring
+          the camera's GigE stream to allow multiple consumers.
+        </div>
+        <div class="option-diagram"><pre>
+<span class="hw">Manta G-033B</span> <span class="hl">--GigE--></span> instrument subnet <span class="hl">--></span> vmbpy direct capture
+                     <span class="warn">^^ conflicts with kSA 400 (exclusive lock)</span>
+<span class="hw">SENA 10.0.42.231</span> <span class="hl">--SSH--></span> ???  <span class="warn">(purpose unknown, needs investigation)</span></pre></div>
+        <div class="procon">
+          <div class="procon-col pros">
+            <h4>Pros</h4>
+            <ul>
+              <li>Raw 12-bit monochrome data</li>
+              <li>No screen scraping</li>
+              <li>Highest possible frame rate</li>
+            </ul>
+          </div>
+          <div class="procon-col cons">
+            <h4>Cons</h4>
+            <ul>
+              <li>Loses false-color LUT (Classifier2 mismatch)</li>
+              <li>May conflict with kSA exclusive camera lock</li>
+              <li>SENA device purpose unknown</li>
+              <li>Requires significant R&D</li>
+            </ul>
+          </div>
+          <div class="procon-col reqs">
+            <h4>Requirements</h4>
+            <ul>
+              <li>SSH into SENA to discover its role</li>
+              <li>Allied Vision SDK (vmbpy) on capture machine</li>
+              <li>Retrain Classifier2 on raw frames, or apply LUT</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Comparison table -->
+  <div class="comparison">
+    <h2>Side-by-Side Comparison</h2>
+    <table class="comp-table">
+      <thead>
+        <tr>
+          <th>Criterion</th>
+          <th>A: TeamViewer</th>
+          <th>B: Local on Bulbasaur</th>
+          <th>C: Frame Server</th>
+          <th>D: Direct GigE</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Image quality</td>
+          <td class="no">Poor (double-compressed)</td>
+          <td class="yes rec-row">Excellent (native kSA)</td>
+          <td class="yes">Good (native capture)</td>
+          <td class="partial">Raw (needs LUT)</td>
+        </tr>
+        <tr>
+          <td>Classifier2 compatibility</td>
+          <td class="partial">Degraded</td>
+          <td class="yes">Exact match to training data</td>
+          <td class="yes">Exact match</td>
+          <td class="no">Needs retrain or LUT</td>
+        </tr>
+        <tr>
+          <td>Pyrometer access</td>
+          <td class="no">OCR through TeamViewer</td>
+          <td class="yes">Direct Modbus RTU (COM4)</td>
+          <td class="yes">Modbus via server</td>
+          <td class="no">Separate solution needed</td>
+        </tr>
+        <tr>
+          <td>Install on Bulbasaur</td>
+          <td class="yes">Nothing</td>
+          <td class="partial">Python + full deps (~2 GB)</td>
+          <td class="partial">Python + minimal deps</td>
+          <td class="partial">vmbpy SDK</td>
+        </tr>
+        <tr>
+          <td>Network dependency</td>
+          <td class="no">TeamViewer (fragile)</td>
+          <td class="yes">None (all local)</td>
+          <td class="no">Campus network required</td>
+          <td class="partial">Instrument subnet</td>
+        </tr>
+        <tr>
+          <td>Future MBE PSU integration</td>
+          <td class="no">Can't control hardware remotely</td>
+          <td class="yes">Same PC, same codebase</td>
+          <td class="no">Control split across machines</td>
+          <td class="no">Separate solution</td>
+        </tr>
+        <tr>
+          <td>ML inference speed</td>
+          <td class="yes">Mac MPS (~10 ms)</td>
+          <td class="partial">CPU only (~80 ms, 120 ms full loop)</td>
+          <td class="yes">Mac MPS (~10 ms)</td>
+          <td class="partial">Depends on machine</td>
+        </tr>
+        <tr>
+          <td>Effort to implement</td>
+          <td class="yes">Works now</td>
+          <td class="yes">Low (code exists)</td>
+          <td class="partial">Medium (networking)</td>
+          <td class="no">High (unknown hardware)</td>
+        </tr>
+        <tr>
+          <td style="font-weight:600">Production viability</td>
+          <td class="no">Demo only</td>
+          <td class="yes" style="font-weight:700">Production-ready</td>
+          <td class="partial">Interim</td>
+          <td class="partial">Research path</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Recommendation -->
+  <div class="recommendation">
+    <h2>Recommendation: Option B &mdash; Build for the Lab PC</h2>
+    <p>
+      The AI-Scientist mode requires direct access to <strong>three hardware interfaces on
+      the same machine</strong>: OWON PSU (USB serial for PID control), pyrometer (COM4 Modbus
+      RTU), and RHEED camera (kSA screen grab). This rules out any remote-only architecture.
+      <strong>The GUI must run on Bulbasaur.</strong>
+    </p>
+    <p>
+      The development workflow becomes: <strong>develop and train on Mac, deploy and run on
+      Bulbasaur.</strong> Model training uses MPS GPU acceleration on the Mac. Trained artifacts
+      (<code>best_model.pth</code>) are copied to Bulbasaur where inference runs on CPU at
+      ~80 ms per frame. Full closed-loop budget is ~120 ms/cycle (screen grab 10 ms +
+      Modbus read 20 ms + inference 80 ms + RL 1 ms + PID + serial write 11 ms) &mdash;
+      well within the 1 FPS target.
+    </p>
+    <p>
+      The only prerequisite is permission to install Python on the lab PC. This is the
+      most easily actionable blocker of all the options.
+    </p>
+    <div class="steps">
+      <div class="step">
+        <span class="step-num">01</span>
+        <span class="step-text"><strong>Get permission to install Python on Bulbasaur</strong> &mdash; user-level install via <code>winget</code>, Microsoft Store, or embeddable zip (no admin needed)</span>
+      </div>
+      <div class="step">
+        <span class="step-num">02</span>
+        <span class="step-text"><strong>Clone AIQM repo + copy model artifacts</strong> &mdash; via git (if installable) or USB drive. Include <code>best_model.pth</code> and ideal reference images</span>
+      </div>
+      <div class="step">
+        <span class="step-num">03</span>
+        <span class="step-text"><strong>pip install dependencies</strong> &mdash; PyQt6, torch (CPU-only wheel, ~150 MB), pymodbus, mss, pillow, numpy</span>
+      </div>
+      <div class="step">
+        <span class="step-num">04</span>
+        <span class="step-text"><strong>Connect OWON PSU via USB</strong> &mdash; verify serial port detection and PID loop on Bulbasaur</span>
+      </div>
+      <div class="step">
+        <span class="step-num">05</span>
+        <span class="step-text"><strong>Test pyrometer serial</strong> &mdash; Modbus RTU read on COM4 when pyrometer is powered on</span>
+      </div>
+      <div class="step">
+        <span class="step-num">06</span>
+        <span class="step-text"><strong>Test kSA screen grab</strong> &mdash; verify <code>ScreenGrabCamera._grab_win32()</code> captures the RHEED window natively</span>
+      </div>
+      <div class="step">
+        <span class="step-num">07</span>
+        <span class="step-text"><strong>Full integration test</strong> &mdash; Growth Monitor GUI with live RHEED + pyrometer + Classifier2 + OWON PID + auto-capture logging</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Data flow for Option B -->
+  <div class="dataflow">
+    <h2>AI-Scientist Mode: Full Closed-Loop Data Flow</h2>
+    <div class="flow-diagram"><pre>
+<span class="stage">HARDWARE</span>                     <span class="stage">DRIVERS</span>                   <span class="stage">ML + CONTROL</span>                  <span class="stage">GUI + LOGGING</span>
+
+<span class="data">kSA 400 window</span>
+  <span class="dim">|</span> false-color frame         <span class="data">ScreenGrabCamera</span>
+  <span class="dim">|--win32gui+mss----------></span>  .read_frame()
+                               <span class="dim">|</span> RGB (656x492)
+                               <span class="dim">v</span>
+                            <span class="data">RheedCameraWorker</span> ------+---> <span class="stage">ClassifierBridge</span> ---------> <span class="output">AI confidence bar</span>
+                               <span class="dim">(QThread, 1 FPS)</span>       <span class="dim">|</span>    .classify(frame)           <span class="output">AI class label</span>
+                                                      <span class="dim">|</span>    <span class="dim">| 5 scores + is_bad</span>        <span class="output">BAD indicator</span>
+                                                      <span class="dim">|</span>    <span class="dim">v</span>
+                                                      <span class="dim">|</span>   <span class="stage">RL Policy</span> --------+
+                                                      <span class="dim">|</span>    <span class="dim">| temp setpoint</span>    <span class="dim">|</span> -----> <span class="output">AI Instructions box</span>
+                                                      <span class="dim">|</span>    <span class="dim">v</span>                  <span class="dim">|</span>
+<span class="data">OWON PSU</span>                    <span class="data">PowerSupplyWorker</span> <---<span class="stage">PID Controller</span>       <span class="dim">|</span> -----> <span class="output">Voltage/Current display</span>
+  <span class="dim">|</span> USB serial                 <span class="dim">(QThread, 2 Hz)</span>   <span class="dim">| voltage cmd</span>          <span class="dim">|</span>
+  <span class="dim">v</span>                                              <span class="dim">|</span>                    <span class="dim">|</span>
+<span class="data">Substrate heater</span> <---------- output on/off -----+                    <span class="dim">|</span>
+                                                                        <span class="dim">|</span>
+<span class="data">BASF Exactus</span>                <span class="data">ModbusPyrometer</span> ---------> <span class="dim">(temp feedback</span>       <span class="dim">|</span>
+  <span class="dim">|</span> RS-422                    .read_temperature()    <span class="dim"> to RL + PID)</span>        <span class="dim">|</span>
+  <span class="dim">|--COM4 Modbus RTU------></span>       <span class="dim">|</span>                                       <span class="dim">|</span>
+                                  <span class="dim">v</span>                                       <span class="dim">v</span>
+                            <span class="data">PyrometerWorker</span> --------------------------------> <span class="output">Temperature display</span>
+                               <span class="dim">(QThread, 2 Hz)</span>
+
+                                                 <span class="stage">AutoCaptureEngine</span> ---------> <span class="output">GrowthLogger</span>
+                                                  <span class="dim">Tier 1: intensity</span>            <span class="dim">|--></span> <span class="output">sensor_log.csv</span>
+                                                  <span class="dim">Tier 2: embedding (planned)</span>  <span class="dim">|--></span> <span class="output">commit_log.csv</span>
+                                                  <span class="dim">Tier 3: classification</span>       <span class="dim">|--></span> <span class="output">auto_capture_log.csv</span>
+                                                                               <span class="dim">|--></span> <span class="output">frames/*.png</span>
+
+<span class="dim">Human can monitor, override, adjust sliders, and COMMIT annotations at any time.</span>
+<span class="dim">The closed loop runs autonomously: RHEED --> Classifier2 --> RL --> PID --> OWON --> heater</span>
+</pre></div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <span>AIQM Growth Monitor &mdash; Yang Lab / Meng Group</span>
+    <span>Prepared for meeting Mar 6, 2026</span>
+  </div>
+
+</div>
+</body>
+</html>
