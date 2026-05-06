@@ -43,6 +43,8 @@ from gui.growth_logger import GrowthLogger
 AUTO_CAPTURE_THRESHOLD = 2.0
 AUTO_CAPTURE_BUFFER_SIZE = 20
 AUTO_CAPTURE_COOLDOWN_S = 10.0
+AUTO_CAPTURE_ADAPTIVE_SIGMA = 3.0
+AUTO_CAPTURE_ADAPTIVE_FLOOR = 0.5
 
 # Heartbeat anchor capture: every N minutes during a session, save the
 # latest RHEED frame regardless of detector flags. Gives every session a
@@ -92,9 +94,17 @@ class GrowthApp(QMainWindow):
             threshold=AUTO_CAPTURE_THRESHOLD,
             cooldown_s=AUTO_CAPTURE_COOLDOWN_S,
             warmup_frames=AUTO_CAPTURE_BUFFER_SIZE,
+            adaptive_sigma=AUTO_CAPTURE_ADAPTIVE_SIGMA,
+            adaptive_floor=AUTO_CAPTURE_ADAPTIVE_FLOOR,
         )
+        # Hardcoded opt-in for specular-anchored ROI + std-of-|diff|;
+        # remove these kwargs to fall back to full-frame mean-of-|diff|.
         self.auto_capture_engine.set_detector(
-            PixelDiffChangeDetector(buffer_size=AUTO_CAPTURE_BUFFER_SIZE),
+            PixelDiffChangeDetector(
+                buffer_size=AUTO_CAPTURE_BUFFER_SIZE,
+                score_metric="std",
+                roi_mode="specular",
+            ),
         )
         self.auto_capture_engine.frame_captured.connect(
             self._on_auto_capture_event,

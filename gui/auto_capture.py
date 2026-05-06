@@ -16,6 +16,8 @@ from abc import ABC, abstractmethod
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from .specular import detect_specular, image_derived_roi
+
 
 # ---------------------------------------------------------------------------
 # ChangeDetector ABC + implementations
@@ -75,11 +77,37 @@ class PixelDiffChangeDetector(ChangeDetector):
     transitions (full delta vs rate of delta), so an in-GUI threshold of
     2.0-2.5 is a reasonable starting point. Re-tune offline against the
     same dataset with the buffer-mean variant before relying on the value.
+
+    May 2026 — ``score_metric`` and ``roi_mode`` are opt-in parameters that
+    route the score through alternative scoring (std of |diff| vs mean) and
+    ROI restriction (specular-anchored, image-derived). Defaults preserve
+    the original full-frame mean-of-|diff| behaviour for backward compat.
+    Threshold values DO NOT transfer between metric/ROI combinations and
+    must be re-tuned per configuration.
     """
 
-    def __init__(self, buffer_size: int = 20, smooth_window: int = 3):
+    def __init__(
+        self,
+        buffer_size: int = 20,
+        smooth_window: int = 3,
+        score_metric: str = "mean",
+        roi_mode: str = "full",
+        roi_threshold_frac: float = 0.5,
+    ):
+        if score_metric not in ("mean", "std"):
+            raise ValueError(
+                f"score_metric must be 'mean' or 'std', got {score_metric!r}"
+            )
+        if roi_mode not in ("full", "specular"):
+            raise ValueError(
+                f"roi_mode must be 'full' or 'specular', got {roi_mode!r}"
+            )
+
         self._buffer_size = buffer_size
         self._smooth_window = smooth_window
+        self._score_metric = score_metric
+        self._roi_mode = roi_mode
+        self._roi_threshold_frac = roi_threshold_frac
         self._buffer: collections.deque[np.ndarray] = collections.deque(
             maxlen=buffer_size,
         )
@@ -110,7 +138,19 @@ class PixelDiffChangeDetector(ChangeDetector):
             return 0.0
 
         buffer_mean = self._sum / len(self._buffer)
-        raw_score = float(np.mean(np.abs(gray - buffer_mean)))
+        diff = np.abs(gray - buffer_mean)
+
+        if self._roi_mode == "specular":
+            x, y = detect_specular(gray)
+            roi = image_derived_roi(
+                gray, x, y, threshold_frac=self._roi_threshold_frac
+            )
+            diff = diff[roi]
+
+        if self._score_metric == "mean":
+            raw_score = float(np.mean(diff))
+        else:  # "std"
+            raw_score = float(np.std(diff))
 
         # Update running sum: subtract the about-to-be-evicted frame
         # before deque.append silently drops it.
