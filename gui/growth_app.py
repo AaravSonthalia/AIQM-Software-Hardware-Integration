@@ -136,6 +136,14 @@ class GrowthApp(QMainWindow):
             self._on_auto_capture_decision,
         )
 
+        # Events tab listens to frame_captured AFTER GrowthApp's own
+        # handler, so the CSV row is already on disk when the tab re-reads
+        # it. Connection order is the synchronization mechanism — the
+        # engine emits to slots in the order they were connected.
+        self.auto_capture_engine.frame_captured.connect(
+            self.monitor.events_tab.on_frame_captured,
+        )
+
     # --- ARM / DISARM ------------------------------------------------------
 
     @pyqtSlot()
@@ -211,6 +219,11 @@ class GrowthApp(QMainWindow):
 
         sample_id = self.monitor.sample_id_input.text().strip() or "unnamed"
         self.growth_log.start_session(sample_id)
+
+        # Point the events tab at this session's CSV so backfill (handles
+        # GUI-restart-mid-session) and the live append-on-signal can read
+        # from the right place.
+        self.monitor.events_tab.attach_session(self.growth_log.session_dir)
 
         interval_ms = int(self.monitor.config_interval_spin.value() * 1000)
         self._sensor_log_timer.setInterval(interval_ms)

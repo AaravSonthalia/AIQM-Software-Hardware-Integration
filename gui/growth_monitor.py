@@ -34,6 +34,7 @@ from gui.growth_logger import (
     EVENT_STATE_KEPT_DEFAULT,
     EVENT_STATE_KEPT_EXPLICIT,
 )
+from gui.events_tab import EventsTab
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +345,7 @@ class GrowthMonitor(QWidget):
         # === Tab widget ===
         self._tabs = QTabWidget()
         self._build_monitor_tab()
+        self._build_events_tab()
         self._build_session_tab()
         root.addWidget(self._tabs, 1)
 
@@ -513,6 +515,18 @@ class GrowthMonitor(QWidget):
         layout.addLayout(footer)
 
         self._tabs.addTab(tab, "Monitor")
+
+    # ----- Events Tab ------------------------------------------------------
+
+    def _build_events_tab(self):
+        """Mount the EventsTab — review surface for auto-capture events.
+
+        Lives between Monitor (live) and Session (config + notes + export)
+        in the tab order so the grower's natural left-to-right scan is
+        now → just-fired events → session admin.
+        """
+        self.events_tab = EventsTab()
+        self._tabs.addTab(self.events_tab, "Events")
 
     # ----- Session Tab -----------------------------------------------------
 
