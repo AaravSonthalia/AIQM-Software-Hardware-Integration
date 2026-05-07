@@ -85,6 +85,13 @@ def read_temp_and_current(
     rr_i = _read_holding(client, REG_CH1_CURR, 2, device_id)
     if rr_t.isError() or rr_i.isError():
         raise ModbusException(f"Bad reply: temp={rr_t}, curr={rr_i}")
+    if len(rr_t.registers) < 2 or len(rr_i.registers) < 2:
+        raise ModbusException(
+            "Empty register response — probe is likely in Exactus Protocol "
+            "mode rather than Modbus RTU. Recovery: physical power-cycle "
+            "the probe (~10s off, 10s boot), then retry. "
+            f"Got temp regs={rr_t.registers!r}, curr regs={rr_i.registers!r}"
+        )
 
     hi_t, lo_t = rr_t.registers
     hi_i, lo_i = rr_i.registers
