@@ -46,9 +46,22 @@ class VmbCamera(RheedCamera):
     the convention used by the existing RHEED GUI code.
     """
 
-    def __init__(self, camera_index: int = 0, trigger_hz: float = 1.0):
+    def __init__(
+        self,
+        camera_index: int = 0,
+        trigger_hz: float = 1.0,
+        bit_depth: int = 12,
+    ):
         self._camera_index = camera_index
         self._trigger_hz = trigger_hz
+        self._bit_depth = bit_depth
+        # Fixed normalization denominator (4095 for 12-bit Manta G-033B).
+        # Used to map raw uint16 ADC samples into the uint8 range while
+        # keeping the scale factor consistent across frames — per-frame
+        # max-normalization (the obvious alternative) would drift the
+        # scale and produce synthetic change scores between frames whose
+        # raw pixel values are identical but max intensity differs.
+        self._max_value = (1 << bit_depth) - 1
         self._vmb = None
         self._cam = None
         self._connected = False
@@ -88,9 +101,15 @@ class VmbCamera(RheedCamera):
         frame = self._cam.get_frame(timeout_ms=2000)
         img = frame.as_numpy_ndarray().squeeze()
 
-        # Normalize to uint8
+        # Normalize to uint8 using fixed bit-depth scaling so frame-to-
+        # frame comparisons are meaningful. Per-frame max normalization
+        # would drift the scale factor and produce synthetic change
+        # scores in the std-of-|diff| algorithm. clip() handles the
+        # all-zero frame case (no NaN from division).
         if img.dtype != np.uint8:
-            img = ((img.astype(np.float32) / img.max()) * 255).astype(np.uint8)
+            img = (
+                img.astype(np.float32) / self._max_value * 255.0
+            ).clip(0, 255).astype(np.uint8)
 
         # Build RGB with intensity in green channel (existing convention)
         if img.ndim == 2:
