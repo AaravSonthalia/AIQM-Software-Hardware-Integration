@@ -227,10 +227,10 @@ class GrowthApp(QMainWindow):
         sample_id = self.monitor.sample_id_input.text().strip() or "unnamed"
         self.growth_log.start_session(sample_id)
 
-        # Point the events tab at this session's CSV so backfill (handles
-        # GUI-restart-mid-session) and the live append-on-signal can read
-        # from the right place.
-        self.monitor.events_tab.attach_session(self.growth_log.session_dir)
+        # Point the events tab at this session's logger so backfill
+        # (handles GUI-restart-mid-session), the live append-on-signal,
+        # and labeling reads/writes all flow through the same source.
+        self.monitor.events_tab.attach_session(self.growth_log)
 
         interval_ms = int(self.monitor.config_interval_spin.value() * 1000)
         self._sensor_log_timer.setInterval(interval_ms)

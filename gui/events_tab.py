@@ -13,10 +13,16 @@ Current scope:
     attach, then live-updated via `AutoCaptureEngine.frame_captured`
   - Detail pane image viewer with metadata header, slider-scrubable
     buffer frames, and a placeholder for empty / missing buffer cases
+  - Live row-state updates from `auto_capture_decision`
+  - Unreviewed-count badge surfaced via `unreviewed_count_changed`
+  - Per-event labeling form: primary reconstruction dropdown + notes
+    field, atomic-per-change writes through GrowthLogger, in-memory
+    label cache loaded on session attach
 
-Two-dropdown labeling UI, unreviewed badge, default-hide-discarded
-filter, and live row-state updates from the auto_capture_decision
-signal are follow-up commits per the design's implementation breakdown.
+Reconstruction-transition labeling (change_from / change_to) and the
+default-hide-discarded filter are deferred. The CSV schema reserves
+the change_from / change_to columns from day one so the deferred UI
+lands without migration.
 """
 from __future__ import annotations
 
@@ -26,17 +32,37 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QSizePolicy,
-    QSlider, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QSizePolicy, QSlider, QSplitter,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from gui.growth_logger import (
     EVENT_STATE_DISCARDED,
     EVENT_STATE_KEPT_EXPLICIT,
+    GrowthLogger,
 )
+
+
+# Five canonical RHEED reconstruction names + meta-categories for events
+# the grower can't or won't tag with one. Spellings match the Monitor tab's
+# recon sliders verbatim — see feedback_recon_naming.md for the canonical
+# list and the "use ASCII x, lowercase rt13" rule.
+RECON_LABEL_OPTIONS = [
+    "1x1",
+    "Twinned (2x1)",
+    "c(6x2)",
+    "rt13xrt13",
+    "HTR",
+    "unknown",
+    "artifact",
+]
+# Sentinel data value for "no label assigned" — distinguishable from any
+# valid reconstruction name in the dropdown's itemData.
+RECON_UNLABELED = ""
 
 
 # An event is "unreviewed" if the grower hasn't made an explicit
@@ -136,6 +162,9 @@ class EventsTab(QWidget):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._session_dir: Optional[Path] = None
+        # GrowthLogger reference for label CSV reads/writes. None when no
+        # session is attached, set in attach_session.
+        self._growth_logger: Optional[GrowthLogger] = None
         # Highest event_idx already in the table — guards repeat appends
         # when the CSV is re-read on every frame_captured.
         self._last_seen_event_idx: int = 0
@@ -143,6 +172,23 @@ class EventsTab(QWidget):
         # Cleared on selection change and on attach_session.
         self._cached_pixmaps: list[QPixmap] = []
         self._cached_paths: list[Path] = []
+        # In-memory label cache — single source of truth for "what label
+        # does each event have right now." Loaded from events_labels.csv
+        # on session attach, kept in sync as the grower applies labels.
+        # Single-writer model (only this widget touches the file), so
+        # staleness can't happen.
+        self._labels_cache: dict[int, dict] = {}
+        # Tracks which event the labeling form is currently bound to, so
+        # form-change handlers know which event_idx to write under.
+        self._currently_displayed_event_idx: Optional[int] = None
+        # Debounce notes-text writes — saving on every keystroke would
+        # both spam disk and persist garbage like "substrate fla". Save
+        # 500ms after the user stops typing, or immediately on selection
+        # change (flushed in _on_selection_changed).
+        self._notes_save_timer = QTimer(self)
+        self._notes_save_timer.setSingleShot(True)
+        self._notes_save_timer.setInterval(500)
+        self._notes_save_timer.timeout.connect(self._flush_notes_to_disk)
         self._build_ui()
         self.events_table.itemSelectionChanged.connect(
             self._on_selection_changed,
@@ -269,6 +315,8 @@ class EventsTab(QWidget):
         slider_row.addWidget(self._frame_position_label, 0)
         content.addLayout(slider_row)
 
+        content.addWidget(self._build_label_form())
+
         self._detail_content.hide()
         layout.addWidget(self._detail_content, 1)
 
@@ -279,25 +327,74 @@ class EventsTab(QWidget):
 
         return detail
 
+    def _build_label_form(self) -> QGroupBox:
+        """Labeling form — primary reconstruction dropdown + notes field.
+
+        The change_from / change_to dropdowns are deferred to a follow-up
+        commit per AJ's scoping decision. The CSV schema reserves their
+        columns from day one so the future UI lands without migration.
+
+        Uses ``activated`` (not ``currentIndexChanged``) on the dropdown
+        so programmatic ``setCurrentIndex`` during selection-change
+        loading doesn't trigger spurious writes. Notes use a debounced
+        timer so per-keystroke writes don't spam disk or persist
+        garbage like "substrate fla".
+        """
+        box = QGroupBox("Label")
+        form = QFormLayout(box)
+        form.setContentsMargins(10, 16, 10, 8)
+        form.setSpacing(6)
+
+        self._primary_recon_combo = QComboBox()
+        self._primary_recon_combo.addItem("(unlabeled)", RECON_UNLABELED)
+        for name in RECON_LABEL_OPTIONS:
+            self._primary_recon_combo.addItem(name, name)
+        self._primary_recon_combo.activated.connect(
+            self._on_primary_recon_activated,
+        )
+        form.addRow("Primary reconstruction:", self._primary_recon_combo)
+
+        self._notes_input = QLineEdit()
+        self._notes_input.setPlaceholderText("Optional notes…")
+        self._notes_input.textChanged.connect(self._on_notes_text_changed)
+        self._notes_input.editingFinished.connect(self._flush_notes_to_disk)
+        form.addRow("Notes:", self._notes_input)
+
+        return box
+
     # --- Public API used by GrowthApp -------------------------------------
 
-    def attach_session(self, session_dir: Optional[Path]) -> None:
-        """Point the tab at a session's CSV and reload the master list.
+    def attach_session(self, growth_logger: Optional[GrowthLogger]) -> None:
+        """Point the tab at the active session's logger and reload the list.
 
         Call from GrowthApp._on_start after GrowthLogger.start_session.
         Clearing + reloading on attach handles GUI-restart-mid-session and
         keeps the tab consistent with whatever's on disk. Also resets the
         detail pane back to its placeholder so a stale selection from the
-        previous session can't render against the new session_dir.
+        previous session can't render against the new session_dir, and
+        repopulates the label cache from events_labels.csv (if any).
+
+        Takes the GrowthLogger rather than a bare session_dir because the
+        Events tab now owns label CSV writes, which need the logger's
+        update_event_label method.
         """
+        self._growth_logger = growth_logger
         self._session_dir = (
-            Path(session_dir) if session_dir is not None else None
+            growth_logger.session_dir
+            if growth_logger is not None and growth_logger.session_dir is not None
+            else None
         )
         self._last_seen_event_idx = 0
         self.events_table.setRowCount(0)
         self._cached_pixmaps = []
         self._cached_paths = []
         self._image_label.clearImage()
+        self._labels_cache = (
+            growth_logger.read_event_labels()
+            if growth_logger is not None else {}
+        )
+        self._currently_displayed_event_idx = None
+        self._notes_save_timer.stop()
         self._set_placeholder("Select an event to view buffer frames.")
         self._load_csv_rows()
 
@@ -393,18 +490,42 @@ class EventsTab(QWidget):
     def _refresh_unreviewed_badge(self) -> None:
         """Recompute unreviewed-event count and emit the change signal.
 
-        Walks the table's State column rather than caching a counter —
-        cheap (≤ ~50 rows per session) and avoids drift when the count
-        could otherwise diverge from the displayed states (e.g., a
-        future "default-hide-discarded" filter could mask rows from the
-        UI without removing them).
+        An event "needs attention" if:
+          - state ∈ (pending, kept_default), OR
+          - state == kept_explicit AND no primary_reconstruction label
+
+        Discarded events never count — the explicit "no" decision is
+        final, and they don't need labeling. The kept_explicit-without-
+        label clause makes the badge useful through the labeling phase
+        of the workflow, not just the keep/discard phase.
+
+        Walks the table + label cache fresh each time rather than
+        maintaining a counter — cheap (≤ ~50 rows per session) and stays
+        consistent when other operations (e.g., a future hide-discarded
+        filter) change the displayed-vs-existing row set.
         """
         count = 0
         for row_idx in range(self.events_table.rowCount()):
             state_item = self.events_table.item(row_idx, COL_STATE)
             if state_item is None:
                 continue
-            if state_item.text() not in _REVIEWED_STATES:
+            state = state_item.text()
+            if state == EVENT_STATE_DISCARDED:
+                continue
+            if state not in _REVIEWED_STATES:
+                count += 1
+                continue
+            # state == EVENT_STATE_KEPT_EXPLICIT — also unreviewed if no label
+            idx_item = self.events_table.item(row_idx, COL_EVENT_IDX)
+            try:
+                event_idx = int(idx_item.text()) if idx_item else None
+            except (TypeError, ValueError):
+                event_idx = None
+            label = (
+                self._labels_cache.get(event_idx)
+                if event_idx is not None else None
+            )
+            if not label or not label.get("primary_reconstruction"):
                 count += 1
         self.unreviewed_count_changed.emit(count)
 
@@ -469,13 +590,24 @@ class EventsTab(QWidget):
         item's UserRole) and routes to the detail loader. Empty
         selections — including the cleared-table state right after
         attach_session — fall back to the placeholder.
+
+        Flushes any pending debounced notes write for the *previous*
+        event before switching, so unsaved typing doesn't get lost when
+        the user clicks another row mid-sentence.
         """
+        # Flush before switching — the user may have typed in notes for the
+        # previous event without explicitly tabbing out.
+        if self._notes_save_timer.isActive():
+            self._notes_save_timer.stop()
+            self._flush_notes_to_disk()
+
         row = self.events_table.currentRow()
         if row < 0 or not self.events_table.selectedItems():
             self._set_placeholder("Select an event to view buffer frames.")
             self._cached_pixmaps = []
             self._cached_paths = []
             self._image_label.clearImage()
+            self._currently_displayed_event_idx = None
             return
 
         idx_item = self.events_table.item(row, COL_EVENT_IDX)
@@ -523,6 +655,15 @@ class EventsTab(QWidget):
         self._metadata_label.setText(self._format_metadata(row_data))
         self._show_detail_content()
 
+        # Bind the labeling form to this event before we populate it,
+        # so any side-effect signals from setText/setCurrentIndex don't
+        # write under a stale event_idx.
+        try:
+            self._currently_displayed_event_idx = int(event_idx)
+        except (TypeError, ValueError):
+            self._currently_displayed_event_idx = None
+        self._populate_label_form(self._currently_displayed_event_idx)
+
         # Default to the trigger frame (last one buffered before the
         # signal fired) — most informative single frame for the grower.
         last_idx = len(self._cached_pixmaps) - 1
@@ -563,6 +704,94 @@ class EventsTab(QWidget):
             f"Event #{event_idx}  ·  {time_str}  ·  "
             f"score {score_str}  ·  {temp_str}  ·  {state}"
         )
+
+    def _populate_label_form(self, event_idx: Optional[int]) -> None:
+        """Pre-fill the labeling form from the cache for ``event_idx``.
+
+        Programmatic setCurrentIndex on the QComboBox doesn't fire
+        ``activated`` (only user interaction does), so no blockSignals
+        is needed there. QLineEdit.setText DOES fire ``textChanged``,
+        which would start the debounce timer pointlessly — so we block
+        signals around the notes setText.
+        """
+        label = (
+            self._labels_cache.get(event_idx)
+            if event_idx is not None else None
+        )
+        primary = (label or {}).get(
+            "primary_reconstruction", RECON_UNLABELED,
+        )
+        notes = (label or {}).get("notes", "")
+
+        target_idx = self._primary_recon_combo.findData(primary)
+        if target_idx < 0:
+            target_idx = 0  # fall back to "(unlabeled)"
+        self._primary_recon_combo.setCurrentIndex(target_idx)
+
+        self._notes_input.blockSignals(True)
+        self._notes_input.setText(notes)
+        self._notes_input.blockSignals(False)
+
+    @pyqtSlot(int)
+    def _on_primary_recon_activated(self, idx: int) -> None:
+        """Persist the new Primary reconstruction selection.
+
+        ``activated`` fires only on user interaction, so getting here
+        means the grower changed the dropdown. Writes atomically through
+        the logger, keeps the cache in sync, and refreshes the badge —
+        the new label may flip a kept_explicit-without-label event into
+        the reviewed bucket (or the reverse, if "(unlabeled)" was picked).
+        """
+        if (
+            self._currently_displayed_event_idx is None
+            or self._growth_logger is None
+        ):
+            return
+        primary = self._primary_recon_combo.itemData(idx)
+        self._growth_logger.update_event_label(
+            self._currently_displayed_event_idx,
+            primary_reconstruction=primary,
+        )
+        cached = self._labels_cache.setdefault(
+            self._currently_displayed_event_idx,
+            {f: "" for f in GrowthLogger.EVENT_LABEL_FIELDS},
+        )
+        cached["event_idx"] = str(self._currently_displayed_event_idx)
+        cached["primary_reconstruction"] = primary
+        cached["label_timestamp_iso"] = datetime.now().isoformat()
+        self._refresh_unreviewed_badge()
+
+    @pyqtSlot()
+    def _on_notes_text_changed(self) -> None:
+        """Restart the debounced notes-save timer on every keystroke."""
+        self._notes_save_timer.start()
+
+    def _flush_notes_to_disk(self) -> None:
+        """Write the current notes-field text to events_labels.csv.
+
+        Idempotent — called from the debounce timer, the field's
+        editingFinished signal, and the selection-change flush path.
+        Notes don't affect the badge (only primary_reconstruction does),
+        so no refresh is emitted from here.
+        """
+        self._notes_save_timer.stop()
+        if (
+            self._currently_displayed_event_idx is None
+            or self._growth_logger is None
+        ):
+            return
+        notes = self._notes_input.text()
+        self._growth_logger.update_event_label(
+            self._currently_displayed_event_idx,
+            notes=notes,
+        )
+        cached = self._labels_cache.setdefault(
+            self._currently_displayed_event_idx,
+            {f: "" for f in GrowthLogger.EVENT_LABEL_FIELDS},
+        )
+        cached["event_idx"] = str(self._currently_displayed_event_idx)
+        cached["notes"] = notes
+        cached["label_timestamp_iso"] = datetime.now().isoformat()
 
     @pyqtSlot(int)
     def _display_frame_at(self, idx: int) -> None:
