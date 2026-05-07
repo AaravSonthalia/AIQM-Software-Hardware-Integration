@@ -7,15 +7,16 @@ labeling input for Classifier2 training data. Catch-up is the primary
 use case — most cognitively expensive — and the master/detail layout is
 optimized around it.
 
-v1 skeleton:
+Current scope:
   - QSplitter master/detail layout
   - Master list populated from `auto_capture_events.csv` on session
     attach, then live-updated via `AutoCaptureEngine.frame_captured`
-  - Detail pane is a placeholder
+  - Detail pane image viewer with metadata header, slider-scrubable
+    buffer frames, and a placeholder for empty / missing buffer cases
 
-Image viewer, two-dropdown labeling UI, unreviewed badge, and the
-default-hide-discarded filter are follow-up commits per the design's
-implementation breakdown.
+Two-dropdown labeling UI, unreviewed badge, default-hide-discarded
+filter, and live row-state updates from the auto_capture_decision
+signal are follow-up commits per the design's implementation breakdown.
 """
 from __future__ import annotations
 
@@ -26,10 +27,60 @@ from typing import Optional
 
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QHeaderView, QLabel, QSplitter,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QSizePolicy,
+    QSlider, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
+
+
+class _ScalingImageLabel(QLabel):
+    """QLabel that keeps an aspect-ratio-scaled view of a source pixmap.
+
+    The QSplitter resizes the *inner* detail pane when its handle is
+    dragged, not the outer EventsTab — so the right place to react is
+    the label's own resizeEvent. Storing the original pixmap means each
+    resize re-scales from full resolution rather than compounding lossy
+    rescales on already-shrunk pixels.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._original: Optional[QPixmap] = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet(
+            "background-color: #000; border: 1px solid #555;"
+        )
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
+        )
+        self.setMinimumSize(320, 240)
+
+    def setOriginalPixmap(self, pixmap: Optional[QPixmap]) -> None:
+        if pixmap is None or pixmap.isNull():
+            self._original = None
+            self.clear()
+            return
+        self._original = pixmap
+        self._rescale()
+
+    def clearImage(self) -> None:
+        self._original = None
+        self.clear()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rescale()
+
+    def _rescale(self) -> None:
+        if self._original is None:
+            return
+        scaled = self._original.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(scaled)
 
 
 # Master-list column indices. Score-color cell coloring and a label-state
@@ -64,7 +115,14 @@ class EventsTab(QWidget):
         # Highest event_idx already in the table — guards repeat appends
         # when the CSV is re-read on every frame_captured.
         self._last_seen_event_idx: int = 0
+        # Pre-decoded pixmaps for the currently-selected event's buffer.
+        # Cleared on selection change and on attach_session.
+        self._cached_pixmaps: list[QPixmap] = []
+        self._cached_paths: list[Path] = []
         self._build_ui()
+        self.events_table.itemSelectionChanged.connect(
+            self._on_selection_changed,
+        )
 
     # --- UI ---------------------------------------------------------------
 
@@ -127,20 +185,73 @@ class EventsTab(QWidget):
         return master
 
     def _build_detail_pane(self) -> QWidget:
-        detail = QWidget()
-        detail_layout = QVBoxLayout(detail)
-        detail_layout.setContentsMargins(8, 8, 8, 8)
+        """Detail pane: placeholder when nothing is selected, otherwise
+        an image viewer with metadata header, scrubable slider, and
+        position counter for the buffer frames of the selected event.
 
-        self._detail_placeholder = QLabel(
-            "Select an event to view buffer frames.\n\n"
-            "Image viewer and labeling controls coming in follow-up commits."
-        )
+        Placeholder + content are siblings in the same QVBoxLayout, both
+        with stretch=1; show/hide swaps which one fills the pane.
+        """
+        detail = QWidget()
+        layout = QVBoxLayout(detail)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self._detail_placeholder = QLabel()
         self._detail_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._detail_placeholder.setWordWrap(True)
         self._detail_placeholder.setStyleSheet(
             "color: #888; font-style: italic;"
         )
-        detail_layout.addWidget(self._detail_placeholder)
+        layout.addWidget(self._detail_placeholder, 1)
+
+        self._detail_content = QWidget()
+        content = QVBoxLayout(self._detail_content)
+        content.setContentsMargins(0, 0, 0, 0)
+        content.setSpacing(6)
+
+        self._metadata_label = QLabel()
+        self._metadata_label.setStyleSheet(
+            "font-weight: bold; font-size: 13px; padding: 2px 4px;"
+        )
+        self._metadata_label.setWordWrap(True)
+        content.addWidget(self._metadata_label)
+
+        self._image_label = _ScalingImageLabel()
+        content.addWidget(self._image_label, 1)
+
+        slider_row = QHBoxLayout()
+        slider_row.setSpacing(8)
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, 0)
+        self._slider.setStyleSheet(
+            "QSlider::groove:horizontal { background: #333; height: 6px; }"
+            "QSlider::handle:horizontal { background: #0d9488; width: 14px; "
+            "margin: -5px 0; border-radius: 7px; }"
+            "QSlider::sub-page:horizontal { background: #0d9488; }"
+            "QSlider::add-page:horizontal { background: #555; }"
+        )
+        self._slider.valueChanged.connect(self._display_frame_at)
+        slider_row.addWidget(self._slider, 1)
+
+        self._frame_position_label = QLabel("0 / 0")
+        self._frame_position_label.setStyleSheet(
+            "color: #aaa; font-size: 11px;"
+        )
+        self._frame_position_label.setMinimumWidth(60)
+        self._frame_position_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        slider_row.addWidget(self._frame_position_label, 0)
+        content.addLayout(slider_row)
+
+        self._detail_content.hide()
+        layout.addWidget(self._detail_content, 1)
+
+        # Default placeholder copy — replaced by _set_placeholder() with
+        # context-specific text when an event is selected but its buffer
+        # is missing or empty.
+        self._set_placeholder("Select an event to view buffer frames.")
 
         return detail
 
@@ -151,13 +262,19 @@ class EventsTab(QWidget):
 
         Call from GrowthApp._on_start after GrowthLogger.start_session.
         Clearing + reloading on attach handles GUI-restart-mid-session and
-        keeps the tab consistent with whatever's on disk.
+        keeps the tab consistent with whatever's on disk. Also resets the
+        detail pane back to its placeholder so a stale selection from the
+        previous session can't render against the new session_dir.
         """
         self._session_dir = (
             Path(session_dir) if session_dir is not None else None
         )
         self._last_seen_event_idx = 0
         self.events_table.setRowCount(0)
+        self._cached_pixmaps = []
+        self._cached_paths = []
+        self._image_label.clearImage()
+        self._set_placeholder("Select an event to view buffer frames.")
         self._load_csv_rows()
 
     @pyqtSlot(np.ndarray, float)
@@ -196,7 +313,12 @@ class EventsTab(QWidget):
             return
 
     def _add_event_row(self, row: dict) -> None:
-        """Insert one CSV row at the top of the master list (newest first)."""
+        """Insert one CSV row at the top of the master list (newest first).
+
+        The full CSV row dict is attached to the event_idx item via
+        Qt.UserRole so the selection handler can recover buffer_dir,
+        timestamp, etc. without re-reading the CSV.
+        """
         timestamp = row.get("timestamp", "")
         try:
             time_str = datetime.fromisoformat(timestamp).strftime("%H:%M:%S")
@@ -223,11 +345,140 @@ class EventsTab(QWidget):
         # the CSV oldest→newest with insertRow(0) leaves the table in
         # newest-at-top order.
         self.events_table.insertRow(0)
-        self.events_table.setItem(
-            0, COL_EVENT_IDX,
-            QTableWidgetItem(str(row.get("event_idx", ""))),
-        )
+        idx_item = QTableWidgetItem(str(row.get("event_idx", "")))
+        idx_item.setData(Qt.ItemDataRole.UserRole, dict(row))
+        self.events_table.setItem(0, COL_EVENT_IDX, idx_item)
         self.events_table.setItem(0, COL_TIME, QTableWidgetItem(time_str))
         self.events_table.setItem(0, COL_SCORE, QTableWidgetItem(score_str))
         self.events_table.setItem(0, COL_TEMP, QTableWidgetItem(temp_str))
         self.events_table.setItem(0, COL_STATE, QTableWidgetItem(state))
+
+    # --- Detail pane ------------------------------------------------------
+
+    def _set_placeholder(self, text: str) -> None:
+        """Show the placeholder copy and hide the image viewer."""
+        self._detail_placeholder.setText(text)
+        self._detail_placeholder.show()
+        self._detail_content.hide()
+
+    def _show_detail_content(self) -> None:
+        """Show the image viewer and hide the placeholder."""
+        self._detail_placeholder.hide()
+        self._detail_content.show()
+
+    def _on_selection_changed(self) -> None:
+        """Handler for ``events_table.itemSelectionChanged``.
+
+        Resolves the selected row's CSV dict (stored on the event_idx
+        item's UserRole) and routes to the detail loader. Empty
+        selections — including the cleared-table state right after
+        attach_session — fall back to the placeholder.
+        """
+        row = self.events_table.currentRow()
+        if row < 0 or not self.events_table.selectedItems():
+            self._set_placeholder("Select an event to view buffer frames.")
+            self._cached_pixmaps = []
+            self._cached_paths = []
+            self._image_label.clearImage()
+            return
+
+        idx_item = self.events_table.item(row, COL_EVENT_IDX)
+        if idx_item is None:
+            return
+        row_data = idx_item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(row_data, dict):
+            return
+        self._load_detail(row_data)
+
+    def _load_detail(self, row_data: dict) -> None:
+        """Populate the detail pane for the given CSV row.
+
+        Walks through the failure-mode ladder (no buffer dir recorded →
+        dir missing on disk → dir empty) and shows a context-specific
+        placeholder for each. On success, decodes all PNGs once into the
+        pixmap cache so slider scrubbing is instantaneous.
+        """
+        event_idx = row_data.get("event_idx", "?")
+        buffer_dir = row_data.get("buffer_dir", "") or ""
+
+        if self._session_dir is None or not buffer_dir:
+            self._set_placeholder(
+                f"Event #{event_idx} has no buffer directory recorded."
+            )
+            return
+
+        full_dir = self._session_dir / buffer_dir
+        if not full_dir.exists() or not full_dir.is_dir():
+            self._set_placeholder(
+                f"Event #{event_idx} — buffer directory not found:\n{buffer_dir}"
+            )
+            return
+
+        frame_paths = sorted(full_dir.glob("*.png"))
+        if not frame_paths:
+            self._set_placeholder(
+                f"Event #{event_idx} — buffer directory is empty."
+            )
+            return
+
+        self._cached_paths = frame_paths
+        self._cached_pixmaps = [QPixmap(str(p)) for p in frame_paths]
+
+        self._metadata_label.setText(self._format_metadata(row_data))
+        self._show_detail_content()
+
+        # Default to the trigger frame (last one buffered before the
+        # signal fired) — most informative single frame for the grower.
+        last_idx = len(self._cached_pixmaps) - 1
+        self._slider.blockSignals(True)
+        self._slider.setRange(0, last_idx)
+        self._slider.setValue(last_idx)
+        self._slider.blockSignals(False)
+        self._display_frame_at(last_idx)
+
+    @staticmethod
+    def _format_metadata(row_data: dict) -> str:
+        """Render the metadata header line for an event."""
+        event_idx = row_data.get("event_idx", "?")
+
+        timestamp = row_data.get("timestamp", "")
+        try:
+            time_str = datetime.fromisoformat(timestamp).strftime("%H:%M:%S")
+        except (TypeError, ValueError):
+            time_str = "—"
+
+        score_raw = row_data.get("change_score", "")
+        try:
+            score_str = f"{float(score_raw):.2f}"
+        except (TypeError, ValueError):
+            score_str = "—"
+
+        temp_raw = row_data.get("pyrometer_temp_C", "")
+        try:
+            temp_str = (
+                f"{float(temp_raw):.1f} ℃" if temp_raw not in ("", None) else "—"
+            )
+        except (TypeError, ValueError):
+            temp_str = "—"
+
+        state = row_data.get("event_state", "?") or "?"
+
+        return (
+            f"Event #{event_idx}  ·  {time_str}  ·  "
+            f"score {score_str}  ·  {temp_str}  ·  {state}"
+        )
+
+    @pyqtSlot(int)
+    def _display_frame_at(self, idx: int) -> None:
+        """Show the frame at slider index ``idx``.
+
+        Bounds-checked because Qt may emit valueChanged transiently
+        during setRange/setValue calls; we already block signals around
+        those, but defensive guarding is cheap.
+        """
+        if not (0 <= idx < len(self._cached_pixmaps)):
+            return
+        self._image_label.setOriginalPixmap(self._cached_pixmaps[idx])
+        self._frame_position_label.setText(
+            f"{idx + 1} / {len(self._cached_pixmaps)}"
+        )
