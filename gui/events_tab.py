@@ -26,12 +26,24 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSlot
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QSizePolicy,
     QSlider, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
+
+from gui.growth_logger import (
+    EVENT_STATE_DISCARDED,
+    EVENT_STATE_KEPT_EXPLICIT,
+)
+
+
+# An event is "unreviewed" if the grower hasn't made an explicit
+# Keep/Discard decision on it. kept_default (banner timed out) counts as
+# unreviewed because the timeout means the grower wasn't actually looking
+# — exactly the walk-away catch-up case the badge needs to surface.
+_REVIEWED_STATES = (EVENT_STATE_KEPT_EXPLICIT, EVENT_STATE_DISCARDED)
 
 
 class _ScalingImageLabel(QLabel):
@@ -107,7 +119,19 @@ class EventsTab(QWidget):
        event_idx, so we re-read the CSV and append rows past the
        watermark. Connection order matters: GrowthApp's handler must be
        wired first so the CSV row is on disk before this slot reads it.
+
+    Live state changes flow in via ``on_decision_made`` (slot for
+    ``GrowthMonitor.auto_capture_decision``). Each transition refreshes
+    the unreviewed-count badge through ``unreviewed_count_changed``,
+    which GrowthMonitor relays to the tab header so the catch-up case
+    (return after walk-away, see "Events (12)") works at a glance.
     """
+
+    # Emitted whenever the count of unreviewed events changes. GrowthMonitor
+    # listens and rewrites the tab header text. "Unreviewed" is currently
+    # state-based (pending or kept_default) — when labeling lands it will
+    # also include events without a primary_reconstruction tag.
+    unreviewed_count_changed = pyqtSignal(int)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -288,29 +312,101 @@ class EventsTab(QWidget):
         """
         self._load_csv_rows()
 
+    @pyqtSlot(int, str, str)
+    def on_decision_made(
+        self, event_idx: int, buffer_dir: str, state: str,  # noqa: ARG002
+    ) -> None:
+        """Slot for ``GrowthMonitor.auto_capture_decision``.
+
+        Updates the matching row's state cell + cached UserRole dict and
+        — if that row is the currently-selected one — re-renders the
+        detail pane's metadata header. Refreshes the unreviewed-count
+        badge afterward. ``buffer_dir`` is part of the signal payload
+        for GrowthApp's CSV writer; the tab doesn't need it.
+
+        Connection order: GrowthApp's _on_auto_capture_decision is wired
+        first and rewrites auto_capture_events.csv via
+        update_auto_capture_state. By the time this slot runs, the CSV
+        row already reflects the new state — but we don't need to re-read
+        it because ``state`` is in the signal payload.
+        """
+        target = str(event_idx)
+        for row_idx in range(self.events_table.rowCount()):
+            idx_item = self.events_table.item(row_idx, COL_EVENT_IDX)
+            if idx_item is None or idx_item.text() != target:
+                continue
+
+            state_item = self.events_table.item(row_idx, COL_STATE)
+            if state_item is not None:
+                state_item.setText(state)
+            else:
+                self.events_table.setItem(
+                    row_idx, COL_STATE, QTableWidgetItem(state),
+                )
+
+            row_data = idx_item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(row_data, dict):
+                row_data["event_state"] = state
+                idx_item.setData(Qt.ItemDataRole.UserRole, row_data)
+                if self.events_table.currentRow() == row_idx:
+                    self._metadata_label.setText(
+                        self._format_metadata(row_data)
+                    )
+            break
+
+        self._refresh_unreviewed_badge()
+
     # --- Internal ---------------------------------------------------------
 
     def _load_csv_rows(self) -> None:
-        """Append rows past the watermark from auto_capture_events.csv."""
-        if self._session_dir is None:
-            return
-        csv_path = self._session_dir / "auto_capture_events.csv"
-        if not csv_path.exists():
-            return
+        """Append rows past the watermark from auto_capture_events.csv.
+
+        Wrapped in try/finally so the unreviewed badge always refreshes
+        — including the early-return paths (no session, missing CSV)
+        and OSError. Without this, attaching to a fresh session whose
+        CSV file doesn't exist yet would leave the badge stale at the
+        previous session's count.
+        """
         try:
-            with open(csv_path, "r", newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    try:
-                        idx = int(row.get("event_idx", "") or 0)
-                    except (TypeError, ValueError):
-                        continue
-                    if idx <= self._last_seen_event_idx:
-                        continue
-                    self._add_event_row(row)
-                    self._last_seen_event_idx = idx
-        except OSError:
-            return
+            if self._session_dir is None:
+                return
+            csv_path = self._session_dir / "auto_capture_events.csv"
+            if not csv_path.exists():
+                return
+            try:
+                with open(csv_path, "r", newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        try:
+                            idx = int(row.get("event_idx", "") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if idx <= self._last_seen_event_idx:
+                            continue
+                        self._add_event_row(row)
+                        self._last_seen_event_idx = idx
+            except OSError:
+                return
+        finally:
+            self._refresh_unreviewed_badge()
+
+    def _refresh_unreviewed_badge(self) -> None:
+        """Recompute unreviewed-event count and emit the change signal.
+
+        Walks the table's State column rather than caching a counter —
+        cheap (≤ ~50 rows per session) and avoids drift when the count
+        could otherwise diverge from the displayed states (e.g., a
+        future "default-hide-discarded" filter could mask rows from the
+        UI without removing them).
+        """
+        count = 0
+        for row_idx in range(self.events_table.rowCount()):
+            state_item = self.events_table.item(row_idx, COL_STATE)
+            if state_item is None:
+                continue
+            if state_item.text() not in _REVIEWED_STATES:
+                count += 1
+        self.unreviewed_count_changed.emit(count)
 
     def _add_event_row(self, row: dict) -> None:
         """Insert one CSV row at the top of the master list (newest first).

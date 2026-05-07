@@ -524,9 +524,25 @@ class GrowthMonitor(QWidget):
         Lives between Monitor (live) and Session (config + notes + export)
         in the tab order so the grower's natural left-to-right scan is
         now → just-fired events → session admin.
+
+        The tab's text gets a "(N)" badge whenever there are unreviewed
+        events — pending or kept_default — so the catch-up case after a
+        walk-away is legible at a glance from any other tab.
         """
         self.events_tab = EventsTab()
-        self._tabs.addTab(self.events_tab, "Events")
+        self._events_tab_index = self._tabs.addTab(self.events_tab, "Events")
+        self.events_tab.unreviewed_count_changed.connect(
+            self._on_unreviewed_count_changed,
+        )
+
+    def _on_unreviewed_count_changed(self, count: int):
+        """Repaint the Events tab header with the unreviewed-event count.
+
+        Empty badge when count == 0 to keep the header quiet during a
+        fully-attended growth; non-zero counts surface explicitly.
+        """
+        label = "Events" if count == 0 else f"Events ({count})"
+        self._tabs.setTabText(self._events_tab_index, label)
 
     # ----- Session Tab -----------------------------------------------------
 

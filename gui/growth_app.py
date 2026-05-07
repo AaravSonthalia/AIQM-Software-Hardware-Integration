@@ -143,6 +143,13 @@ class GrowthApp(QMainWindow):
         self.auto_capture_engine.frame_captured.connect(
             self.monitor.events_tab.on_frame_captured,
         )
+        # Events tab also reflects banner Keep/Discard decisions in its
+        # state column + unreviewed badge. Same connection-order reasoning:
+        # GrowthApp's handler (above) writes the CSV first, the tab updates
+        # its UI second using the state arg from the signal payload.
+        self.monitor.auto_capture_decision.connect(
+            self.monitor.events_tab.on_decision_made,
+        )
 
     # --- ARM / DISARM ------------------------------------------------------
 
