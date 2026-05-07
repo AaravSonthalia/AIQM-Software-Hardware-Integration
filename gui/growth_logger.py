@@ -14,6 +14,16 @@ from typing import Optional
 import numpy as np
 
 
+# Auto-capture event states (used by event_state column in
+# auto_capture_events.csv). Set to PENDING at fire time; transitions to one
+# of the other three when the grower interacts with the AutoCaptureBanner or
+# the keep-default countdown fires.
+EVENT_STATE_PENDING = "pending"
+EVENT_STATE_KEPT_EXPLICIT = "kept_explicit"
+EVENT_STATE_KEPT_DEFAULT = "kept_default"
+EVENT_STATE_DISCARDED = "discarded"
+
+
 class GrowthLogger:
     """Logs sensor data and timestamped entries during a growth session."""
 
@@ -35,6 +45,7 @@ class GrowthLogger:
         "timestamp", "elapsed_s", "event_idx",
         "change_score", "pyrometer_temp_C",
         "buffer_count", "buffer_dir",
+        "event_state", "state_changed_at",
     ]
     HEARTBEAT_FIELDS = [
         "timestamp", "elapsed_s", "heartbeat_idx",
@@ -271,6 +282,7 @@ class GrowthLogger:
         pyro_temp: Optional[float] = None,
         buffer_count: int = 0,
         buffer_dir: str = "",
+        event_state: str = EVENT_STATE_PENDING,
     ):
         """Append a row to auto_capture_events.csv for shadow-mode logging.
 
@@ -280,6 +292,11 @@ class GrowthLogger:
         and pyrometer trajectory after the session. ``buffer_count`` and
         ``buffer_dir`` capture how many context frames were dumped and
         where, so post-hoc analysis can locate them.
+
+        ``event_state`` defaults to ``"pending"`` at fire time and is updated
+        to one of ``"kept_explicit"`` / ``"kept_default"`` / ``"discarded"``
+        when the grower interacts with the AutoCaptureBanner (see
+        ``update_auto_capture_state``).
         """
         if not self._auto_capture_writer:
             return
@@ -293,8 +310,65 @@ class GrowthLogger:
             ),
             "buffer_count": buffer_count,
             "buffer_dir": buffer_dir,
+            "event_state": event_state,
+            "state_changed_at": "",
         })
         self._auto_capture_file.flush()
+
+    def update_auto_capture_state(
+        self,
+        event_idx: int,
+        new_state: str,
+    ) -> bool:
+        """Update event_state and state_changed_at for an existing event row.
+
+        Called when the grower interacts with the AutoCaptureBanner (Keep
+        Now, Discard) or when the keep-default countdown fires. Rewrites
+        auto_capture_events.csv in place — small file, infrequent updates,
+        simple semantics. Returns True if the row was found and updated.
+
+        Non-destructive design: discard updates the row state but does NOT
+        remove the buffer directory. The grower can recover discarded
+        events from the Events tab if they change their mind. See
+        ``feedback_aiqm_grower_friction.md`` for the design rationale.
+        """
+        if self._session_dir is None:
+            return False
+        csv_path = self._session_dir / "auto_capture_events.csv"
+        if not csv_path.exists():
+            return False
+
+        # Close the writer's file handle so we can rewrite in-place.
+        if self._auto_capture_file and not self._auto_capture_file.closed:
+            self._auto_capture_file.close()
+
+        with open(csv_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        timestamp = datetime.now().isoformat()
+        found = False
+        for row in rows:
+            if str(row.get("event_idx", "")) == str(event_idx):
+                row["event_state"] = new_state
+                row["state_changed_at"] = timestamp
+                found = True
+                break
+
+        if found:
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self.AUTO_CAPTURE_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+
+        # Reopen for append so subsequent log_auto_capture_event calls work.
+        # No header write — the file already has the header from start_session
+        # (or the rewrite above when found=True).
+        self._auto_capture_file = open(csv_path, "a", newline="")
+        self._auto_capture_writer = csv.DictWriter(
+            self._auto_capture_file, fieldnames=self.AUTO_CAPTURE_FIELDS,
+        )
+        return found
 
     def save_auto_capture_buffer(
         self,

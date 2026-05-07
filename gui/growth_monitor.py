@@ -29,6 +29,11 @@ from gui.state import (
     PowerSupplyState, PyrometerState,
 )
 from gui.widgets import ValueDisplay
+from gui.growth_logger import (
+    EVENT_STATE_DISCARDED,
+    EVENT_STATE_KEPT_DEFAULT,
+    EVENT_STATE_KEPT_EXPLICIT,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +155,7 @@ class AutoCaptureBanner(QFrame):
     classifier-driven version takes over.
     """
 
-    discard_requested = pyqtSignal(str)  # emits buffer_dir (relative to session)
+    decision_made = pyqtSignal(int, str, str)  # emits (event_idx, buffer_dir, state)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -204,6 +209,7 @@ class AutoCaptureBanner(QFrame):
         self._countdown_timer.setInterval(1000)
         self._countdown_timer.timeout.connect(self._tick)
         self._countdown_remaining = 0
+        self._current_event_idx = 0
         self._current_buffer_dir = ""
         self.hide()
 
@@ -215,6 +221,7 @@ class AutoCaptureBanner(QFrame):
         countdown_s: int = 10,
     ) -> None:
         """Display the banner for one flagged event."""
+        self._current_event_idx = event_idx
         self._current_buffer_dir = buffer_dir
         self._countdown_remaining = max(1, int(countdown_s))
         self._message_label.setText(
@@ -227,7 +234,7 @@ class AutoCaptureBanner(QFrame):
     def _tick(self) -> None:
         self._countdown_remaining -= 1
         if self._countdown_remaining <= 0:
-            self._on_keep_clicked()
+            self._on_keep_default_timeout()
         else:
             self._update_countdown_label()
 
@@ -237,13 +244,22 @@ class AutoCaptureBanner(QFrame):
         )
 
     def _on_discard_clicked(self) -> None:
-        self._countdown_timer.stop()
-        if self._current_buffer_dir:
-            self.discard_requested.emit(self._current_buffer_dir)
-        self.hide()
+        self._emit_decision(EVENT_STATE_DISCARDED)
 
     def _on_keep_clicked(self) -> None:
+        self._emit_decision(EVENT_STATE_KEPT_EXPLICIT)
+
+    def _on_keep_default_timeout(self) -> None:
+        self._emit_decision(EVENT_STATE_KEPT_DEFAULT)
+
+    def _emit_decision(self, state: str) -> None:
+        """Stop countdown, emit decision_made, hide the banner."""
         self._countdown_timer.stop()
+        self.decision_made.emit(
+            self._current_event_idx,
+            self._current_buffer_dir,
+            state,
+        )
         self.hide()
 
 
@@ -258,8 +274,11 @@ class GrowthMonitor(QWidget):
     export_requested = pyqtSignal()
     # True = user wants auto-capture paused; False = wants it resumed.
     auto_capture_pause_toggled = pyqtSignal(bool)
-    # Forwarded from the banner — emits the relative buffer dir to delete.
-    auto_capture_event_discarded = pyqtSignal(str)
+    # Forwarded from the banner — emits (event_idx, buffer_dir, state).
+    # State is one of EVENT_STATE_KEPT_EXPLICIT / EVENT_STATE_KEPT_DEFAULT /
+    # EVENT_STATE_DISCARDED. GrowthApp connects this to update the row in
+    # auto_capture_events.csv via GrowthLogger.update_auto_capture_state.
+    auto_capture_decision = pyqtSignal(int, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -344,8 +363,8 @@ class GrowthMonitor(QWidget):
         # Auto-capture event banner — hidden by default, surfaces when the
         # detector flags an event and disappears on Keep / Discard / timeout.
         self.auto_capture_banner = AutoCaptureBanner()
-        self.auto_capture_banner.discard_requested.connect(
-            self._on_auto_capture_discard,
+        self.auto_capture_banner.decision_made.connect(
+            self._on_auto_capture_decision_internal,
         )
         layout.addWidget(self.auto_capture_banner)
 
@@ -899,10 +918,13 @@ class GrowthMonitor(QWidget):
             event_idx, score, buffer_dir, countdown_s,
         )
 
-    def _on_auto_capture_discard(self, buffer_dir: str):
-        """Re-emit the banner's discard signal at the GrowthMonitor level
-        so GrowthApp can wire the cleanup without knowing about the banner."""
-        self.auto_capture_event_discarded.emit(buffer_dir)
+    def _on_auto_capture_decision_internal(
+        self, event_idx: int, buffer_dir: str, state: str,
+    ):
+        """Re-emit the banner's decision signal at the GrowthMonitor level
+        so GrowthApp can route the state update without knowing about the
+        banner internals."""
+        self.auto_capture_decision.emit(event_idx, buffer_dir, state)
 
     def set_auto_capture_pause_enabled(self, enabled: bool):
         """Enable/disable the pause toggle. Called by GrowthApp at session

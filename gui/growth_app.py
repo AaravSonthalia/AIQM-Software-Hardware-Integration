@@ -17,6 +17,7 @@ from PyQt6.QtCore import pyqtSlot, QTimer
 log = logging.getLogger(__name__)
 
 from gui.auto_capture import AutoCaptureEngine, PixelDiffChangeDetector
+from gui.growth_logger import EVENT_STATE_DISCARDED
 from gui.state import CameraState, EvapControlState, MistralState, PyrometerState
 from gui.workers import (
     EvapControlWorker, MistralWorker, PyrometerWorker, RheedCameraWorker,
@@ -131,8 +132,8 @@ class GrowthApp(QMainWindow):
         self.monitor.auto_capture_pause_toggled.connect(
             self._on_auto_capture_pause_toggled,
         )
-        self.monitor.auto_capture_event_discarded.connect(
-            self._on_auto_capture_event_discarded,
+        self.monitor.auto_capture_decision.connect(
+            self._on_auto_capture_decision,
         )
 
     # --- ARM / DISARM ------------------------------------------------------
@@ -419,28 +420,27 @@ class GrowthApp(QMainWindow):
                 buffer_dir=buffer_dir,
             )
 
-    @pyqtSlot(str)
-    def _on_auto_capture_event_discarded(self, buffer_dir: str):
-        """Grower hit Discard on the banner — delete the buffer directory.
+    @pyqtSlot(int, str, str)
+    def _on_auto_capture_decision(
+        self, event_idx: int, buffer_dir: str, state: str,
+    ):
+        """Route the grower's decision (or default-keep timeout) for an
+        auto-captured event into the CSV.
 
-        The CSV row in auto_capture_events.csv stays as a record that the
-        detector fired (with the original buffer_count); only the visual
-        bytes are removed.
+        Updates the event's row in auto_capture_events.csv to reflect the
+        decision state — one of ``kept_explicit``, ``kept_default``, or
+        ``discarded``. **Non-destructive by design**: the buffer directory
+        is preserved on disk regardless of state, so a "discarded" event
+        can be recovered from the Events tab if the grower changes their
+        mind. Rationale: feedback_aiqm_grower_friction.md (decisions
+        worth making should be recorded; a 10-second decision shouldn't
+        be irreversible).
         """
-        if not buffer_dir or not self.growth_log.session_dir:
-            return
-        target = self.growth_log.session_dir / buffer_dir
-        if not target.is_dir():
-            return
-        import shutil
-        try:
-            shutil.rmtree(target)
+        self.growth_log.update_auto_capture_state(event_idx, state)
+        if state == EVENT_STATE_DISCARDED:
             self.statusBar().showMessage(
-                f"Discarded auto-capture buffer at {buffer_dir}", 3000,
-            )
-        except OSError as e:
-            self.statusBar().showMessage(
-                f"Failed to discard buffer: {e}", 3000,
+                f"Event #{event_idx} marked discarded (buffer preserved at {buffer_dir})",
+                3000,
             )
 
     @pyqtSlot(bool)
