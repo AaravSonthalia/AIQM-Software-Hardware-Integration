@@ -10,6 +10,16 @@ This script searches likely Windows locations for recently-modified
 .txt / .log / .csv / .dat files and surfaces candidates with metadata
 plus an optional content preview.
 
+Scienta Omicron data-storage convention (from SES Software Manual v5.0,
+page 6, Table 1): data is stored INSIDE the install directory in
+sub-folders /data (binary .dat + .bin), /ini (.ini, .json), and
+/sequences (.seq, .ini) — NOT in standard Windows locations like
+ProgramData or AppData. Worth assuming MISTRAL follows the same pattern.
+SES also uses a custom top-level directory (e.g.
+`C:\\Scienta Omicron\\SES_1.8.0_Win64\\`) per the File Options dialog on
+page 27, so both `C:\\Scienta Omicron\\` and the standard install paths
+are searched.
+
 Usage on Bulbasaur:
     python scripts/find_mistral_logs.py              # default search
     python scripts/find_mistral_logs.py --peek       # also show first lines
@@ -35,8 +45,12 @@ import time
 from datetime import datetime
 from typing import Optional
 
-# Most-likely roots, in order of priority.
+# Most-likely roots, in order of priority. `C:\Scienta Omicron` is the
+# top-level data directory pattern Scienta Omicron uses per the SES
+# Software Manual v5.0 (page 27, File Options dialog) — separate from the
+# Program Files install location.
 KNOWN_ROOTS: tuple[str, ...] = (
+    r"C:\Scienta Omicron",
     r"C:\Program Files\Scienta Omicron",
     r"C:\Program Files (x86)\Scienta Omicron",
     r"C:\ProgramData\Scienta Omicron",
