@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
 )
 
 from gui.growth_logger import (
+    EVENT_STATE_AUTO_SKIPPED,
     EVENT_STATE_DISCARDED,
     EVENT_STATE_KEPT_EXPLICIT,
     GrowthLogger,
@@ -69,7 +70,13 @@ RECON_UNLABELED = ""
 # Keep/Discard decision on it. kept_default (banner timed out) counts as
 # unreviewed because the timeout means the grower wasn't actually looking
 # — exactly the walk-away catch-up case the badge needs to surface.
-_REVIEWED_STATES = (EVENT_STATE_KEPT_EXPLICIT, EVENT_STATE_DISCARDED)
+# auto_skipped events have no buffer to review (quality gate rejected
+# all 20 frames), so they don't need grower attention either.
+_REVIEWED_STATES = (
+    EVENT_STATE_KEPT_EXPLICIT,
+    EVENT_STATE_DISCARDED,
+    EVENT_STATE_AUTO_SKIPPED,
+)
 
 
 class _ScalingImageLabel(QLabel):

@@ -17,11 +17,16 @@ import numpy as np
 # Auto-capture event states (used by event_state column in
 # auto_capture_events.csv). Set to PENDING at fire time; transitions to one
 # of the other three when the grower interacts with the AutoCaptureBanner or
-# the keep-default countdown fires.
+# the keep-default countdown fires. AUTO_SKIPPED is set at log time when
+# the quality gate rejected all 20 buffer frames — there's nothing to
+# review, so the event has no banner and no resolution path. Marking it
+# at log time gives the row a terminal state instead of leaving it as
+# pending forever.
 EVENT_STATE_PENDING = "pending"
 EVENT_STATE_KEPT_EXPLICIT = "kept_explicit"
 EVENT_STATE_KEPT_DEFAULT = "kept_default"
 EVENT_STATE_DISCARDED = "discarded"
+EVENT_STATE_AUTO_SKIPPED = "auto_skipped"
 
 
 class GrowthLogger:
@@ -312,8 +317,15 @@ class GrowthLogger:
         """
         if not self._auto_capture_writer:
             return
+        timestamp = datetime.now().isoformat()
+        # Non-pending initial states (auto_skipped, etc.) are terminal at
+        # log time — set state_changed_at so the CSV stays internally
+        # consistent with the rule that any non-pending row has a stamp.
+        state_changed_at = (
+            timestamp if event_state != EVENT_STATE_PENDING else ""
+        )
         self._auto_capture_writer.writerow({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": timestamp,
             "elapsed_s": f"{elapsed_s:.2f}",
             "event_idx": event_idx,
             "change_score": f"{score:.4f}",
@@ -323,7 +335,7 @@ class GrowthLogger:
             "buffer_count": buffer_count,
             "buffer_dir": buffer_dir,
             "event_state": event_state,
-            "state_changed_at": "",
+            "state_changed_at": state_changed_at,
         })
         self._auto_capture_file.flush()
 

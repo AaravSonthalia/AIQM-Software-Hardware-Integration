@@ -17,7 +17,11 @@ from PyQt6.QtCore import pyqtSlot, QTimer
 log = logging.getLogger(__name__)
 
 from gui.auto_capture import AutoCaptureEngine, PixelDiffChangeDetector
-from gui.growth_logger import EVENT_STATE_DISCARDED
+from gui.growth_logger import (
+    EVENT_STATE_AUTO_SKIPPED,
+    EVENT_STATE_DISCARDED,
+    EVENT_STATE_PENDING,
+)
 from gui.state import CameraState, EvapControlState, MistralState, PyrometerState
 from gui.workers import (
     EvapControlWorker, MistralWorker, PyrometerWorker, RheedCameraWorker,
@@ -423,6 +427,13 @@ class GrowthApp(QMainWindow):
             event_idx=self._auto_capture_event_count,
             frames=context_frames,
         )
+        # Empty-buffer events have nothing to review — quality gate rejected
+        # all 20 frames. Mark as auto_skipped at log time so the CSV row
+        # gets a terminal state instead of sitting at pending forever.
+        initial_state = (
+            EVENT_STATE_AUTO_SKIPPED if buffer_count == 0
+            else EVENT_STATE_PENDING
+        )
         self.growth_log.log_auto_capture_event(
             event_idx=self._auto_capture_event_count,
             score=score,
@@ -430,6 +441,7 @@ class GrowthApp(QMainWindow):
             pyro_temp=pyro_temp,
             buffer_count=buffer_count,
             buffer_dir=buffer_dir,
+            event_state=initial_state,
         )
         # Surface the banner so the grower can discard if it looks spurious.
         # Default action (timeout) is to keep — the buffer is already on disk.
