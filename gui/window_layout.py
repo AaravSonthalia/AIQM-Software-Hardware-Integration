@@ -60,7 +60,7 @@ DEFAULT_LAYOUT: tuple[WindowSpec, ...] = (
     ),
     WindowSpec(
         name="Pyrometer",
-        title_substrings=("EX04763",),
+        title_substrings=("TemperaSure",),
         x=740, y=425, w=290, h=200,
     ),
     WindowSpec(
