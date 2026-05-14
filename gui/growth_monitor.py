@@ -884,6 +884,17 @@ class GrowthMonitor(QWidget):
         )
         self.growth_notes_table.scrollToBottom()
 
+    def clear_session_tables(self):
+        """Reset Sensor Log + Growth Notes table UIs for a new session.
+
+        The CSV files are correctly per-session (start_session opens fresh
+        ones), but these QTableWidgets accumulate rows visually across
+        sessions because nothing in the original wiring resets them.
+        Mirrors the setRowCount(0) call EventsTab.attach_session uses.
+        """
+        self.sensor_log_table.setRowCount(0)
+        self.growth_notes_table.setRowCount(0)
+
     # ----- Sensor Log display ---------------------------------------------
 
     def add_sensor_log_row(self, time_str: str, temp: Optional[float],
