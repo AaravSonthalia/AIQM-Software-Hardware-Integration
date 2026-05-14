@@ -10,7 +10,9 @@ Tab layout:
              growth notes (bottom half, full width), export
 """
 
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -23,6 +25,22 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QFont, QShortcut, QKeySequence
+
+
+def _default_save_path() -> str:
+    """Pick the default growth-log save path.
+
+    On Bulbasaur (Windows with the OMBE SSD mounted at E:), prefer
+    ``E:\\OMBE\\GrowthMonitor`` per PI directive that all growth data
+    written by this GUI should go to the SSD. Falls back to the original
+    ``logs/growths`` (relative to the repo) when the SSD isn't present —
+    keeps the default sane on Mac, on Windows boxes without the SSD
+    attached, and on any other deployment.
+    """
+    ssd_root = Path(r"E:\OMBE")
+    if sys.platform == "win32" and ssd_root.exists():
+        return str(ssd_root / "GrowthMonitor")
+    return "logs/growths"
 
 from gui.state import (
     CameraState, EvapControlState, MistralState,
@@ -576,8 +594,9 @@ class GrowthMonitor(QWidget):
 
         save_row = QHBoxLayout()
         self.config_save_path = QLineEdit()
-        self.config_save_path.setPlaceholderText("logs/growths")
-        self.config_save_path.setText("logs/growths")
+        default_save = _default_save_path()
+        self.config_save_path.setPlaceholderText(default_save)
+        self.config_save_path.setText(default_save)
         save_row.addWidget(self.config_save_path)
         browse_btn = QPushButton("Browse")
         browse_btn.setFixedWidth(70)

@@ -45,33 +45,39 @@ class WindowSpec:
     h: int
 
 
-# Layout estimated from Apr 29 screenshot. Verify on Bulbasaur and tune.
-# Left monitor: 0..1919. Right monitor: 1920..3839. Both 1080 tall.
+# Layout matches AJ's deliberate Bulbasaur arrangement (May 14 lab visit).
+# Bulbasaur has dual 1920x1080 monitors:
+#   Left monitor:  x = -1920 to 0
+#   Right monitor: x = 0 to 1920
+# Coordinates are rough estimates from Image #15 screenshot — first
+# `--arrange` will get us in the neighborhood; tune from there.
 DEFAULT_LAYOUT: tuple[WindowSpec, ...] = (
+    # Left monitor — AIQM stack
     WindowSpec(
         name="kSA",
-        title_substrings=("AVT Manta", "kSA 400"),
-        x=0, y=0, w=480, h=420,
+        title_substrings=("kSA 400", "AVT Manta"),
+        x=-1920, y=0, w=640, h=410,
     ),
     WindowSpec(
         name="GrowthMonitor",
         title_substrings=("OMBE Growth Monitor",),
-        x=480, y=0, w=540, h=420,
+        x=-1280, y=0, w=520, h=410,
     ),
     WindowSpec(
         name="Pyrometer",
         title_substrings=("TemperaSure",),
-        x=740, y=425, w=290, h=200,
+        x=-650, y=10, w=320, h=240,
     ),
     WindowSpec(
         name="EvapControl",
         title_substrings=("Evaporation control",),
-        x=0, y=575, w=1020, h=220,
+        x=-1920, y=420, w=1280, h=170,
     ),
+    # Right monitor — MISTRAL fullscreen
     WindowSpec(
         name="MistralGui",
         title_substrings=("MistralGui",),
-        x=1920, y=0, w=1920, h=1040,
+        x=0, y=0, w=1920, h=1080,
     ),
 )
 
