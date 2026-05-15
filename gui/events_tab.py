@@ -36,8 +36,8 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QSizePolicy, QSlider, QSplitter,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QSizePolicy,
+    QSlider, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from gui.growth_logger import (
@@ -366,6 +366,27 @@ class EventsTab(QWidget):
         self._notes_input.textChanged.connect(self._on_notes_text_changed)
         self._notes_input.editingFinished.connect(self._flush_notes_to_disk)
         form.addRow("Notes:", self._notes_input)
+
+        # Experimental: classify the currently displayed frame via Classifier2.
+        # Lazy-loaded on first click — Bulbasaur needs torch + AI_for_quantum
+        # cloned. AI_REPO_ROOT env var overrides the platform default. Result
+        # is shown inline; full breakdown via tooltip on hover.
+        self._classifier = None  # ClassifierBridge instance, lazy-loaded
+        self._classifier_load_error: Optional[str] = None
+        classify_row = QHBoxLayout()
+        classify_row.setSpacing(6)
+        self._classify_button = QPushButton("Classify!")
+        self._classify_button.setToolTip(
+            "Run Classifier2 on the currently displayed buffer frame "
+            "(slider position). Lazy-loads the model on first click."
+        )
+        self._classify_button.clicked.connect(self._on_classify_clicked)
+        classify_row.addWidget(self._classify_button)
+        self._classifier_result_label = QLabel("<i>not yet classified</i>")
+        self._classifier_result_label.setStyleSheet("color: #888;")
+        self._classifier_result_label.setWordWrap(True)
+        classify_row.addWidget(self._classifier_result_label, 1)
+        form.addRow("Classifier:", classify_row)
 
         return box
 
@@ -814,3 +835,137 @@ class EventsTab(QWidget):
         self._frame_position_label.setText(
             f"{idx + 1} / {len(self._cached_pixmaps)}"
         )
+        # Reset the classifier label whenever the displayed frame changes —
+        # the displayed result is for the previously-classified frame and
+        # would be misleading otherwise. User must click Classify again.
+        if hasattr(self, "_classifier_result_label"):
+            self._classifier_result_label.setText("<i>not yet classified</i>")
+            self._classifier_result_label.setStyleSheet("color: #888;")
+
+    # --- Experimental: Classifier2 integration ----------------------------
+
+    @staticmethod
+    def _default_ai_repo_root() -> "Path":
+        """Platform-aware default for the AI_for_quantum repo location.
+
+        Override with the AI_REPO_ROOT environment variable. The defaults
+        track the per-machine layout: Mac dev clone vs. Bulbasaur clone.
+        """
+        import os
+        env = os.environ.get("AI_REPO_ROOT")
+        if env:
+            return Path(env)
+        import sys
+        if sys.platform == "win32":
+            return Path(r"C:\Users\Lab10\AI_for_quantum")
+        return Path("/Users/aj/test-claude/projects/ai-for-quantum")
+
+    def _get_classifier(self):
+        """Lazy-load ClassifierBridge on first call. Cache for subsequent calls.
+
+        Returns None and surfaces a QMessageBox if loading fails (torch missing,
+        repo not cloned, model missing, etc.). Subsequent calls short-circuit
+        without retrying — clear cached_error to retry after fixing.
+        """
+        if self._classifier is not None:
+            return self._classifier
+        if self._classifier_load_error is not None:
+            return None
+        try:
+            from gui.classifier_bridge import ClassifierBridge
+            repo_root = self._default_ai_repo_root()
+            if not repo_root.exists():
+                raise FileNotFoundError(
+                    f"AI_for_quantum repo not found at {repo_root}. "
+                    f"Clone it or set AI_REPO_ROOT env var."
+                )
+            self._classifier = ClassifierBridge(repo_root)
+            return self._classifier
+        except Exception as e:
+            self._classifier_load_error = str(e)
+            QMessageBox.critical(
+                self, "Classifier load failed",
+                f"Failed to load Classifier2.\n\n{e}\n\n"
+                f"On Bulbasaur, this typically means torch isn't installed "
+                f"or the AI_for_quantum repo isn't cloned. See the lab "
+                f"setup notes."
+            )
+            return None
+
+    def _on_classify_clicked(self) -> None:
+        """Classify the currently displayed buffer frame.
+
+        Reads the PNG at the current slider position, hands the raw pixels
+        to ClassifierBridge, and renders the breakdown inline. Disables the
+        button while inferring (single-threaded; classifier is fast enough
+        on CPU that the brief UI freeze is acceptable for an MVP).
+        """
+        if not self._cached_paths:
+            self._classifier_result_label.setText(
+                "<span style='color: #c33;'>no frame loaded</span>"
+            )
+            return
+        idx = self._slider.value()
+        if not (0 <= idx < len(self._cached_paths)):
+            return
+        frame_path = self._cached_paths[idx]
+
+        classifier = self._get_classifier()
+        if classifier is None:
+            self._classifier_result_label.setText(
+                "<span style='color: #c33;'>classifier unavailable</span>"
+            )
+            return
+
+        self._classify_button.setEnabled(False)
+        self._classifier_result_label.setText("<i>classifying…</i>")
+        try:
+            from PIL import Image
+            arr = np.asarray(Image.open(frame_path).convert("RGB"))
+            result = classifier.classify(arr)
+            self._render_classifier_result(result)
+        except Exception as e:
+            self._classifier_result_label.setText(
+                f"<span style='color: #c33;'>error: {e}</span>"
+            )
+        finally:
+            self._classify_button.setEnabled(True)
+
+    def _render_classifier_result(self, result: dict) -> None:
+        """Format classifier output as a compact inline label."""
+        scores = result.get("classification_scores", {}) or {}
+        predicted = result.get("predicted_class", "?")
+        is_bad = result.get("is_bad", False)
+        bad_conf = result.get("bad_confidence", 0.0)
+
+        # Sort scores descending; show all with the predicted class bolded.
+        items = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        parts = []
+        for label, v in items:
+            pct = f"{v * 100:.1f}%"
+            if label == predicted:
+                parts.append(f"<b>{label} {pct}</b>")
+            else:
+                parts.append(f"{label} {pct}")
+        breakdown = " · ".join(parts)
+
+        if is_bad:
+            prefix = (
+                f"<span style='color: #c33;'>⚠ low-quality "
+                f"({bad_conf:.0%})</span>  "
+            )
+        else:
+            prefix = ""
+        self._classifier_result_label.setText(prefix + breakdown)
+        self._classifier_result_label.setStyleSheet("color: #ddd;")
+
+        # Tooltip shows the raw dict for debugging.
+        quality = result.get("quality")
+        tip_lines = [f"Predicted: {predicted}"]
+        for label, v in items:
+            tip_lines.append(f"  {label}: {v:.4f}")
+        if quality is not None:
+            tip_lines.append(f"Quality: {quality:.3f}")
+        if is_bad:
+            tip_lines.append(f"Low-quality flag: True ({bad_conf:.1%})")
+        self._classifier_result_label.setToolTip("\n".join(tip_lines))
