@@ -67,6 +67,17 @@ PROCESS_WH = (128, 96)
 DISPLAY_WH = (640, 480)
 LABELS_CSV = Path.home() / "Downloads" / "equalizer_labels.csv"
 
+# Pre-computed class means cache — lets the UI run on machines without the
+# training data (e.g., Bulbasaur). Build with scripts/build_equalizer_cache.py
+# on a machine that has CLASSIFIER2_DATA_ROOT, commit the resulting npz.
+MEANS_CACHE = Path(__file__).parent.parent / "data" / "equalizer_class_means.npz"
+# npz requires keys that are valid Python identifiers; map labels with parens.
+SAFE_KEYS = {
+    label: label.replace("(", "_").replace(")", "_").replace(" ", "")
+    for label in CLASS_LABELS
+}
+SAFE_KEYS_REVERSE = {v: k for k, v in SAFE_KEYS.items()}
+
 # Sliders are integer 0-100 internally; UI weight is value/100.
 SLIDER_MIN = 0
 SLIDER_MAX = 100
@@ -81,8 +92,33 @@ def load_grayscale(path: Path, target_wh: tuple[int, int]) -> np.ndarray:
     return np.asarray(img, dtype=np.float32)
 
 
+def _load_means_from_cache() -> dict[str, np.ndarray] | None:
+    """Try to load pre-computed class means from the npz cache."""
+    if not MEANS_CACHE.exists():
+        return None
+    data = np.load(MEANS_CACHE)
+    means = {
+        SAFE_KEYS_REVERSE[k]: data[k].astype(np.float32)
+        for k in data.files
+        if k in SAFE_KEYS_REVERSE
+    }
+    return means or None
+
+
 def load_class_means(target_wh: tuple[int, int]) -> dict[str, np.ndarray]:
-    """Compute the per-class mean image for each STO reconstruction class."""
+    """Per-class mean image for each STO reconstruction class.
+
+    First checks for a pre-computed cache (lets Bulbasaur run without the
+    training data). Falls back to computing from CLASSIFIER2_DATA_ROOT.
+    Cache is assumed to be at PROCESS_WH; mismatched target_wh triggers a
+    recompute path (which only works on Mac where training data exists).
+    """
+    cached = _load_means_from_cache()
+    if cached is not None:
+        sample = next(iter(cached.values()))
+        if sample.shape == (target_wh[1], target_wh[0]):
+            return cached
+
     means: dict[str, np.ndarray] = {}
     for label, subdir in CLASS_DIRS.items():
         class_dir = CLASSIFIER2_DATA_ROOT / subdir
