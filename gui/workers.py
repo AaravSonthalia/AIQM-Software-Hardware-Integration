@@ -337,6 +337,8 @@ class PyrometerWorker(QThread):
         mode: str = "dummy",
         poll_interval: float = 0.5,
         samples_per_poll: int = 5,
+        port: str = "COM4",
+        baudrate: int = 115200,
     ):
         super().__init__()
         self.mode = mode
@@ -345,6 +347,8 @@ class PyrometerWorker(QThread):
         # at the Exactus default rate (~10 reads/s); for screengrab mode it
         # samples whatever jitter the GUI exposes between refreshes.
         self.samples_per_poll = max(1, int(samples_per_poll))
+        self.port = port
+        self.baudrate = baudrate
         self.running = False
         self._sensor = None
 
@@ -426,6 +430,9 @@ class PyrometerWorker(QThread):
         elif self.mode == "screengrab":
             from drivers.pyrometer import ScreenGrabPyrometer
             return ScreenGrabPyrometer()
+        elif self.mode == "exactus":
+            from drivers.pyrometer import ExactusSerialPyrometer
+            return ExactusSerialPyrometer(port=self.port, baudrate=self.baudrate)
         else:
             from drivers.pyrometer import DummyPyrometer
             return DummyPyrometer()
