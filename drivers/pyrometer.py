@@ -368,6 +368,85 @@ class ScreenGrabPyrometer(TemperatureSensor):
         return None
 
 
+class ExactusSerialPyrometer(TemperatureSensor):
+    """
+    BASF Exactus optical thermometer — binary serial protocol.
+
+    Each packet is 5 bytes:
+      [0x81, B0, B1, B2, B3]
+    where B0..B3 is an IEEE 754 big-endian float32 (temperature in °C).
+
+    The reader syncs to the 0x81 header byte, then reads the 4-byte body.
+    Call from a background thread; read_temperature() blocks until one
+    valid packet arrives or the serial timeout fires.
+    """
+
+    HEADER = 0x81
+    BODY_LEN = 4
+
+    def __init__(
+        self,
+        port: str = "COM4",
+        baudrate: int = 115200,
+        timeout: float = 2.0,
+    ):
+        self._port = port
+        self._baudrate = baudrate
+        self._timeout = timeout
+        self._serial = None
+        self._connected = False
+
+    def connect(self) -> None:
+        try:
+            import serial
+        except ImportError:
+            raise ImportError("pyserial not installed: pip install pyserial")
+
+        import serial as _serial
+
+        self._serial = _serial.Serial(
+            port=self._port,
+            baudrate=self._baudrate,
+            timeout=self._timeout,
+        )
+        if not self._serial.is_open:
+            self._serial.open()
+        self._connected = True
+
+    def disconnect(self) -> None:
+        if self._serial is not None:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+            self._serial = None
+        self._connected = False
+
+    def read_temperature(self) -> float:
+        """Block until one complete Exactus packet is received, return °C."""
+        if not self._connected or self._serial is None:
+            raise RuntimeError("ExactusSerialPyrometer not connected.")
+
+        # Sync to header byte — discard any partial/stale bytes
+        while True:
+            b = self._serial.read(1)
+            if not b:
+                raise RuntimeError(
+                    "Serial timeout waiting for Exactus 0x81 header."
+                )
+            if b[0] == self.HEADER:
+                break
+
+        body = self._serial.read(self.BODY_LEN)
+        if len(body) < self.BODY_LEN:
+            raise RuntimeError(
+                f"Exactus short packet: expected {self.BODY_LEN} bytes, "
+                f"got {len(body)}."
+            )
+
+        return struct.unpack(">f", body)[0]
+
+
 class DummyPyrometer(TemperatureSensor):
     """Test pyrometer that returns a slowly varying temperature."""
 

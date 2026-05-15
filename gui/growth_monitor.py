@@ -615,8 +615,18 @@ class GrowthMonitor(QWidget):
         config_form.addRow("Camera mode:", self.config_camera_mode)
 
         self.config_pyrometer_mode = QComboBox()
-        self.config_pyrometer_mode.addItems(["dummy", "modbus", "screengrab"])
+        self.config_pyrometer_mode.addItems(["dummy", "exactus", "modbus", "screengrab"])
         config_form.addRow("Pyrometer mode:", self.config_pyrometer_mode)
+
+        self.config_exactus_port = QLineEdit("COM4")
+        config_form.addRow("Exactus port:", self.config_exactus_port)
+
+        self.config_exactus_baud = QComboBox()
+        self.config_exactus_baud.addItems(
+            ["9600", "19200", "38400", "57600", "115200"]
+        )
+        self.config_exactus_baud.setCurrentText("115200")
+        config_form.addRow("Exactus baud:", self.config_exactus_baud)
 
         self.config_mistral_mode = QComboBox()
         self.config_mistral_mode.addItems(["dummy", "screengrab"])

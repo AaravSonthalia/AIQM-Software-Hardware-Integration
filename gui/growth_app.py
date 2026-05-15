@@ -192,8 +192,13 @@ class GrowthApp(QMainWindow):
             self.camera_worker.start()
 
         if not self.pyrometer_worker or not self.pyrometer_worker.isRunning():
+            exactus_port = self.monitor.config_exactus_port.text().strip() or "COM4"
+            exactus_baud = int(self.monitor.config_exactus_baud.currentText())
             self.pyrometer_worker = PyrometerWorker(
-                mode=pyrometer_mode, poll_interval=0.5,
+                mode=pyrometer_mode,
+                poll_interval=0.5,
+                port=exactus_port,
+                baudrate=exactus_baud,
             )
             self.pyrometer_worker.state_updated.connect(self._on_pyrometer_state)
             self.pyrometer_worker.start()
