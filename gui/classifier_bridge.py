@@ -50,7 +50,7 @@ class ClassifierBridge:
         self._bad_threshold = bad_threshold
 
         # Add Classifier2 to sys.path so its modules are importable.
-        c2_dir = str(self._repo / "Classifier2")
+        c2_dir = str(self._repo / "src" / "classifiers" / "classifier2")
         if c2_dir not in sys.path:
             sys.path.insert(0, c2_dir)
 
@@ -61,7 +61,10 @@ class ClassifierBridge:
 
         # Resolve model path.
         if model_path is None:
-            model_path = self._repo / "Classifier2" / "artifacts" / "best_model.pth"
+            model_path = (
+                self._repo / "src" / "classifiers" / "classifier2"
+                / "artifacts" / "best_model.pth"
+            )
 
         self._model, self._device = load_model(str(model_path))
 

@@ -65,8 +65,19 @@ DEFAULT_LAYOUT: tuple[WindowSpec, ...] = (
     ),
     WindowSpec(
         name="Pyrometer",
-        title_substrings=("TemperaSure",),
+        # "BASF" is unique to the main TemperaSure app and disambiguates from
+        # the live readout window (which also contains "TemperaSure" in its
+        # title). May 15 lab finding.
+        title_substrings=("BASF",),
         x=-650, y=10, w=320, h=240,
+    ),
+    WindowSpec(
+        name="PyrometerReadout",
+        # The big "551.94" pop-out readout. Title looks like "TemperaSure: NNN"
+        # — the colon is the disambiguator. May 15 lab finding (previously
+        # thought to be unmanageable).
+        title_substrings=("TemperaSure:",),
+        x=-330, y=10, w=240, h=150,
     ),
     WindowSpec(
         name="EvapControl",

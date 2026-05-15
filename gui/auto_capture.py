@@ -266,6 +266,7 @@ class AutoCaptureEngine(QObject):
         adaptive_history: int = 100,
         adaptive_warmup: int = 20,
         adaptive_floor: float = 1.0,
+        suppress_events_during_adaptive_warmup: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -300,6 +301,9 @@ class AutoCaptureEngine(QObject):
         self._adaptive_history = adaptive_history
         self._adaptive_warmup = adaptive_warmup
         self._adaptive_floor = adaptive_floor
+        self._suppress_events_during_adaptive_warmup = (
+            suppress_events_during_adaptive_warmup
+        )
         self._baseline_scores: collections.deque[float] = collections.deque(
             maxlen=adaptive_history,
         )
@@ -392,6 +396,23 @@ class AutoCaptureEngine(QObject):
         score = self._detector.compute_score(frame)
         self._latest_score = score
         now = time.time()
+
+        # During adaptive warmup, the detector's internal buffer is still
+        # settling and the rolling baseline hasn't filled — effective_threshold
+        # falls back to the fixed _threshold (often near the floor), so any
+        # noise above the floor fires events on a 5-frame cooldown. Cross-
+        # dataset replay (Rahim 02_04/02_06/04_11) showed this consistently
+        # produces 4 spurious events at frames 32/40/48/56 every session.
+        # Fix: feed all scores to the baseline during adaptive warmup but
+        # suppress event emission entirely.
+        in_adaptive_warmup = (
+            self._adaptive_sigma is not None
+            and self._suppress_events_during_adaptive_warmup
+            and len(self._baseline_scores) < self._adaptive_warmup
+        )
+        if in_adaptive_warmup:
+            self._baseline_scores.append(score)
+            return
 
         threshold = self.effective_threshold
         if score >= threshold:
