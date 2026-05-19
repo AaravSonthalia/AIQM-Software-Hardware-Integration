@@ -388,6 +388,24 @@ class EventsTab(QWidget):
         classify_row.addWidget(self._classifier_result_label, 1)
         form.addRow("Classifier:", classify_row)
 
+        # Launch the Equalizer in a separate top-level window pre-loaded with
+        # the currently displayed frame. Per PI direction May 8 + AJ's May 19
+        # clarification: separate non-modal window so growers can label
+        # without losing sight of the live Growth Monitor.
+        self._equalizer_window = None  # held to prevent GC of the popup
+        equalizer_row = QHBoxLayout()
+        equalizer_row.setSpacing(6)
+        self._equalizer_button = QPushButton("Label with Equalizer…")
+        self._equalizer_button.setToolTip(
+            "Open the currently displayed buffer frame in the RHEED "
+            "Equalizer (separate window). Drag the 5 sliders to label "
+            "the reconstruction mixture. Save writes back to this event."
+        )
+        self._equalizer_button.clicked.connect(self._on_open_equalizer)
+        equalizer_row.addWidget(self._equalizer_button)
+        equalizer_row.addStretch(1)
+        form.addRow("Equalizer:", equalizer_row)
+
         return box
 
     # --- Public API used by GrowthApp -------------------------------------
@@ -930,6 +948,95 @@ class EventsTab(QWidget):
             )
         finally:
             self._classify_button.setEnabled(True)
+
+    # --- Experimental: Equalizer integration -------------------------------
+
+    def _on_open_equalizer(self) -> None:
+        """Open the current buffer frame in a separate Equalizer window.
+
+        Lazy-imports the Equalizer (it's in scripts/ not gui/) so that
+        events_tab.py stays importable even if scripts/ isn't on sys.path
+        in some downstream context. Spawns a top-level non-modal window;
+        keeps a reference so the popup isn't garbage-collected.
+        """
+        if not self._cached_paths:
+            return
+        idx = self._slider.value()
+        if not (0 <= idx < len(self._cached_paths)):
+            return
+        frame_path = self._cached_paths[idx]
+        event_idx = self._currently_displayed_event_idx
+        if event_idx is None:
+            return
+
+        # Repo root is parent of gui/ — add to sys.path so scripts.equalizer_ui
+        # resolves regardless of how growth_monitor_app.py was launched.
+        import sys as _sys
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        if repo_root not in _sys.path:
+            _sys.path.insert(0, repo_root)
+        try:
+            from scripts.equalizer_ui import EqualizerWindow
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Equalizer unavailable",
+                f"Couldn't import the Equalizer:\n\n{e}",
+            )
+            return
+
+        callback = self._make_equalizer_save_callback(event_idx)
+        try:
+            self._equalizer_window = EqualizerWindow(
+                pre_loaded_image=frame_path,
+                on_save_callback=callback,
+            )
+            self._equalizer_window.show()
+            self._equalizer_window.raise_()
+            self._equalizer_window.activateWindow()
+        except SystemExit:
+            # EqualizerWindow.__init__ calls sys.exit(1) if it can't load
+            # any basis at all — swallow it here so it doesn't kill the
+            # Growth Monitor process. The user already saw the QMessageBox.
+            self._equalizer_window = None
+
+    def _make_equalizer_save_callback(self, event_idx: int):
+        """Build the on_save callback bound to a specific event_idx."""
+        # Class label → growth_logger.update_event_label kwarg name.
+        kwarg_for_class = {
+            "1x1":     "recon_1x1",
+            "Tw(2x1)": "recon_tw",
+            "c(6x2)":  "recon_c6x2",
+            "RT13":    "recon_rt13",
+            "HTR":     "recon_HTR",
+        }
+
+        def _save(weights: dict) -> None:
+            if self._growth_logger is None:
+                return
+            kwargs: dict = {}
+            for class_label, kwarg in kwarg_for_class.items():
+                kwargs[kwarg] = float(weights.get(class_label, 0.0))
+            # Pick primary_reconstruction as the argmax for back-compat with
+            # downstream filters that still look at the single-class field.
+            if weights:
+                primary_label = max(weights.items(), key=lambda kv: kv[1])[0]
+                kwargs["primary_reconstruction"] = primary_label
+            self._growth_logger.update_event_label(event_idx, **kwargs)
+            # Refresh the in-memory cache + the label form so the new
+            # primary label is reflected in the dropdown next time the
+            # grower scrolls back to this event.
+            self._label_cache[event_idx] = (
+                self._label_cache.get(event_idx) or {}
+            )
+            self._label_cache[event_idx]["primary_reconstruction"] = (
+                kwargs.get("primary_reconstruction", "")
+            )
+            for k, v in kwargs.items():
+                if k.startswith("recon_"):
+                    self._label_cache[event_idx][k] = f"{v:.4f}"
+            self._refresh_unreviewed_badge()
+
+        return _save
 
     def _render_classifier_result(self, result: dict) -> None:
         """Format classifier output as a compact inline label."""

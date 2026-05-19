@@ -72,6 +72,15 @@ class GrowthLogger:
         "change_to",
         "notes",
         "label_timestamp_iso",
+        # Mixture-label columns written by the Equalizer (May 19 2026 sprint).
+        # Each is a float in [0, 1]; ideally sum to ~1 after normalization.
+        # primary_reconstruction stays populated as argmax for back-compat and
+        # quick filtering by single-class users.
+        "recon_1x1",
+        "recon_tw",
+        "recon_c6x2",
+        "recon_rt13",
+        "recon_HTR",
     ]
 
     def __init__(self, base_dir: str = "logs/growths"):
@@ -429,6 +438,11 @@ class GrowthLogger:
         change_from: Optional[str] = None,
         change_to: Optional[str] = None,
         notes: Optional[str] = None,
+        recon_1x1: Optional[float] = None,
+        recon_tw: Optional[float] = None,
+        recon_c6x2: Optional[float] = None,
+        recon_rt13: Optional[float] = None,
+        recon_HTR: Optional[float] = None,
     ) -> bool:
         """Atomically upsert a labeling row in events_labels.csv.
 
@@ -480,6 +494,15 @@ class GrowthLogger:
             existing["change_to"] = change_to
         if notes is not None:
             existing["notes"] = notes
+        for col_name, val in (
+            ("recon_1x1", recon_1x1),
+            ("recon_tw", recon_tw),
+            ("recon_c6x2", recon_c6x2),
+            ("recon_rt13", recon_rt13),
+            ("recon_HTR", recon_HTR),
+        ):
+            if val is not None:
+                existing[col_name] = f"{val:.4f}"
         existing["label_timestamp_iso"] = datetime.now().isoformat()
 
         try:

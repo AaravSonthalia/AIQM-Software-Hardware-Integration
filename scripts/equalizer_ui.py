@@ -35,6 +35,7 @@ import csv
 import datetime
 import sys
 from pathlib import Path
+from typing import Callable, Optional
 
 import numpy as np
 from PIL import Image
@@ -78,6 +79,20 @@ SAFE_KEYS = {
 }
 SAFE_KEYS_REVERSE = {v: k for k, v in SAFE_KEYS.items()}
 
+# Physics-simulated basis from Liu et al. (J. Vac. Sci. Technol. B 2022),
+# rendered from the parameters in their xlsx, exported via the PI's earlier
+# presentation. Used for the four well-defined reconstructions; HTR has no
+# closed-form physical model so it stays empirical (per AJ's clarification
+# May 19 2026 — HTR is a grower-side "catch-all" term, not a phase).
+SIMULATED_BASIS_DIR = Path(__file__).parent.parent / "data" / "simulated_basis"
+SIMULATED_BASIS_FILES = {
+    "1x1": "1x1.png",
+    "Tw(2x1)": "Tw_2x1.png",
+    "c(6x2)": "c_6x2.png",
+    "RT13": "rt13.png",
+    # HTR intentionally omitted — empirical mean only.
+}
+
 # Sliders are integer 0-100 internally; UI weight is value/100.
 SLIDER_MIN = 0
 SLIDER_MAX = 100
@@ -105,32 +120,71 @@ def _load_means_from_cache() -> dict[str, np.ndarray] | None:
     return means or None
 
 
-def load_class_means(target_wh: tuple[int, int]) -> dict[str, np.ndarray]:
-    """Per-class mean image for each STO reconstruction class.
+def _load_simulated_basis(target_wh: tuple[int, int]) -> dict[str, np.ndarray]:
+    """Load the physics-simulated reference image for each well-defined class.
 
-    First checks for a pre-computed cache (lets Bulbasaur run without the
-    training data). Falls back to computing from CLASSIFIER2_DATA_ROOT.
-    Cache is assumed to be at PROCESS_WH; mismatched target_wh triggers a
-    recompute path (which only works on Mac where training data exists).
+    Returns a dict mapping class label → grayscale array at target_wh, only
+    for classes that have a committed simulation PNG. Classes without a
+    simulation (HTR) are absent from the returned dict; the caller layers
+    the empirical mean for those.
     """
+    simulated: dict[str, np.ndarray] = {}
+    for label, filename in SIMULATED_BASIS_FILES.items():
+        path = SIMULATED_BASIS_DIR / filename
+        if not path.exists():
+            continue
+        simulated[label] = load_grayscale(path, target_wh)
+    return simulated
+
+
+def load_class_means(target_wh: tuple[int, int]) -> dict[str, np.ndarray]:
+    """Per-class basis image for each STO reconstruction class.
+
+    Hybrid basis (per PI direction May 8 2026 + AJ's HTR clarification
+    May 19 2026):
+      - Four well-defined reconstructions (1x1, Tw(2x1), c(6x2), RT13)
+        use physics-simulated images from Liu et al. (JVSTB 2022).
+      - HTR has no closed-form physical model — it's a grower-side
+        "catch-all" — so it stays as the empirical class mean from
+        Classifier2's training data.
+
+    Resolution order:
+      1. Simulated PNG if present (4 classes)
+      2. Cached empirical mean (HTR, and fallback for missing simulations)
+      3. Recompute from CLASSIFIER2_DATA_ROOT (Mac dev only)
+    """
+    simulated = _load_simulated_basis(target_wh)
     cached = _load_means_from_cache()
+
+    # If the cache matches target resolution, use it as the empirical fill.
+    empirical: dict[str, np.ndarray] = {}
     if cached is not None:
         sample = next(iter(cached.values()))
         if sample.shape == (target_wh[1], target_wh[0]):
-            return cached
+            empirical = cached
 
-    means: dict[str, np.ndarray] = {}
-    for label, subdir in CLASS_DIRS.items():
-        class_dir = CLASSIFIER2_DATA_ROOT / subdir
-        if not class_dir.is_dir():
-            continue
-        rows: list[np.ndarray] = []
-        for p in sorted(class_dir.iterdir()):
-            if p.suffix.lower() not in IMAGE_EXTS:
+    # If we have no empirical fill and no training data either, return
+    # simulated-only — the UI will warn about missing HTR.
+    if not empirical and not CLASSIFIER2_DATA_ROOT.is_dir():
+        return dict(simulated)
+
+    # Need to compute empirical from training data (Mac dev path).
+    if not empirical:
+        for label, subdir in CLASS_DIRS.items():
+            class_dir = CLASSIFIER2_DATA_ROOT / subdir
+            if not class_dir.is_dir():
                 continue
-            rows.append(load_grayscale(p, target_wh))
-        if rows:
-            means[label] = np.stack(rows).mean(axis=0)
+            rows: list[np.ndarray] = []
+            for p in sorted(class_dir.iterdir()):
+                if p.suffix.lower() not in IMAGE_EXTS:
+                    continue
+                rows.append(load_grayscale(p, target_wh))
+            if rows:
+                empirical[label] = np.stack(rows).mean(axis=0)
+
+    # Layer: simulated wins for the 4 well-defined classes, empirical for HTR.
+    means: dict[str, np.ndarray] = dict(empirical)
+    means.update(simulated)
     return means
 
 
@@ -194,32 +248,76 @@ def array_to_pixmap(
 
 
 class EqualizerWindow(QMainWindow):
-    def __init__(self) -> None:
+    """RHEED Equalizer labeling window.
+
+    Standalone mode (no args): user picks an image via the Open dialog;
+    Save writes a row to ``~/Downloads/equalizer_labels.csv``.
+
+    Embedded mode (Events tab launcher, May 19 2026):
+      - ``pre_loaded_image`` skips the file dialog
+      - ``on_save_callback`` is invoked on Save with the slider weights
+        dict; the standalone CSV write is skipped so the events_labels.csv
+        write is the single source of truth.
+    """
+
+    def __init__(
+        self,
+        pre_loaded_image: Optional[Path] = None,
+        on_save_callback: Optional["Callable[[dict[str, float]], None]"] = None,
+    ) -> None:
         super().__init__()
-        self.setWindowTitle("RHEED Equalizer")
+        title = "RHEED Equalizer"
+        if pre_loaded_image is not None:
+            title = f"RHEED Equalizer — {pre_loaded_image.name}"
+        self.setWindowTitle(title)
         self.resize(1500, 800)
 
         self.means = load_class_means(PROCESS_WH)
         if not self.means:
             QMessageBox.critical(
-                self, "Training data missing",
-                f"Couldn't load per-class means from\n{CLASSIFIER2_DATA_ROOT}\n"
-                "Make sure the Classifier2 STO_ideal_* dirs exist.",
+                self, "Basis images missing",
+                f"Couldn't load per-class basis from either\n"
+                f"  simulated: {SIMULATED_BASIS_DIR}\n"
+                f"  cached:    {MEANS_CACHE}\n"
+                f"  training:  {CLASSIFIER2_DATA_ROOT}\n"
+                "Make sure at least one source is available.",
             )
             sys.exit(1)
         missing = set(CLASS_LABELS) - set(self.means)
         if missing:
             QMessageBox.warning(
                 self, "Some classes missing",
-                f"Missing class means: {missing}.\n"
+                f"Missing class basis images: {missing}.\n"
                 "Sliders for those classes will appear but do nothing.",
             )
 
         self.target: np.ndarray | None = None
         self.target_path: Path | None = None
+        self._on_save_callback = on_save_callback
 
         self._build_ui()
         self._reset_to_uniform()
+
+        # Pre-load the target image if provided (Events tab launcher).
+        if pre_loaded_image is not None and pre_loaded_image.exists():
+            try:
+                self.target = load_grayscale(pre_loaded_image, PROCESS_WH)
+                self.target_path = pre_loaded_image
+                self.target_label.setPixmap(
+                    array_to_pixmap(self.target, DISPLAY_WH),
+                )
+                self._update_reconstruction()
+                # Auto-fit immediately so the grower lands on a sensible
+                # starting mixture rather than uniform.
+                self.action_autofit()
+                self.statusbar.showMessage(
+                    f"Loaded {pre_loaded_image.name} (auto-fit)", 4000,
+                )
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Pre-load failed",
+                    f"Couldn't pre-load {pre_loaded_image}:\n{e}",
+                )
 
     # ----- Layout -----
 
@@ -344,6 +442,21 @@ class EqualizerWindow(QMainWindow):
             self.statusbar.showMessage("Load a target image first", 3000)
             return
         weights = self._current_weights()
+
+        # Embedded mode: hand off to the caller (Events tab), skip CSV write
+        # so events_labels.csv is the single source of truth for that label.
+        if self._on_save_callback is not None:
+            try:
+                self._on_save_callback(weights)
+                self.statusbar.showMessage("Saved label → events_labels.csv", 5000)
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Save failed",
+                    f"Save callback raised:\n{e}",
+                )
+            return
+
+        # Standalone mode: append to the default labels CSV.
         LABELS_CSV.parent.mkdir(parents=True, exist_ok=True)
         write_header = not LABELS_CSV.exists()
         with open(LABELS_CSV, "a", newline="") as f:
