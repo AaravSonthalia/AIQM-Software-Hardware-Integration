@@ -65,7 +65,7 @@ IMAGE_EXTS = {".png", ".bmp", ".jpg", ".jpeg", ".tif", ".tiff"}
 # Internal processing resolution — matches the SVD prototype so basis
 # vectors are pixel-comparable. Display upscales for visibility.
 PROCESS_WH = (128, 96)
-DISPLAY_WH = (640, 480)
+DISPLAY_WH = (520, 390)
 LABELS_CSV = Path.home() / "Downloads" / "equalizer_labels.csv"
 
 # Pre-computed class means cache — lets the UI run on machines without the
@@ -225,16 +225,40 @@ def auto_fit(
     return dict(zip(labels_in_means, w))
 
 
+def apply_green_palette(arr_u8: np.ndarray) -> np.ndarray:
+    """Map grayscale [0, 255] → RGB with a phosphor-green BGW-style ramp.
+
+    Mirrors kSA's BGW (blue → green → white) display convention so the
+    rendered images look familiar to growers used to the live RHEED view.
+    Pure analysis stays grayscale; this transform is display-only.
+    """
+    h, w = arr_u8.shape
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    # Green channel scales linearly with intensity (the dominant signal).
+    rgb[..., 1] = arr_u8
+    # Faint blue underglow at low intensities (BGW ramp's "B" stage).
+    rgb[..., 2] = np.clip(arr_u8.astype(np.int16) // 3, 0, 255).astype(np.uint8)
+    # White highlights at very high intensities (the "W" tail).
+    high_mask = arr_u8 > 200
+    if high_mask.any():
+        boost = (arr_u8[high_mask].astype(np.int16) - 200) * 3
+        boost = np.clip(boost, 0, 255).astype(np.uint8)
+        rgb[..., 0][high_mask] = boost
+        rgb[..., 2][high_mask] = np.clip(
+            rgb[..., 2][high_mask].astype(np.int16) + boost, 0, 255,
+        ).astype(np.uint8)
+    return rgb
+
+
 def array_to_pixmap(
     arr: np.ndarray, display_wh: tuple[int, int],
 ) -> QPixmap:
-    """Convert (H, W) float32 in [0, 255] to upscaled Grayscale8 QPixmap."""
+    """Convert (H, W) float32 in [0, 255] to upscaled phosphor-green QPixmap."""
     arr_u8 = np.clip(arr, 0, 255).astype(np.uint8)
-    # PyQt6 requires contiguous bytes — np arrays usually are, but be safe.
-    arr_u8 = np.ascontiguousarray(arr_u8)
-    h, w = arr_u8.shape
+    rgb = np.ascontiguousarray(apply_green_palette(arr_u8))
+    h, w, _ = rgb.shape
     qimg = QImage(
-        arr_u8.tobytes(), w, h, w, QImage.Format.Format_Grayscale8,
+        rgb.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888,
     )
     pixmap = QPixmap.fromImage(qimg)
     return pixmap.scaled(
@@ -270,7 +294,9 @@ class EqualizerWindow(QMainWindow):
         if pre_loaded_image is not None:
             title = f"RHEED Equalizer — {pre_loaded_image.name}"
         self.setWindowTitle(title)
-        self.resize(1500, 800)
+        # Narrower window now that sliders live at the bottom rather than
+        # the right column (PI feedback May 19 2026: window was too wide).
+        self.resize(1180, 820)
 
         self.means = load_class_means(PROCESS_WH)
         if not self.means:
@@ -341,51 +367,64 @@ class EqualizerWindow(QMainWindow):
         top.addStretch()
         root.addLayout(top)
 
-        # Middle — target image, reconstruction, sliders
+        # Middle — target image and your-blend side by side (no sliders here)
         middle = QHBoxLayout()
+        middle.setSpacing(8)
 
         target_group = QGroupBox("Target")
         target_layout = QVBoxLayout(target_group)
         self.target_label = QLabel("No image loaded")
         self.target_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.target_label.setMinimumSize(QSize(*DISPLAY_WH))
-        self.target_label.setStyleSheet("background-color: #222; color: #888;")
+        self.target_label.setStyleSheet("background-color: #111; color: #888;")
         target_layout.addWidget(self.target_label)
-        middle.addWidget(target_group)
+        middle.addWidget(target_group, 1)
 
         recon_group = QGroupBox("Your blend")
         recon_layout = QVBoxLayout(recon_group)
         self.recon_label = QLabel()
         self.recon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.recon_label.setMinimumSize(QSize(*DISPLAY_WH))
+        self.recon_label.setStyleSheet("background-color: #111;")
         recon_layout.addWidget(self.recon_label)
-        middle.addWidget(recon_group)
+        middle.addWidget(recon_group, 1)
 
-        sliders_group = QGroupBox("Mixture")
+        root.addLayout(middle, 1)
+
+        # Bottom — sliders panel at full window width. Each slider gets a
+        # full row with name on the left, wide track in the middle, value
+        # on the right. Per PI direction May 8 + May 19 feedback: prominent
+        # sliders growers can drag with precision rather than a compact
+        # right-column knob row.
+        sliders_group = QGroupBox("Reconstruction mixture")
         sliders_layout = QGridLayout(sliders_group)
-        sliders_layout.setColumnStretch(1, 1)
+        sliders_layout.setContentsMargins(12, 16, 12, 12)
+        sliders_layout.setHorizontalSpacing(12)
+        sliders_layout.setVerticalSpacing(8)
+        sliders_layout.setColumnStretch(1, 1)  # slider track expands
         self.sliders: dict[str, QSlider] = {}
         self.value_labels: dict[str, QLabel] = {}
         for i, label in enumerate(CLASS_LABELS):
-            name_label = QLabel(label)
-            name_label.setMinimumWidth(80)
+            name_label = QLabel(f"<b>{label}</b>")
+            name_label.setMinimumWidth(90)
+            name_label.setTextFormat(Qt.TextFormat.RichText)
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setRange(SLIDER_MIN, SLIDER_MAX)
+            slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            slider.setTickInterval(10)
             slider.valueChanged.connect(self._on_slider_changed)
             value_label = QLabel("0.00")
-            value_label.setMinimumWidth(50)
+            value_label.setMinimumWidth(60)
             value_label.setAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
             )
+            value_label.setStyleSheet("font-family: monospace;")
             sliders_layout.addWidget(name_label, i, 0)
             sliders_layout.addWidget(slider, i, 1)
             sliders_layout.addWidget(value_label, i, 2)
             self.sliders[label] = slider
             self.value_labels[label] = value_label
-        sliders_group.setMaximumWidth(400)
-        middle.addWidget(sliders_group)
-
-        root.addLayout(middle)
+        root.addWidget(sliders_group, 0)
 
         # Status bar
         self.statusbar = QStatusBar()
