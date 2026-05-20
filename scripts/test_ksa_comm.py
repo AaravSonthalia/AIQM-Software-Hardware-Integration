@@ -243,6 +243,55 @@ def cmd_get_ksa400_intensities(sock: socket.socket) -> dict | None:
     return {"extra_bytes": extra}
 
 
+BINARY_CMD_NAMES = {
+    CMD_INITIALIZE: "INITIALIZE",
+    CMD_SET_DATA_FIELDS: "SET_DATA_FIELDS",
+    CMD_RUN: "RUN",
+    CMD_GET_DATA: "GET_DATA",
+    CMD_STOP: "STOP",
+    CMD_GET_DATA_SPECIFIC: "GET_DATA_SPECIFIC",
+    CMD_RESTART_GROWTHRATE_FIT: "RESTART_GROWTHRATE_FIT",
+    CMD_OPEN_ACQUIRE: "OPEN_ACQUIRE",
+    CMD_CLOSE_ACQUIRE: "CLOSE_ACQUIRE",
+    CMD_GET_STATUS: "GET_STATUS",
+    CMD_GET_APP_VERSION: "GET_APP_VERSION",
+    CMD_TEXT_CMD: "TEXT_CMD",
+}
+
+
+def scan_binary_commands(sock: socket.socket) -> None:
+    """Send each known binary command code with an empty body to map v6 coverage.
+
+    Interpretation:
+        err  0 → command alive, succeeded with no body
+        err -2 → command code not implemented in this build
+        err -3 → command code IS implemented but needs proper parameters
+        err -4 → command alive but requires acquisition to be running first
+        other → check spec section 9
+
+    This is read-only insofar as the commands we're scanning don't take
+    side-effecting parameters when sent empty — but if any of INITIALIZE,
+    RUN, STOP, OPEN_ACQUIRE, CLOSE_ACQUIRE returns 0 here, we may have
+    nudged kSA state. Watch the kSA UI for unexpected mode changes.
+    """
+    print("\n--- Binary command coverage scan (all empty bodies) ---")
+    for code in sorted(BINARY_CMD_NAMES):
+        name = BINARY_CMD_NAMES[code]
+        try:
+            send_command(sock, code, b"")
+            cmd, err, data = recv_reply(sock)
+            verdict = {
+                0: "ALIVE (returned 0)",
+                -2: "dead",
+                -3: "ALIVE (needs args)",
+                -4: "ALIVE (invalid state)",
+            }.get(err, f"err {err}")
+            print(f"  {code} {name:<24}  err={err:>3}  data={len(data):>3}B  -- {verdict}")
+        except (ConnectionError, OSError) as e:
+            print(f"  {code} {name:<24}  TRANSPORT ERROR: {e}")
+            return
+
+
 DISCOVERY_PROBES = [
     "?",                    # Generic help
     "help",                 # Help alias
@@ -270,6 +319,11 @@ def main() -> int:
         "--skip-text",
         action="store_true",
         help="Skip TEXT_CMD discovery (binary smoke test only)",
+    )
+    parser.add_argument(
+        "--scan-binary",
+        action="store_true",
+        help="Probe all known binary command codes with empty bodies",
     )
     args = parser.parse_args()
 
@@ -319,6 +373,10 @@ def main() -> int:
         # --- GET_DATA_SPECIFIC for kSA 400 intensities ---
         print("\nGET_DATA_SPECIFIC (kSA 400 intensities, all fields):")
         cmd_get_ksa400_intensities(sock)
+
+        # --- Binary command coverage scan (optional) ---
+        if args.scan_binary:
+            scan_binary_commands(sock)
 
         # --- TEXT_CMD: ad-hoc or discovery batch ---
         if not args.skip_text:
