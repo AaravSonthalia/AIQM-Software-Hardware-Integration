@@ -1,0 +1,219 @@
+ColID	Name
+    0	Elapsed Time
+    1	Peak Intensity
+    2	Summed Intensity
+    3	Average Intensity
+    4	Peak Row
+    5	Peak Column
+    6	Region Width
+    7	Tracking Type
+    8	Data Point
+    9	Centroid Column
+   10	Centroid Row
+   11	Centroid Intensity
+   12	Energy
+   13	Tracking Threshold
+   14	Analog Input
+   15	Region Height
+   16	Center Row
+   17	Center Column
+   18	Maximum Possible Intensity
+   19	Region Shape
+   20	Standard Deviation
+   21	Center Intensity
+   22	Number of Regions
+   23	Normalized Intensity
+   24	Digital Input (all bits)
+   25	Digital Input 1
+   26	Digital Input 2
+   27	Digital Input 3
+   28	Digital Input 4
+   29	Digital Input 5
+   30	Digital Input 6
+   31	Digital Input 7
+   32	Digital Input 8
+   33	Digital Input 9
+   34	Digital Input 10
+   35	Digital Input 11
+   36	Digital Input 12
+   37	Digital Input 13
+   38	Digital Input 14
+   39	Digital Input 15
+   40	Digital Input 16
+   41	Acquire in Progress
+   42	Analog Input 0
+   43	Analog Input 1
+   44	Analog Input 2
+   45	Analog Input 3
+   46	Analog Input 4
+   47	Analog Input 5
+   48	Analog Input 6
+   49	Analog Input 7
+   50	Block Analog Input
+   51	Block Analog Input Size
+   52	Block Analog Input 0
+   53	Block Analog Input 0 Size
+   54	Block Analog Input 1
+   55	Block Analog Input 1 Size
+   56	Block Analog Input 2
+   57	Block Analog Input 2 Size
+   58	Block Analog Input 3
+   59	Block Analog Input 3 Size
+   60	Block Analog Input 4
+   61	Block Analog Input 4 Size
+   62	Block Analog Input 5
+   63	Block Analog Input 5 Size
+   64	Block Analog Input 6
+   65	Block Analog Input 6 Size
+   66	Block Analog Input 7
+   67	Block Analog Input 7 Size
+   68	Data Set
+   69	Acquire Phase Index
+   70	Acquire Phase ID
+   71	Acquire Sub-phase Index
+   72	Num. Data Sets
+   73	Num. Acquire Phases
+   74	Num. Acquire Sub-phases
+   75	Relative Elapsed Time
+   76	Relative Data Point
+   77	Acquisition Iteration
+   78	Samples per Data Point
+   79	Region Number
+   80	Minimum Intensity
+   81	Min Int. Row
+   82	Min Int. Column
+   83	Exposure Time
+   84	Temperature
+   85	Adjusted Elapsed Time
+   86	Number of Wafers
+   87	Wafer Number
+   88	Bin Number
+   89	Position
+   90	Max Position
+   91	RPM
+   92	Stepcode
+   93	Analog Input Mapped 0
+   94	Analog Input Mapped 1
+   95	Analog Input Mapped 2
+   96	Analog Input Mapped 3
+   97	Analog Input Mapped 4
+   98	Analog Input Mapped 5
+   99	Analog Input Mapped 6
+  100	Analog Input Mapped 7
+  101	Time Of Day
+  102	Stepcode Analog Voltage
+  103	Corrected Position
+  104	Rotation Angle
+  105	Corrected Rotation Angle
+  106	Aggregation Association
+  107	Aggregation Association Length
+  108	Scan Number
+  109	Process Recipe
+  110	Process Recipe Length
+  111	Marker Width
+  112	Marker Number
+  113	Scan Number
+  114	Phase Delay
+  115	Annotations
+  116	Annotation Width
+  117	DateTime
+  118	DateTime Width
+  119	Data Source Group
+  120	Data Source Group Width
+  121	Run Name
+  122	Run Name Width
+  123	DPF Object
+  124	DPF Object Width
+  125	Derived Columns Object
+  126	Derived Columns Object Width
+  127	Virtual Homepulse Position
+  128	Time of Day
+  129	Record Number
+  130	Sample Regrab Count
+  131	Stage Motion Recipe
+  132	Stage Motion Recipe Width
+  133	Stage Motion Ordinal Pos X
+  134	Stage Motion Ordinal Pos Y
+  135	Stage Motion Ordinal Pos Z
+  136	Stage Motion Pos X
+  137	Stage Motion Pos Y
+  138	Stage Motion Pos Z
+  139	Stage Motion Scan X
+  140	Stage Motion Scan Y
+  141	Stage Motion Scan Z
+  142	Stage Motion Num. Pts. X
+  143	Stage Motion Num. Pts. Y
+  144	Stage Motion Num. Pts. Z
+  145	Constant delay between data points
+  146	Raw Peak Intensity
+  147	Pyrometer Temperature
+  148	Pyrometer Volts
+  149	Cycle Count
+  150	Emissometer Config
+  151	Emissometer Config Width
+  152	Number of Pixels
+  153	Delay before 1st Data point
+  154	Data Group ID
+  155	Data Group ID Width
+  156	RunID
+  157	RunID Width
+  158	SourceID
+  159	SourceID Width
+  160	Datapoint at Center
+  161	Analog Input 8
+  162	Analog Input 9
+  163	Analog Input 10
+  164	Analog Input 11
+  165	Analog Input 12
+  166	Analog Input 13
+  167	Analog Input 14
+  168	Analog Input 15
+  169	Analog Input Mapped 8
+  170	Analog Input Mapped 9
+  171	Analog Input Mapped 10
+  172	Analog Input Mapped 11
+  173	Analog Input Mapped 12
+  174	Analog Input Mapped 13
+  175	Analog Input Mapped 14
+  176	Analog Input Mapped 15
+  177	Laser Setpoint
+  178	Reference file
+  179	Reference file width
+  180	Position X
+  181	Position Y
+  182	Position Z
+  183	Rotation Angle Index
+  184	Rotation Angle Index Width
+  185	Chamber Pressure
+  186	Chamber Controlled Pressure
+  187	Gas1 Flow Rate
+  188	Gas2 Flow Rate
+  189	Gas3 Flow Rate
+  190	Gas4 Flow Rate
+  191	System Fault
+  192	Thickness
+  193	DateTime
+  500	Electron Gun Filament
+  501	Electron Gun Grid
+  502	Electron Gun Focus
+  503	Electron Gun X Deflection
+  504	Electron Gun Y Deflection
+  505	Electron Gun Y Beam Rocking
+  506	ER-RHEED Energy
+  507	ER-RHEED Focus
+  508	ER-RHEED X Deflection
+  509	ER-RHEED Y Deflection
+  510	Spectra
+  511	d Spacing
+  512	Spacing
+  513	Coherence
+  514	FWHM
+  515	Beam Rockning
+  516	Growth Rate
+  517	Electron Gun X2 Deflection
+  518	Electron Gun Y2 Deflection
+  519	Electron Gun X Sample Theta
+46105	Region Operator 1
+46106	Region Operator 2
+46107	Region Operator 3
+46108	Region Operator 4
