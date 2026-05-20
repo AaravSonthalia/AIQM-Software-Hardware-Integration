@@ -90,8 +90,10 @@ def encode_text_body(text: str, enc: str) -> bytes:
         chars = text.encode("ascii")
         return struct.pack("<H", len(chars)) + chars
     if enc == "u32":
-        chars = text.encode("ascii")
-        return struct.pack("<I", len(chars)) + chars
+        # u32-prefixed long-string: length INCLUDES the trailing NULL,
+        # matching the short-string handshake convention (spec p6).
+        payload = text.encode("ascii") + b"\x00"
+        return struct.pack("<I", len(payload)) + payload
     raise ValueError(f"unknown enc {enc!r}")
 
 
