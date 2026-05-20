@@ -21,11 +21,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from drivers.elog import find_current_log, format_value, latest_record
 
-LIVE_PATH = Path(
-    r"C:\_Omicron_Software\EvapControl\evap_control_1.2.0.51"
-    r"\evap_control_1.2.0.51\log\log_2026-05-15_000000.elo"
-)
-
 # Panel of vars to cross-check against MISTRAL. Group by sub-panel so
 # the output is easy to read off alongside the MISTRAL UI.
 PANEL = [
@@ -40,9 +35,9 @@ PANEL = [
 
 
 def main() -> None:
-    path = LIVE_PATH if LIVE_PATH.exists() else find_current_log()
+    path = find_current_log()
     if path is None or not path.exists():
-        sys.exit(f"No live ELog file found at {LIVE_PATH}")
+        sys.exit("No live ELog file for today found. Check EvapControl is running.")
 
     print(f"Reading: {path}")
 
