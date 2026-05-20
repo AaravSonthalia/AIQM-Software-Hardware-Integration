@@ -75,7 +75,12 @@ def recv_reply(sock: socket.socket, timeout: float = 5.0) -> tuple[int, int, byt
 
 
 def encode_text_body(text: str, enc: str) -> bytes:
-    """Encode a TEXT_CMD body using one of three candidate formats."""
+    """Encode a TEXT_CMD body using one of four candidate formats.
+
+    May 20 2026 finding from kSA Command Log: TEXT_CMD expects a 4-byte
+    (u32 LE) length prefix for the Char[1] array — i.e. ``enc="u32"``.
+    The other three are kept for diagnostics.
+    """
     if enc == "raw":
         return text.encode("ascii")
     if enc == "short":
@@ -84,6 +89,9 @@ def encode_text_body(text: str, enc: str) -> bytes:
     if enc == "u16":
         chars = text.encode("ascii")
         return struct.pack("<H", len(chars)) + chars
+    if enc == "u32":
+        chars = text.encode("ascii")
+        return struct.pack("<I", len(chars)) + chars
     raise ValueError(f"unknown enc {enc!r}")
 
 
@@ -114,9 +122,9 @@ def main() -> int:
     )
     p.add_argument(
         "--enc",
-        default="raw",
-        choices=["raw", "short", "u16"],
-        help="TEXT_CMD payload encoding (default raw)",
+        default="u32",
+        choices=["raw", "short", "u16", "u32"],
+        help="TEXT_CMD payload encoding (default u32 — confirmed correct May 20 2026)",
     )
     args = p.parse_args()
 
