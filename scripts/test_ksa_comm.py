@@ -154,6 +154,58 @@ def cmd_get_status(sock: socket.socket) -> dict | None:
     }
 
 
+def cmd_text(sock: socket.socket, text: str, encoding: str = "raw") -> tuple[int, str]:
+    """Send a TEXT_CMD (1011) and return (err_code, reply_text).
+
+    encoding:
+        "raw"    — CmdData = text bytes only (outer CmdLength has the size)
+        "short"  — CmdData = [len:1][chars:len-1][null] (handshake convention)
+        "u16"    — CmdData = [len:2 LE][chars]
+    """
+    if encoding == "raw":
+        body = text.encode("ascii")
+    elif encoding == "short":
+        payload = text.encode("ascii") + b"\x00"
+        body = struct.pack("B", len(payload)) + payload
+    elif encoding == "u16":
+        chars = text.encode("ascii")
+        body = struct.pack("<H", len(chars)) + chars
+    else:
+        raise ValueError(f"unknown encoding {encoding!r}")
+    send_command(sock, CMD_TEXT_CMD, body)
+    cmd, err, data = recv_reply(sock)
+    if err != 0:
+        return err, ""
+    # Try interpretations of the reply: raw, then u16-prefixed, then short.
+    text_out = data.decode("ascii", errors="replace").rstrip("\x00")
+    return err, text_out
+
+
+def probe_text_commands(sock: socket.socket, commands: list[str]) -> None:
+    """Send a series of TEXT_CMD probes; print request/reply/error for each.
+
+    Tries "raw" encoding first; if every probe returns -2 (Unknown command)
+    OR -3 (Invalid parameter), retries the same probes with "short" and "u16"
+    encodings to rule out an encoding mismatch.
+    """
+    for enc in ("raw", "short", "u16"):
+        print(f"\n--- TEXT_CMD probe (encoding={enc}) ---")
+        any_success = False
+        for cmd_text_str in commands:
+            err, reply = cmd_text(sock, cmd_text_str, encoding=enc)
+            preview = reply.replace("\n", " | ")[:200]
+            tag = "OK " if err == 0 else f"err {err}"
+            print(f"  [{tag:>7}] {cmd_text_str!r:<32}  -> {preview!r}")
+            if err == 0:
+                any_success = True
+        if any_success:
+            return  # Found a working encoding; no need to retry
+    print("\n(All three encodings failed for every probe — TEXT_CMD may not be")
+    print(" wired up at all in this kSA 400 build, OR the command vocabulary")
+    print(" is different. Next step: check Options dialog for a TEXT_CMD enable")
+    print(" switch, or contact k-Space for the kSA 400 text command list.)")
+
+
 def cmd_get_ksa400_intensities(sock: socket.socket) -> dict | None:
     """Try to read all 7 kSA 400 intensity fields for all datasets/regions.
 
@@ -191,11 +243,34 @@ def cmd_get_ksa400_intensities(sock: socket.socket) -> dict | None:
     return {"extra_bytes": extra}
 
 
+DISCOVERY_PROBES = [
+    "?",                    # Generic help
+    "help",                 # Help alias
+    "version",              # Software version via text
+    "status",               # System status via text
+    "measurement ?",        # Discover measurement subcommands
+    "measurement sources",  # List sources (kSA 400 should report 1)
+    "measurement acquire ?",
+    "marker ?",             # Markers = ROI definitions
+    "dataset ?",            # Datasets = computed regions on markers
+    "field ?",              # Field IDs
+]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1", help="kSA host (default: localhost)")
     parser.add_argument("--port", type=int, default=1800, help="kSA TCP port (default: 1800)")
     parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--text-cmd",
+        help="Send a single ad-hoc TEXT_CMD instead of the discovery batch",
+    )
+    parser.add_argument(
+        "--skip-text",
+        action="store_true",
+        help="Skip TEXT_CMD discovery (binary smoke test only)",
+    )
     args = parser.parse_args()
 
     print(f"Connecting to kSA at {args.host}:{args.port}...")
@@ -245,7 +320,18 @@ def main() -> int:
         print("\nGET_DATA_SPECIFIC (kSA 400 intensities, all fields):")
         cmd_get_ksa400_intensities(sock)
 
-        print("\n✅ Smoke test passed — kSAComm interface is alive and responding.")
+        # --- TEXT_CMD: ad-hoc or discovery batch ---
+        if not args.skip_text:
+            if args.text_cmd:
+                print(f"\nTEXT_CMD (ad-hoc): {args.text_cmd!r}")
+                for enc in ("raw", "short", "u16"):
+                    err, reply = cmd_text(sock, args.text_cmd, encoding=enc)
+                    tag = "OK " if err == 0 else f"err {err}"
+                    print(f"  [{enc:>5}] [{tag:>7}]  -> {reply!r}")
+            else:
+                probe_text_commands(sock, DISCOVERY_PROBES)
+
+        print("\n✅ Smoke test complete — kSAComm interface is alive and responding.")
         return 0
     finally:
         sock.close()
