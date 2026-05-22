@@ -10,6 +10,7 @@ false-color screenshots — scraping gives the exact image format the classifier
 expects without needing to discover/apply the kSA LUT.
 """
 
+import threading
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -39,11 +40,20 @@ class RheedCamera(ABC):
 
 class VmbCamera(RheedCamera):
     """
-    Direct access to Allied Vision camera via vmbpy SDK.
+    Direct access to an Allied Vision camera (Manta G-033B) via the vmbpy SDK.
 
-    Requires exclusive camera lock — cannot run simultaneously with kSA 400.
-    Frames are monochrome; intensity is placed in the green channel to match
-    the convention used by the existing RHEED GUI code.
+    Requires an exclusive camera lock — cannot run while kSA 400 holds the
+    camera. Frames are monochrome; intensity is placed in the green channel
+    to match the convention used by the rest of the GUI.
+
+    Acquisition uses a **streaming-callback** pattern, not per-call triggering.
+    With ``TriggerMode='On'`` the camera produces frames only into an active
+    streaming pipeline — a bare ``get_frame()`` registers no consumer, so
+    every call times out (confirmed on Bulbasaur, May 8 2026). Instead a
+    background thread opens the camera, starts streaming with a frame handler,
+    and software-triggers at ``trigger_hz``. The handler keeps the single most
+    recent frame in a thread-safe slot; ``read_frame()`` returns a copy of it,
+    so the poll-based ``RheedCameraWorker`` consumes this driver unchanged.
     """
 
     def __init__(
@@ -62,80 +72,165 @@ class VmbCamera(RheedCamera):
         # scale and produce synthetic change scores between frames whose
         # raw pixel values are identical but max intensity differs.
         self._max_value = (1 << bit_depth) - 1
-        self._vmb = None
-        self._cam = None
         self._connected = False
+
+        # Streaming state. The stream thread owns every vmbpy call for a
+        # connect cycle; connect() blocks on _ready_event until it is
+        # streaming (or has failed). read_frame() reads _latest_frame under
+        # _frame_lock — the handler writes it under the same lock.
+        self._stream_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._frame_lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
+        self._connect_error: Optional[Exception] = None
+        self._last_error: str = ""
 
     def connect(self) -> None:
+        # Fail fast with a clear message if the SDK is missing, before
+        # spawning the thread (the thread re-imports — module is cached).
         try:
-            from vmbpy import VmbSystem
+            import vmbpy  # noqa: F401
         except ImportError:
             raise ImportError(
-                "vmbpy not installed. Install the Allied Vision SDK or use "
-                "ScreenGrabCamera for screen-scrape mode."
+                "vmbpy not installed. Install the Allied Vision Vimba X SDK "
+                "or use ScreenGrabCamera for screen-scrape mode."
             )
 
-        self._vmb = VmbSystem.get_instance()
-        self._vmb.__enter__()
+        # Fresh primitives per connect cycle — a connect after a previous
+        # disconnect must not observe stale event state.
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._connect_error = None
+        with self._frame_lock:
+            self._latest_frame = None
 
-        cams = self._vmb.get_all_cameras()
-        if not cams:
-            self._vmb.__exit__(None, None, None)
-            raise RuntimeError("No Allied Vision cameras found.")
+        self._stream_thread = threading.Thread(
+            target=self._stream_loop, name="VmbCameraStream", daemon=True,
+        )
+        self._stream_thread.start()
 
-        self._cam = cams[self._camera_index]
-        self._cam.__enter__()
-
-        # Configure software trigger for controlled frame rate
-        self._cam.TriggerSource.set("Software")
-        self._cam.TriggerMode.set("On")
-        self._cam.AcquisitionMode.set("Continuous")
+        # Block until the thread is streaming, has reported a setup failure,
+        # or hangs past the timeout.
+        if not self._ready_event.wait(timeout=10.0):
+            self._stop_event.set()
+            raise RuntimeError(
+                "Vimba camera connect timed out — no response from the "
+                "streaming thread within 10 s."
+            )
+        if self._connect_error is not None:
+            raise self._connect_error
         self._connected = True
 
-    def read_frame(self) -> np.ndarray:
-        if not self._connected or self._cam is None:
-            raise RuntimeError("Camera not connected.")
+    def _stream_loop(self) -> None:
+        """Background thread — owns every vmbpy call for one connect cycle.
 
-        self._cam.TriggerSoftware.run()
-        frame = self._cam.get_frame(timeout_ms=2000)
-        img = frame.as_numpy_ndarray().squeeze()
+        Opens VmbSystem + camera, configures the software trigger, starts
+        streaming with _frame_handler, then triggers at trigger_hz until
+        disconnect() sets _stop_event. Keeping all vmbpy calls on this one
+        thread respects the SDK's thread affinity; the ``with`` blocks
+        release the camera even on error, so kSA — or a reconnect — can
+        re-acquire it.
+        """
+        try:
+            from vmbpy import VmbSystem
 
-        # Normalize to uint8 using fixed bit-depth scaling so frame-to-
-        # frame comparisons are meaningful. Per-frame max normalization
-        # would drift the scale factor and produce synthetic change
-        # scores in the std-of-|diff| algorithm. clip() handles the
-        # all-zero frame case (no NaN from division).
+            with VmbSystem.get_instance() as vmb:
+                cams = vmb.get_all_cameras()
+                if not cams:
+                    raise RuntimeError(
+                        "No Allied Vision cameras found — confirm kSA 400 is "
+                        "fully closed (it holds the camera exclusively)."
+                    )
+                with cams[self._camera_index] as cam:
+                    # Software trigger → deterministic, controlled frame rate.
+                    cam.TriggerSource.set("Software")
+                    cam.TriggerSelector.set("FrameStart")
+                    cam.TriggerMode.set("On")
+                    cam.AcquisitionMode.set("Continuous")
+
+                    cam.start_streaming(self._frame_handler)
+                    try:
+                        # connect() unblocks here — the pipeline is live.
+                        self._ready_event.set()
+                        period = 1.0 / self._trigger_hz
+                        while not self._stop_event.is_set():
+                            cam.TriggerSoftware.run()
+                            # Interruptible pacing — disconnect() wakes this
+                            # at once instead of after a full period.
+                            self._stop_event.wait(period)
+                    finally:
+                        cam.stop_streaming()
+        except Exception as exc:
+            self._connect_error = exc
+        finally:
+            self._connected = False
+            # Unblock connect() even if setup failed before the set() above.
+            self._ready_event.set()
+
+    def _frame_handler(self, cam, _stream, frame) -> None:
+        """vmbpy streaming callback — runs on the SDK's handler thread.
+
+        Copies the frame out, recycles the buffer, converts to the GUI's
+        RGB-uint8 contract, and stores it as the latest frame. A failure
+        here must not kill the stream: a bad frame is recorded and skipped.
+        """
+        try:
+            try:
+                # as_numpy_ndarray() is a view into the frame buffer — copy
+                # it out BEFORE queue_frame() hands the buffer back.
+                img = frame.as_numpy_ndarray().copy().squeeze()
+            finally:
+                # Always recycle: a leaked buffer shrinks the pool and,
+                # once it is exhausted, silently halts capture.
+                cam.queue_frame(frame)
+            rgb = self._to_rgb_uint8(img)
+            with self._frame_lock:
+                self._latest_frame = rgb
+        except Exception as exc:
+            self._last_error = str(exc)
+
+    def _to_rgb_uint8(self, img: np.ndarray) -> np.ndarray:
+        """Map a raw camera frame to the GUI's RGB-uint8 (H, W, 3) contract.
+
+        Normalizes with a FIXED bit-depth denominator (not per-frame max):
+        per-frame max-normalization would drift the scale between frames
+        with identical raw pixels but different peak intensity, injecting
+        synthetic change scores into the std-of-|diff| detector.
+        """
         if img.dtype != np.uint8:
             img = (
                 img.astype(np.float32) / self._max_value * 255.0
             ).clip(0, 255).astype(np.uint8)
-
-        # Build RGB with intensity in green channel (existing convention)
+        # Monochrome intensity → green channel (existing GUI convention).
         if img.ndim == 2:
             rgb = np.zeros((*img.shape, 3), dtype=np.uint8)
-            rgb[:, :, 1] = img  # green channel
-        else:
-            rgb = img
+            rgb[:, :, 1] = img
+            return rgb
+        return img
 
-        return rgb
+    def read_frame(self) -> np.ndarray:
+        """Return the most recent streamed frame as RGB uint8 (H, W, 3).
+
+        Non-blocking — returns whatever the streaming thread captured last.
+        Raises if no frame has arrived yet; RheedCameraWorker treats that as
+        a transient error and retries on its next poll.
+        """
+        if not self._connected:
+            raise RuntimeError("Camera not connected.")
+        with self._frame_lock:
+            if self._latest_frame is None:
+                raise RuntimeError("No frame available yet.")
+            return self._latest_frame.copy()
 
     def disconnect(self) -> None:
-        if self._cam is not None:
-            try:
-                self._cam.__exit__(None, None, None)
-            except Exception:
-                pass
-            self._cam = None
-
-        if self._vmb is not None:
-            try:
-                self._vmb.__exit__(None, None, None)
-            except Exception:
-                pass
-            self._vmb = None
-
         self._connected = False
+        self._stop_event.set()
+        if self._stream_thread is not None:
+            self._stream_thread.join(timeout=5.0)
+            self._stream_thread = None
+        with self._frame_lock:
+            self._latest_frame = None
 
     @property
     def connected(self) -> bool:
