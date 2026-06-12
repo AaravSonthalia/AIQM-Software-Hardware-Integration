@@ -7,6 +7,7 @@ and ARM / START / STOP / DISARM session state transitions.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -51,13 +52,20 @@ AUTO_CAPTURE_COOLDOWN_S = 10.0
 AUTO_CAPTURE_ADAPTIVE_SIGMA = 3.0
 AUTO_CAPTURE_ADAPTIVE_FLOOR = 0.5
 
-# Heartbeat anchor capture: every N minutes during a session, save the
-# latest RHEED frame regardless of detector flags. Gives every session a
-# coarse temporal scaffold so the team can review "what was happening at
-# minute X" even if the detector missed transitions. Per Justin's 30-50
-# total-frames-per-trajectory budget: at 10 min × 4 hr session = 24
-# anchors, leaving room for ~6-26 detector-flagged frames.
-HEARTBEAT_INTERVAL_MIN = 10.0
+# Heartbeat dense-capture: every N seconds during a session, save the
+# latest RHEED frame regardless of detector flags. Per the May 21 joint
+# decision and Yuxin's CS-side "background data" request, capture as
+# much continuous data as possible — frames between detector events
+# that show what's happening when nothing has been flagged. Lets the
+# model learn when *not* to act, and captures grower-initiated V/I
+# changes that detector-based capture would miss. PI affirmed 5 s as
+# the working default at the joint meeting.
+#
+# Tunable via env var AIQM_HEARTBEAT_INTERVAL_SECONDS for grower-side
+# adjustment without code edits.
+HEARTBEAT_INTERVAL_SECONDS = float(
+    os.environ.get("AIQM_HEARTBEAT_INTERVAL_SECONDS", "5.0")
+)
 
 # MISTRAL set-V/I change detection — derives "operator pressed Set Voltage /
 # Set Current" events from successive OCR'd setpoint values changing.
@@ -86,10 +94,11 @@ class GrowthApp(QMainWindow):
         self._sensor_log_timer.setInterval(1000)
         self._sensor_log_timer.timeout.connect(self._log_sensors)
 
-        # Heartbeat anchor-capture timer — fires every N minutes during a
-        # session and saves whatever the latest RHEED frame is.
+        # Heartbeat dense-capture timer — fires every N seconds during a
+        # session and saves whatever the latest RHEED frame is. See
+        # HEARTBEAT_INTERVAL_SECONDS for the May 21 joint decision context.
         self._heartbeat_timer = QTimer(self)
-        self._heartbeat_timer.setInterval(int(HEARTBEAT_INTERVAL_MIN * 60 * 1000))
+        self._heartbeat_timer.setInterval(int(HEARTBEAT_INTERVAL_SECONDS * 1000))
         self._heartbeat_timer.timeout.connect(self._on_heartbeat)
 
         # Auto-capture engine — shadow-mode pixel-diff change detection.
@@ -257,10 +266,18 @@ class GrowthApp(QMainWindow):
         self._last_v_set = None
         self._last_i_set = None
 
-        # Start heartbeat anchor capture (first fire after HEARTBEAT_INTERVAL_MIN;
-        # we don't fire-on-start to avoid saving a black frame before the
-        # camera has produced anything useful).
+        # Start heartbeat dense-capture (first fire after
+        # HEARTBEAT_INTERVAL_SECONDS; we don't fire-on-start to avoid
+        # saving a black frame before the camera has produced anything
+        # useful).
         self._heartbeat_timer.start()
+        _frames_per_hr = round(3600 / HEARTBEAT_INTERVAL_SECONDS)
+        _est_mb_per_hr = _frames_per_hr * 200 / 1024  # ~200 KB/frame PNG estimate
+        log.info(
+            "Heartbeat: every %.1f s -> ~%d frames/hr "
+            "(~%.0f MB/hr at ~200 KB/frame PNG estimate)",
+            HEARTBEAT_INTERVAL_SECONDS, _frames_per_hr, _est_mb_per_hr,
+        )
 
         self.monitor.set_state("running")
         self.statusBar().showMessage(f"Running \u2014 {sample_id}")
