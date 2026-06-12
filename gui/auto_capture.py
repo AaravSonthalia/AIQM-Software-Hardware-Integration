@@ -12,6 +12,7 @@ from __future__ import annotations
 import collections
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -244,6 +245,138 @@ class ClassificationChangeDetector(ChangeDetector):
         kl_pm = float(np.sum(p * np.log2(p / m)))
         kl_qm = float(np.sum(q * np.log2(q / m)))
         return 0.5 * (kl_pm + kl_qm)
+
+
+# ---------------------------------------------------------------------------
+# Event confirmation — plateau-shift test (A: May 22 PI proposal, first cut)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConfirmationResult:
+    """Outcome of the plateau-shift confirmation test.
+
+    Returned by :func:`confirm_event_by_plateau_shift`. ``confirmed`` is the
+    pass/fail decision; ``diff_score`` is the underlying metric (useful for
+    threshold tuning); ``reason`` is a stable string token suitable for
+    logging or CSV (one of ``"confirmed"``, ``"rejected_below_threshold"``,
+    ``"buffer_too_small"``, ``"windows_out_of_range"``).
+    """
+    confirmed: bool
+    diff_score: float
+    reason: str
+
+
+def confirm_event_by_plateau_shift(
+    buffer: "list[np.ndarray] | collections.deque",
+    trigger_idx: int,
+    pre_window_size: int = 5,
+    post_window_size: int = 5,
+    skip_around_trigger: int = 2,
+    confirmation_threshold: float = 1.0,
+    score_metric: str = "std",
+) -> ConfirmationResult:
+    """Distinguish a real reconstruction transition from a one-frame bump.
+
+    The May 22 PI proposal: bumps and transitions both spike the change
+    detector, but only transitions produce a *sustained baseline shift*.
+    This test reformulates the PI's "middle frames drastically different
+    from neighbors" criterion as a plateau-comparison:
+
+        bump          → pre and post plateaus are SAME      (low diff)
+        transition    → pre and post plateaus are DIFFERENT (high diff)
+
+    Operationally: average frames before and after the trigger (skipping
+    the transition frames themselves), then measure how different the two
+    averaged frames are. The metric matches PixelDiffChangeDetector so
+    confirmation thresholds can be reasoned about in the same units.
+
+    Parameters
+    ----------
+    buffer
+        Ordered sequence of frames (oldest → newest). Frames may be 2D
+        (grayscale) or 3D (RGB); RGB is reduced to the green channel per
+        project convention (see ``PixelDiffChangeDetector._to_gray``).
+    trigger_idx
+        Index in ``buffer`` of the trigger frame.
+    pre_window_size, post_window_size
+        Number of frames to average for each plateau.
+    skip_around_trigger
+        Frames skipped on each side of ``trigger_idx`` — these are the
+        transition frames themselves and shouldn't pollute either plateau.
+    confirmation_threshold
+        Minimum plateau-shift score to confirm. Suggested starting value
+        is ~0.5x the live trigger threshold (plateau shift is substantial
+        relative to noise but smaller than the spike that triggered).
+    score_metric
+        ``"std"`` (default) or ``"mean"`` of the per-pixel ``|pre - post|``.
+        Matches the same parameter in ``PixelDiffChangeDetector``.
+
+        Note: ``"std"`` rejects purely uniform brightness shifts because
+        they have no spatial variability — this is usually a feature
+        (reconstruction transitions ARE spatially structured), but if
+        uniform-shift detection is desired, use ``"mean"`` instead.
+
+    Returns
+    -------
+    ConfirmationResult
+        See class docstring for reason codes.
+
+    Notes
+    -----
+    This function does NOT couple to the engine. Engine integration is
+    the follow-up: add a PENDING_CONFIRMATION state to AutoCaptureEngine,
+    delay the ``frame_captured`` emission by N frames after a trigger,
+    then call this function on the rotated buffer. See
+    ``aimbe_a_first_cut_design.md`` for the full FSM sketch.
+
+    Examples
+    --------
+    >>> buffer = [np.full((64, 64), 50.0, np.float32)] * 10 + \\
+    ...          [np.full((64, 64), 100.0, np.float32)] * 10
+    >>> # Uniform shift — rejected under default std metric (no spatial variation)
+    >>> result = confirm_event_by_plateau_shift(buffer, trigger_idx=10)
+    >>> result.confirmed
+    False
+    """
+    if score_metric not in ("std", "mean"):
+        raise ValueError(
+            f"score_metric must be 'std' or 'mean', got {score_metric!r}"
+        )
+
+    if isinstance(buffer, collections.deque):
+        buffer = list(buffer)
+
+    needed = pre_window_size + post_window_size + 2 * skip_around_trigger + 1
+    if len(buffer) < needed:
+        return ConfirmationResult(False, 0.0, "buffer_too_small")
+
+    pre_start = trigger_idx - skip_around_trigger - pre_window_size
+    pre_end = trigger_idx - skip_around_trigger
+    post_start = trigger_idx + skip_around_trigger + 1
+    post_end = post_start + post_window_size
+
+    if pre_start < 0 or post_end > len(buffer):
+        return ConfirmationResult(False, 0.0, "windows_out_of_range")
+
+    def _to_gray(f: np.ndarray) -> np.ndarray:
+        if f.ndim == 2:
+            return f.astype(np.float32)
+        return f[:, :, 1].astype(np.float32)
+
+    pre_gray = [_to_gray(f) for f in buffer[pre_start:pre_end]]
+    post_gray = [_to_gray(f) for f in buffer[post_start:post_end]]
+
+    pre_mean = np.mean(pre_gray, axis=0)
+    post_mean = np.mean(post_gray, axis=0)
+    diff = np.abs(pre_mean - post_mean)
+    diff_score = float(np.std(diff) if score_metric == "std" else np.mean(diff))
+
+    confirmed = diff_score >= confirmation_threshold
+    return ConfirmationResult(
+        confirmed=confirmed,
+        diff_score=diff_score,
+        reason="confirmed" if confirmed else "rejected_below_threshold",
+    )
 
 
 # ---------------------------------------------------------------------------
