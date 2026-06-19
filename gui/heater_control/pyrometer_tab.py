@@ -20,7 +20,7 @@ from PyQt6.QtGui import QFont
 import pyqtgraph as pg
 
 from gui.state import PyrometerState
-from gui.action_logger import ActionLogger
+from gui.heater_control.action_logger import ActionLogger
 
 
 class PyrometerTab(QWidget):

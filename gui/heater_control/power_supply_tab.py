@@ -15,7 +15,7 @@ import pyqtgraph as pg
 
 from gui.state import PowerSupplyState
 from gui.widgets import ValueDisplay, ControlPanel, ProtectionPanel
-from gui.action_logger import ActionLogger
+from gui.heater_control.action_logger import ActionLogger
 
 
 class PowerSupplyTab(QWidget):

@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtGui import QFont
 
-from gui.pid_controller import PIDController, PIDConfig, GainBand, HARD_CUTOFF_C, PIDRunState
+from gui.heater_control.pid_controller import PIDController, PIDConfig, GainBand, HARD_CUTOFF_C, PIDRunState
 
 
 _STATE_COLORS = {

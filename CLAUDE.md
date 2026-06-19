@@ -20,6 +20,22 @@
 | `scripts/psu_diagnostic.py` | PSU connectivity check |
 | `scripts/owon_self_test.py` | OWON self-test |
 
+## Two GUI Applications
+
+This repo ships two distinct PyQt6 apps that share `gui/state.py`,
+`gui/widgets.py`, and `gui/workers.py` but nothing else at the UI layer:
+
+| Product | Launcher | Window title | Tabs | UI code |
+|---|---|---|---|---|
+| OMBE Growth Monitor | `python growth_monitor_app.py` | "OMBE Growth Monitor" | Monitor / Events / Session | `gui/growth_*.py`, `gui/events_tab.py`, `gui/auto_capture.py`, `gui/classifier_bridge.py` |
+| Heater Control (dummy-loop) | `python gui.py` | "Hardware Control Dashboard" | RHEED / Pyrometer / Power Supply / Thermocouple / Dashboard / Visuals / Config / PID / Action Log | `gui/heater_control/` (subpackage) |
+
+The growth monitor is the AI-MBE product (RHEED + pyrometer + auto-capture +
+classifier integration). The heater-control GUI is the dummy-loop /
+AI-Scientist-mode infrastructure (OWON PSU + Dracal TC + PID heater
+control) — used for v4 closed-loop work when active. **Launch the right
+one for your workflow — they're not the same product.**
+
 ## GUI (PyQt6) — OMBE Growth Log Assistant
 Launch: `python growth_monitor_app.py`
 

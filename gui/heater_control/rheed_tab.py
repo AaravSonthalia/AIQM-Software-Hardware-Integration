@@ -21,7 +21,7 @@ from PyQt6.QtGui import QImage, QPixmap, QFont, QPainter, QColor, QPen
 import pyqtgraph as pg
 
 from gui.state import CameraState
-from gui.action_logger import ActionLogger
+from gui.heater_control.action_logger import ActionLogger
 
 
 class RheedImageLabel(QLabel):

@@ -4,7 +4,7 @@ Application entry point — QApplication setup and main().
 
 import sys
 from PyQt6.QtWidgets import QApplication
-from gui.main_window import MainWindow
+from gui.heater_control.main_window import MainWindow
 
 
 def main():

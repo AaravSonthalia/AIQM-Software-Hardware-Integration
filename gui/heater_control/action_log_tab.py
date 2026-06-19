@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 
 from gui.state import ActionLogEntry
-from gui.action_logger import ActionLogger
+from gui.heater_control.action_logger import ActionLogger
 
 
 class ActionLogTab(QWidget):
