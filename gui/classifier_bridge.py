@@ -78,9 +78,12 @@ class ClassifierBridge:
         self._bad_scores = load_bad_image_scores(self._model, self._device)
 
         # Import the classify function.
-        from evaluate import classify_winrate as _cw, preprocess_image
+        # Note (June 16 2026): ``preprocess_image`` used to be imported here
+        # and stored on ``self._preprocess`` but was never used downstream and
+        # is no longer exported from ``evaluate.py`` after the upstream
+        # reorganization. Removed to unbreak the import on all current clones.
+        from evaluate import classify_winrate as _cw
         self._classify_winrate = _cw
-        self._preprocess = preprocess_image
 
     # ------------------------------------------------------------------
 

@@ -5,6 +5,7 @@ Supports two frame sources:
   - Screen grab of kSA 400 window (primary — matches Classifier2 training data)
   - Direct vmbpy camera access (secondary — when kSA not running)
 """
+from __future__ import annotations  # Defer X | None evaluation for Python 3.9 (Mac venv).
 
 import time
 from collections import deque
