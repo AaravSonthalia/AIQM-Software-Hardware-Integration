@@ -592,6 +592,26 @@ class GrowthMonitor(QWidget):
         self.config_interval_spin.setSingleStep(1.0)
         config_form.addRow("Recording interval:", self.config_interval_spin)
 
+        # Heartbeat interval — how often we save a RHEED frame regardless
+        # of detector flags. Default 5 s per the May 21 joint decision
+        # (was env-var-only before Jun 23). Range 1 s (dense) to 600 s
+        # (10 min, the old default). Spans the typical use cases.
+        # Applied at session START — changing mid-session has no effect.
+        self.config_heartbeat_interval_spin = QDoubleSpinBox()
+        self.config_heartbeat_interval_spin.setRange(1.0, 600.0)
+        self.config_heartbeat_interval_spin.setValue(5.0)
+        self.config_heartbeat_interval_spin.setSuffix(" s")
+        self.config_heartbeat_interval_spin.setDecimals(0)
+        self.config_heartbeat_interval_spin.setSingleStep(1.0)
+        self.config_heartbeat_interval_spin.setToolTip(
+            "How often to save a RHEED heartbeat frame. Lower = denser "
+            "data (more disk + memory); 5 s default per May 21 joint "
+            "group meeting."
+        )
+        config_form.addRow(
+            "RHEED heartbeat interval:", self.config_heartbeat_interval_spin,
+        )
+
         save_row = QHBoxLayout()
         self.config_save_path = QLineEdit()
         default_save = _default_save_path()

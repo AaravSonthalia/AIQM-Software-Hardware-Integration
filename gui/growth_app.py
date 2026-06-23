@@ -281,17 +281,26 @@ class GrowthApp(QMainWindow):
         self._last_v_set = None
         self._last_i_set = None
 
-        # Start heartbeat dense-capture (first fire after
-        # HEARTBEAT_INTERVAL_SECONDS; we don't fire-on-start to avoid
-        # saving a black frame before the camera has produced anything
-        # useful).
+        # Start heartbeat dense-capture. Interval comes from the Config
+        # tab spinbox (since Jun 23) — falls back to HEARTBEAT_INTERVAL_SECONDS
+        # (env-var or default) if the monitor widget isn't reachable, but
+        # in practice the spinbox always wins. First fire is after one
+        # full interval; we don't fire-on-start to avoid saving a black
+        # frame before the camera has produced anything useful.
+        try:
+            heartbeat_s = float(
+                self.monitor.config_heartbeat_interval_spin.value()
+            )
+        except AttributeError:
+            heartbeat_s = HEARTBEAT_INTERVAL_SECONDS
+        self._heartbeat_timer.setInterval(int(heartbeat_s * 1000))
         self._heartbeat_timer.start()
-        _frames_per_hr = round(3600 / HEARTBEAT_INTERVAL_SECONDS)
+        _frames_per_hr = round(3600 / heartbeat_s)
         _est_mb_per_hr = _frames_per_hr * 200 / 1024  # ~200 KB/frame PNG estimate
         log.info(
             "Heartbeat: every %.1f s -> ~%d frames/hr "
             "(~%.0f MB/hr at ~200 KB/frame PNG estimate)",
-            HEARTBEAT_INTERVAL_SECONDS, _frames_per_hr, _est_mb_per_hr,
+            heartbeat_s, _frames_per_hr, _est_mb_per_hr,
         )
 
         self.monitor.set_state("running")
