@@ -85,11 +85,37 @@ class MistralState:
 
 @dataclass
 class EvapControlState:
-    """Current state of the Evap Control MBE chamber pressure (OCR-scraped)."""
+    """Current state from EvapControl / ElogReader.
+
+    Field provenance:
+    - ``screengrab`` mode (OCR): only ``chamber_pressure_mbar`` is populated.
+    - ``elog`` mode (.elo binary log): all fields populated where the elog
+      schema contains the underlying variable. Missing variables stay None
+      (different MBE systems have different cells).
+
+    Field-to-elog-variable mapping is defined in
+    ``drivers.evap_control.ElogReader.DEFAULT_VAR_MAP``. To track different
+    cells on a different system, pass a custom ``var_map`` when constructing
+    the reader and extend this dataclass to match.
+    """
+    # Always populated (both modes)
     chamber_pressure_mbar: Optional[float] = None
+    # Elog-mode only: substrate manipulator (the substrate temperature itself)
+    substrate_temp_pv_C: Optional[float] = None
+    substrate_temp_setpoint_C: Optional[float] = None
+    # Elog-mode only: effusion cell process values (Bulbasaur OMBE config)
+    cell_HTEC2_pv_C: Optional[float] = None
+    cell_Y_pv_C: Optional[float] = None       # Yttrium
+    cell_Sr_pv_C: Optional[float] = None      # Strontium
+    cell_Eu_pv_C: Optional[float] = None      # Europium
+    cell_Er_pv_C: Optional[float] = None      # Erbium
+    # Elog-mode only: plasma source state (when in use)
+    plasma_dc_bias_V: Optional[float] = None
+    plasma_forward_W: Optional[float] = None
+    plasma_reflected_W: Optional[float] = None
     connected: bool = False
     error: str = ""
-    mode: str = ""  # "screengrab" or "dummy"
+    mode: str = ""  # "screengrab", "elog", or "dummy"
 
 
 @dataclass

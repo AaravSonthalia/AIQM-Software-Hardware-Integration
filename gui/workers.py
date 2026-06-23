@@ -541,7 +541,22 @@ class EvapControlWorker(QThread):
 
             try:
                 vals = self._driver.read()
+                # Pressure: populated by both screengrab and elog modes.
                 state.chamber_pressure_mbar = vals.get("chamber_pressure_mbar")
+                # Substrate + cells + plasma: populated by elog mode only;
+                # screengrab returns None for these keys. The same field
+                # set is fanned out either way — downstream consumers see
+                # None for variables not present in the active mode.
+                state.substrate_temp_pv_C = vals.get("substrate_temp_pv_C")
+                state.substrate_temp_setpoint_C = vals.get("substrate_temp_setpoint_C")
+                state.cell_HTEC2_pv_C = vals.get("cell_HTEC2_pv_C")
+                state.cell_Y_pv_C = vals.get("cell_Y_pv_C")
+                state.cell_Sr_pv_C = vals.get("cell_Sr_pv_C")
+                state.cell_Eu_pv_C = vals.get("cell_Eu_pv_C")
+                state.cell_Er_pv_C = vals.get("cell_Er_pv_C")
+                state.plasma_dc_bias_V = vals.get("plasma_dc_bias_V")
+                state.plasma_forward_W = vals.get("plasma_forward_W")
+                state.plasma_reflected_W = vals.get("plasma_reflected_W")
                 state.connected = True
                 state.error = ""
             except Exception as e:

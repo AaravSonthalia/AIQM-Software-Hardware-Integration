@@ -383,6 +383,22 @@ class GrowthApp(QMainWindow):
             ),
             pyro_temp_std=pyro_temp_std,
             pyro_temp_n=pyro_temp_n,
+            # Elog-direct fields (None outside elog mode — see
+            # drivers.evap_control.ElogReader).
+            substrate_temp_pv_C=(
+                e.substrate_temp_pv_C if evap_ok else None
+            ),
+            substrate_temp_setpoint_C=(
+                e.substrate_temp_setpoint_C if evap_ok else None
+            ),
+            cell_HTEC2_pv_C=e.cell_HTEC2_pv_C if evap_ok else None,
+            cell_Y_pv_C=e.cell_Y_pv_C if evap_ok else None,
+            cell_Sr_pv_C=e.cell_Sr_pv_C if evap_ok else None,
+            cell_Eu_pv_C=e.cell_Eu_pv_C if evap_ok else None,
+            cell_Er_pv_C=e.cell_Er_pv_C if evap_ok else None,
+            plasma_dc_bias_V=e.plasma_dc_bias_V if evap_ok else None,
+            plasma_forward_W=e.plasma_forward_W if evap_ok else None,
+            plasma_reflected_W=e.plasma_reflected_W if evap_ok else None,
         )
 
         from datetime import datetime

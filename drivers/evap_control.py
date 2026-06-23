@@ -143,27 +143,29 @@ class EvapControl:
 
 
 class ElogReader:
-    """Direct-read chamber pressure via EvapControl's own ``.elo`` log.
+    """Direct-read growth state via EvapControl's own ``.elo`` log.
 
     Drop-in for ``EvapControl``: same ``connect/read/disconnect`` shape so
     ``EvapControlWorker`` swaps it in by changing the ``mode`` parameter.
-    Returns the same dict key (``chamber_pressure_mbar``) so downstream
-    fan-out (``EvapControlState.chamber_pressure_mbar`` → ``sensor_log.csv``)
-    is unchanged.
+    Returns the same dict key (``chamber_pressure_mbar``) the screengrab
+    path always returned, PLUS richer growth-state values (substrate
+    temperature, cell temperatures, plasma) that the elog schema exposes
+    but the OCR path can't reach.
+
+    Variable selection is configurable via ``var_map``: an elog-variable
+    name → output-dict-key mapping. Variables absent from the elog file's
+    schema are silently skipped (the output dict key stays None), so the
+    same reader works across MBE systems with different cell
+    configurations. Default map covers the Bulbasaur OMBE configuration
+    per ``elog_direct_read_may15.md``.
 
     Path discovery uses ``elog.find_current_log()`` which targets
     ``C:\\_Omicron_Software\\EvapControl\\evap_control_1.2.0.51\\evap_control_1.2.0.51\\log``.
     Override via ``log_dir`` if the install path differs.
 
-    Per ``elog_direct_read_may15.md``: ``MBE.Pressure`` is one of 91
-    variables in the .elo schema; many more (substrate manipulator
-    setpoint+PV, all cell temperatures, plasma DC bias, FTM) are
-    available and worth surfacing in a follow-up — for now we ship the
-    smallest viable replacement of the screengrab pressure channel.
-
     Midnight rotation: ``find_current_log()`` resolves today's filename
-    each call, so a session that spans midnight will pick up the new
-    file on the next ``read()``.
+    each call, so a session that spans midnight picks up the new file on
+    the next ``read()``.
     """
 
     DEFAULT_LOG_DIR = (
@@ -171,15 +173,43 @@ class ElogReader:
         r"\evap_control_1.2.0.51\log"
     )
 
+    # elog variable name → EvapControlState field name (also the dict
+    # key returned by ``read()``). Edit this to expose more growth state
+    # to downstream consumers; also extend ``EvapControlState`` in
+    # ``gui/state.py`` and the ``log_sensors`` schema in
+    # ``gui/growth_logger.py`` so the new fields land in sensor_log.csv.
+    DEFAULT_VAR_MAP: dict[str, str] = {
+        # Chamber pressure — also available via screengrab; always populated
+        "MBE.Pressure": "chamber_pressure_mbar",
+        # Substrate manipulator — the substrate temperature growers track
+        "MBE-Mani.PV": "substrate_temp_pv_C",
+        "MBE-Mani.setpoint": "substrate_temp_setpoint_C",
+        # Effusion cells (Bulbasaur OMBE)
+        "HTEC 2.PV": "cell_HTEC2_pv_C",
+        "HTEC Y.PV": "cell_Y_pv_C",
+        "LTEC 1 Sr.PV": "cell_Sr_pv_C",
+        "LTEC 2 Eu.PV": "cell_Eu_pv_C",
+        "MTEC Er.PV": "cell_Er_pv_C",
+        # Plasma source (when in use)
+        "Plasma.DCBias": "plasma_dc_bias_V",
+        "Plasma.forward": "plasma_forward_W",
+        "Plasma.reflected": "plasma_reflected_W",
+    }
+
     def __init__(
         self,
         log_dir: Optional[str] = None,
-        pressure_var: str = "MBE.Pressure",
+        var_map: Optional[dict[str, str]] = None,
     ):
         self._log_dir = log_dir or self.DEFAULT_LOG_DIR
-        self._pressure_var = pressure_var
+        self._var_map = var_map or self.DEFAULT_VAR_MAP
         self._connected = False
         self._last_log_path: Optional[Path] = None
+        # Cached schema intersection: which of our wanted vars actually
+        # exist in this elog's schema. Populated at first successful read,
+        # invalidated when the log file rotates (re-checked).
+        self._schema_present: Optional[list[str]] = None
+        self._schema_log_path: Optional[Path] = None
 
     def connect(self) -> None:
         # Resolve once at connect to fail fast — re-resolves at each read
@@ -199,35 +229,67 @@ class ElogReader:
         log.info("ElogReader connected: %s", path)
 
     def read(self) -> dict[str, Optional[float]]:
-        result: dict[str, Optional[float]] = {"chamber_pressure_mbar": None}
+        # All output keys start None; populated only if the variable
+        # exists in the elog schema and the read succeeds.
+        result: dict[str, Optional[float]] = {
+            out_key: None for out_key in self._var_map.values()
+        }
         if not self._connected:
             return result
 
-        from drivers.elog import find_current_log, latest_value
+        from drivers.elog import find_current_log, latest_record
 
         # Re-resolve every read so we cleanly handle midnight log rotation
         # mid-session without needing a reconnect.
         path = find_current_log(self._log_dir)
         if path is None:
             return result
+
+        # Cache which of our wanted vars are actually in this elog's schema.
+        # Re-check on log rotation (midnight) because a system reconfig
+        # could change the variable set.
+        if self._schema_present is None or self._schema_log_path != path:
+            from drivers.elog import parse_schema
+            try:
+                with open(path, "rb") as f:
+                    names, _fmts, _ = parse_schema(f)
+            except OSError as exc:
+                log.debug("ElogReader schema read failed: %s", exc)
+                return result
+            wanted = list(self._var_map.keys())
+            self._schema_present = [v for v in wanted if v in names]
+            self._schema_log_path = path
+            missing = set(wanted) - set(self._schema_present)
+            if missing:
+                log.info(
+                    "ElogReader: %d/%d wanted vars absent from elog schema "
+                    "(skipping): %s",
+                    len(missing), len(wanted), sorted(missing),
+                )
         self._last_log_path = path
 
+        # Batch read all present vars in one open+schema+tail.
         try:
-            _ts, val = latest_value(path, self._pressure_var)
+            _ts, var_values = latest_record(path, self._schema_present)
         except (KeyError, OSError, ValueError) as exc:
             log.debug("ElogReader read failed: %s", exc)
             return result
 
-        # Plausibility filter mirrors EvapControl's PRESSURE_RANGE_MBAR
-        lo, hi = PRESSURE_RANGE_MBAR
-        if not (lo <= val <= hi):
-            return result
+        for elog_name, (val, _fmt) in var_values.items():
+            out_key = self._var_map[elog_name]
+            # Pressure: plausibility-filter to UHV range.
+            if out_key == "chamber_pressure_mbar":
+                lo, hi = PRESSURE_RANGE_MBAR
+                if not (lo <= val <= hi):
+                    continue
+            result[out_key] = val
 
-        result["chamber_pressure_mbar"] = val
         return result
 
     def disconnect(self) -> None:
         self._last_log_path = None
+        self._schema_present = None
+        self._schema_log_path = None
         self._connected = False
 
     @property

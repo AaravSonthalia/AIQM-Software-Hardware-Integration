@@ -38,6 +38,14 @@ class GrowthLogger:
         "mistral_v_set_V", "mistral_v_actual_V",
         "mistral_i_set_A", "mistral_i_actual_A",
         "chamber_pressure_mbar",
+        # Elog-direct columns (populated when EvapControl mode = "elog";
+        # blank in screengrab mode where the .elo binary isn't read).
+        # See drivers.evap_control.ElogReader.DEFAULT_VAR_MAP for the
+        # elog-variable-name → column-name mapping.
+        "substrate_temp_pv_C", "substrate_temp_setpoint_C",
+        "cell_HTEC2_pv_C",
+        "cell_Y_pv_C", "cell_Sr_pv_C", "cell_Eu_pv_C", "cell_Er_pv_C",
+        "plasma_dc_bias_V", "plasma_forward_W", "plasma_reflected_W",
     ]
     COMMIT_FIELDS = [
         "timestamp", "time_display", "elapsed_s", "sample_id", "grower",
@@ -168,12 +176,27 @@ class GrowthLogger:
         v_set=None, v_actual=None, i_set=None, i_actual=None,
         chamber_pressure_mbar=None,
         pyro_temp_std=None, pyro_temp_n=None,
+        # Elog-direct extensions (Jun 23 2026 — EvapControl mode="elog").
+        # All optional; blank in the CSV when None. Order matches
+        # EvapControlState field order so the call site can pass through
+        # state attributes one-for-one.
+        substrate_temp_pv_C=None, substrate_temp_setpoint_C=None,
+        cell_HTEC2_pv_C=None,
+        cell_Y_pv_C=None, cell_Sr_pv_C=None,
+        cell_Eu_pv_C=None, cell_Er_pv_C=None,
+        plasma_dc_bias_V=None, plasma_forward_W=None,
+        plasma_reflected_W=None,
     ):
         """Append a row to sensor_log.csv. All values may be None.
 
         ``pyro_temp_std`` and ``pyro_temp_n`` capture the per-poll
         statistical spread when the pyrometer worker takes multiple
         sub-readings per cycle. Empty strings if not provided.
+
+        The ``substrate_*``, ``cell_*``, and ``plasma_*`` kwargs are
+        populated only when EvapControl is in ``elog`` mode (reading the
+        .elo binary log directly). In ``screengrab`` mode they default
+        to None and the columns are blank.
         """
         if not self._sensor_writer:
             return
@@ -195,6 +218,18 @@ class GrowthLogger:
             "mistral_i_set_A":    _f(i_set, 3),
             "mistral_i_actual_A": _f(i_actual, 3),
             "chamber_pressure_mbar": _sci(chamber_pressure_mbar),
+            # Elog-direct fields. Temps to 1 dp (TemperaSure-style),
+            # plasma DC bias to 1 dp, plasma powers to 1 dp.
+            "substrate_temp_pv_C":       _f(substrate_temp_pv_C, 1),
+            "substrate_temp_setpoint_C": _f(substrate_temp_setpoint_C, 1),
+            "cell_HTEC2_pv_C": _f(cell_HTEC2_pv_C, 1),
+            "cell_Y_pv_C":     _f(cell_Y_pv_C, 1),
+            "cell_Sr_pv_C":    _f(cell_Sr_pv_C, 1),
+            "cell_Eu_pv_C":    _f(cell_Eu_pv_C, 1),
+            "cell_Er_pv_C":    _f(cell_Er_pv_C, 1),
+            "plasma_dc_bias_V":   _f(plasma_dc_bias_V, 1),
+            "plasma_forward_W":   _f(plasma_forward_W, 1),
+            "plasma_reflected_W": _f(plasma_reflected_W, 1),
         })
         self._sensor_file.flush()
 
