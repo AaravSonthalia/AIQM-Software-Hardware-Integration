@@ -321,6 +321,18 @@ class GrowthApp(QMainWindow):
         path = self.growth_log.export_growth_log(metadata)
 
         self.growth_log.end_session()
+
+        # Auto-generate T vs t plot from sensor_log.csv (Frankie-style).
+        # Soft-deps matplotlib; returns None and logs a warning if absent
+        # or the pyrometer was offline all session. The plot is a
+        # post-mortem convenience \u2014 failure doesn't block STOP completion.
+        try:
+            plot_path = self.growth_log.generate_temperature_plot(metadata)
+            if plot_path:
+                log.info("Auto T vs t plot saved: %s", plot_path)
+        except Exception as e:
+            log.warning("Auto T vs t plot failed: %s", e)
+
         self.monitor.set_state("armed")
 
         if path:
@@ -627,10 +639,15 @@ class GrowthApp(QMainWindow):
         self._sensor_log_timer.stop()
         self._heartbeat_timer.stop()
         if self.growth_log.active:
-            self.growth_log.save_session_metadata(
-                self.monitor.get_session_metadata(),
-            )
+            metadata = self.monitor.get_session_metadata()
+            self.growth_log.save_session_metadata(metadata)
             self.growth_log.end_session()
+            # Same auto-plot as _on_stop — also covers the "user closed
+            # window mid-session" path, not just clean STOP.
+            try:
+                self.growth_log.generate_temperature_plot(metadata)
+            except Exception as e:
+                log.warning("Auto T vs t plot failed during close: %s", e)
         self._stop_worker(self.camera_worker)
         self._stop_worker(self.pyrometer_worker)
         self._stop_worker(self.mistral_worker)

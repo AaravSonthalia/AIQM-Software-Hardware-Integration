@@ -798,3 +798,106 @@ class GrowthLogger:
         self._set_change_writer = None
         # NOTE: _session_dir and _entries intentionally preserved
         # so Export Growth Log works after STOP.
+
+    def generate_temperature_plot(self, metadata: Optional[dict] = None) -> Optional[Path]:
+        """Generate a Temperature-vs-Time PNG from this session's sensor_log.csv.
+
+        Convenience auto-plot called from GrowthApp at session end (per Jun 23
+        2026 — Frankie's f_version pattern, ported to the canonical product).
+        Reads ``pyrometer_temp_C`` + ``elapsed_s`` from the sensor log this
+        session just wrote and saves ``temperature_profile.png`` to the same
+        directory.
+
+        Works post-``end_session()`` because ``_session_dir`` is preserved
+        through close. Returns the plot path on success; returns None and
+        logs a warning if matplotlib isn't installed or the sensor log has
+        no temperature data (e.g. pyrometer disconnected the whole session).
+
+        For richer post-hoc plotting (custom titles, output format, dpi),
+        use ``python scripts/plot_temperature.py <session_dir>``.
+        """
+        if self._session_dir is None:
+            return None
+
+        sensor_path = self._session_dir / "sensor_log.csv"
+        if not sensor_path.exists():
+            return None
+
+        # Matplotlib is a soft dependency — present on Mac dev env, may not
+        # be on Bulbasaur. Lazy-import + graceful failure.
+        try:
+            import matplotlib
+            matplotlib.use("Agg")  # No GUI needed; just write a file
+            import matplotlib.pyplot as plt
+        except ImportError:
+            import logging
+            logging.getLogger(__name__).warning(
+                "matplotlib not installed; skipping auto T-vs-t plot. "
+                "Install with: pip install matplotlib"
+            )
+            return None
+
+        # Parse sensor_log.csv — same shape as scripts/plot_temperature.py
+        elapsed: list[float] = []
+        temps: list[float] = []
+        with open(sensor_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    t = float(row["elapsed_s"])
+                except (KeyError, ValueError):
+                    continue
+                temp_str = row.get("pyrometer_temp_C", "").strip()
+                if not temp_str:
+                    continue
+                try:
+                    temp = float(temp_str)
+                except ValueError:
+                    continue
+                elapsed.append(t)
+                temps.append(temp)
+
+        if not temps:
+            # Pyrometer was offline the whole session — nothing to plot.
+            return None
+
+        # Title: prefer metadata if provided (richer); fall back to dir name.
+        if metadata:
+            title_parts = []
+            if metadata.get("sample_id"):
+                title_parts.append(str(metadata["sample_id"]))
+            if metadata.get("grower"):
+                title_parts.append(f"by {metadata['grower']}")
+            if metadata.get("date"):
+                title_parts.append(metadata["date"])
+            title = " — ".join(title_parts) if title_parts else self._session_dir.name
+        else:
+            title = self._session_dir.name
+
+        elapsed_min = [t / 60.0 for t in elapsed]
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(elapsed_min, temps, color="#0d9488", linewidth=1.2)
+        ax.set_xlabel("Elapsed Time (min)", fontsize=12)
+        ax.set_ylabel("Temperature (°C)", fontsize=12)
+        ax.set_title(title, fontsize=13)
+        ax.grid(True, alpha=0.3)
+
+        # Annotate min/max so the curve is glanceable
+        t_min, t_max = min(temps), max(temps)
+        ax.axhline(y=t_max, color="#dc2626", linestyle="--", alpha=0.5, linewidth=0.8)
+        ax.axhline(y=t_min, color="#2563eb", linestyle="--", alpha=0.5, linewidth=0.8)
+        ax.text(
+            elapsed_min[-1], t_max, f"  {t_max:.0f}°C",
+            va="bottom", color="#dc2626", fontsize=9,
+        )
+        ax.text(
+            elapsed_min[-1], t_min, f"  {t_min:.0f}°C",
+            va="top", color="#2563eb", fontsize=9,
+        )
+
+        fig.tight_layout()
+        out_path = self._session_dir / "temperature_profile.png"
+        fig.savefig(str(out_path), dpi=150)
+        plt.close(fig)  # Free figure memory; we're done with it.
+        return out_path
