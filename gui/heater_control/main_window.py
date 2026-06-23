@@ -14,17 +14,17 @@ from gui.workers import (
     PowerSupplyWorker, ThermocoupleWorker,
     RheedCameraWorker, PyrometerWorker,
 )
-from gui.action_logger import ActionLogger
-from gui.power_supply_tab import PowerSupplyTab
-from gui.temperature_tab import TemperatureTab
-from gui.dashboard_tab import DashboardTab
-from gui.visuals_tab import VisualsTab
-from gui.config_tab import ConfigTab
-from gui.pid_controller import PIDController
-from gui.pid_tab import PIDTab
-from gui.action_log_tab import ActionLogTab
-from gui.rheed_tab import RheedTab
-from gui.pyrometer_tab import PyrometerTab
+from gui.heater_control.action_logger import ActionLogger
+from gui.heater_control.power_supply_tab import PowerSupplyTab
+from gui.heater_control.temperature_tab import TemperatureTab
+from gui.heater_control.dashboard_tab import DashboardTab
+from gui.heater_control.visuals_tab import VisualsTab
+from gui.heater_control.config_tab import ConfigTab
+from gui.heater_control.pid_controller import PIDController
+from gui.heater_control.pid_tab import PIDTab
+from gui.heater_control.action_log_tab import ActionLogTab
+from gui.heater_control.rheed_tab import RheedTab
+from gui.heater_control.pyrometer_tab import PyrometerTab
 
 
 class MainWindow(QMainWindow):

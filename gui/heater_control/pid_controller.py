@@ -20,7 +20,7 @@ from typing import Optional
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from gui.state import PowerSupplyState, TemperatureState
-from gui.action_logger import ActionLogger
+from gui.heater_control.action_logger import ActionLogger
 
 
 HARD_CUTOFF_C: float = 300.0  # absolute system ceiling — Config tab cannot exceed this

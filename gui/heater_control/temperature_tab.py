@@ -14,7 +14,7 @@ from PyQt6.QtGui import QFont
 import pyqtgraph as pg
 
 from gui.state import TemperatureState
-from gui.action_logger import ActionLogger
+from gui.heater_control.action_logger import ActionLogger
 
 
 class TemperatureTab(QWidget):

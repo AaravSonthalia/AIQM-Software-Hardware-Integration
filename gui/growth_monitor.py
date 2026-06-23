@@ -10,7 +10,9 @@ Tab layout:
              growth notes (bottom half, full width), export
 """
 
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -24,11 +26,33 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QFont, QShortcut, QKeySequence
 
+
+def _default_save_path() -> str:
+    """Pick the default growth-log save path.
+
+    On Bulbasaur (Windows with the OMBE SSD mounted at E:), prefer
+    ``E:\\OMBE\\GrowthMonitor`` per PI directive that all growth data
+    written by this GUI should go to the SSD. Falls back to the original
+    ``logs/growths`` (relative to the repo) when the SSD isn't present —
+    keeps the default sane on Mac, on Windows boxes without the SSD
+    attached, and on any other deployment.
+    """
+    ssd_root = Path(r"E:\OMBE")
+    if sys.platform == "win32" and ssd_root.exists():
+        return str(ssd_root / "GrowthMonitor")
+    return "logs/growths"
+
 from gui.state import (
     CameraState, EvapControlState, MistralState,
     PowerSupplyState, PyrometerState,
 )
 from gui.widgets import ValueDisplay
+from gui.growth_logger import (
+    EVENT_STATE_DISCARDED,
+    EVENT_STATE_KEPT_DEFAULT,
+    EVENT_STATE_KEPT_EXPLICIT,
+)
+from gui.events_tab import EventsTab
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +174,7 @@ class AutoCaptureBanner(QFrame):
     classifier-driven version takes over.
     """
 
-    discard_requested = pyqtSignal(str)  # emits buffer_dir (relative to session)
+    decision_made = pyqtSignal(int, str, str)  # emits (event_idx, buffer_dir, state)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -204,6 +228,7 @@ class AutoCaptureBanner(QFrame):
         self._countdown_timer.setInterval(1000)
         self._countdown_timer.timeout.connect(self._tick)
         self._countdown_remaining = 0
+        self._current_event_idx = 0
         self._current_buffer_dir = ""
         self.hide()
 
@@ -215,6 +240,7 @@ class AutoCaptureBanner(QFrame):
         countdown_s: int = 10,
     ) -> None:
         """Display the banner for one flagged event."""
+        self._current_event_idx = event_idx
         self._current_buffer_dir = buffer_dir
         self._countdown_remaining = max(1, int(countdown_s))
         self._message_label.setText(
@@ -227,7 +253,7 @@ class AutoCaptureBanner(QFrame):
     def _tick(self) -> None:
         self._countdown_remaining -= 1
         if self._countdown_remaining <= 0:
-            self._on_keep_clicked()
+            self._on_keep_default_timeout()
         else:
             self._update_countdown_label()
 
@@ -237,13 +263,22 @@ class AutoCaptureBanner(QFrame):
         )
 
     def _on_discard_clicked(self) -> None:
-        self._countdown_timer.stop()
-        if self._current_buffer_dir:
-            self.discard_requested.emit(self._current_buffer_dir)
-        self.hide()
+        self._emit_decision(EVENT_STATE_DISCARDED)
 
     def _on_keep_clicked(self) -> None:
+        self._emit_decision(EVENT_STATE_KEPT_EXPLICIT)
+
+    def _on_keep_default_timeout(self) -> None:
+        self._emit_decision(EVENT_STATE_KEPT_DEFAULT)
+
+    def _emit_decision(self, state: str) -> None:
+        """Stop countdown, emit decision_made, hide the banner."""
         self._countdown_timer.stop()
+        self.decision_made.emit(
+            self._current_event_idx,
+            self._current_buffer_dir,
+            state,
+        )
         self.hide()
 
 
@@ -258,8 +293,11 @@ class GrowthMonitor(QWidget):
     export_requested = pyqtSignal()
     # True = user wants auto-capture paused; False = wants it resumed.
     auto_capture_pause_toggled = pyqtSignal(bool)
-    # Forwarded from the banner — emits the relative buffer dir to delete.
-    auto_capture_event_discarded = pyqtSignal(str)
+    # Forwarded from the banner — emits (event_idx, buffer_dir, state).
+    # State is one of EVENT_STATE_KEPT_EXPLICIT / EVENT_STATE_KEPT_DEFAULT /
+    # EVENT_STATE_DISCARDED. GrowthApp connects this to update the row in
+    # auto_capture_events.csv via GrowthLogger.update_auto_capture_state.
+    auto_capture_decision = pyqtSignal(int, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -325,6 +363,7 @@ class GrowthMonitor(QWidget):
         # === Tab widget ===
         self._tabs = QTabWidget()
         self._build_monitor_tab()
+        self._build_events_tab()
         self._build_session_tab()
         root.addWidget(self._tabs, 1)
 
@@ -344,8 +383,8 @@ class GrowthMonitor(QWidget):
         # Auto-capture event banner — hidden by default, surfaces when the
         # detector flags an event and disappears on Keep / Discard / timeout.
         self.auto_capture_banner = AutoCaptureBanner()
-        self.auto_capture_banner.discard_requested.connect(
-            self._on_auto_capture_discard,
+        self.auto_capture_banner.decision_made.connect(
+            self._on_auto_capture_decision_internal,
         )
         layout.addWidget(self.auto_capture_banner)
 
@@ -495,6 +534,34 @@ class GrowthMonitor(QWidget):
 
         self._tabs.addTab(tab, "Monitor")
 
+    # ----- Events Tab ------------------------------------------------------
+
+    def _build_events_tab(self):
+        """Mount the EventsTab — review surface for auto-capture events.
+
+        Lives between Monitor (live) and Session (config + notes + export)
+        in the tab order so the grower's natural left-to-right scan is
+        now → just-fired events → session admin.
+
+        The tab's text gets a "(N)" badge whenever there are unreviewed
+        events — pending or kept_default — so the catch-up case after a
+        walk-away is legible at a glance from any other tab.
+        """
+        self.events_tab = EventsTab()
+        self._events_tab_index = self._tabs.addTab(self.events_tab, "Events")
+        self.events_tab.unreviewed_count_changed.connect(
+            self._on_unreviewed_count_changed,
+        )
+
+    def _on_unreviewed_count_changed(self, count: int):
+        """Repaint the Events tab header with the unreviewed-event count.
+
+        Empty badge when count == 0 to keep the header quiet during a
+        fully-attended growth; non-zero counts surface explicitly.
+        """
+        label = "Events" if count == 0 else f"Events ({count})"
+        self._tabs.setTabText(self._events_tab_index, label)
+
     # ----- Session Tab -----------------------------------------------------
 
     def _build_session_tab(self):
@@ -527,8 +594,9 @@ class GrowthMonitor(QWidget):
 
         save_row = QHBoxLayout()
         self.config_save_path = QLineEdit()
-        self.config_save_path.setPlaceholderText("logs/growths")
-        self.config_save_path.setText("logs/growths")
+        default_save = _default_save_path()
+        self.config_save_path.setPlaceholderText(default_save)
+        self.config_save_path.setText(default_save)
         save_row.addWidget(self.config_save_path)
         browse_btn = QPushButton("Browse")
         browse_btn.setFixedWidth(70)
@@ -845,6 +913,17 @@ class GrowthMonitor(QWidget):
         )
         self.growth_notes_table.scrollToBottom()
 
+    def clear_session_tables(self):
+        """Reset Sensor Log + Growth Notes table UIs for a new session.
+
+        The CSV files are correctly per-session (start_session opens fresh
+        ones), but these QTableWidgets accumulate rows visually across
+        sessions because nothing in the original wiring resets them.
+        Mirrors the setRowCount(0) call EventsTab.attach_session uses.
+        """
+        self.sensor_log_table.setRowCount(0)
+        self.growth_notes_table.setRowCount(0)
+
     # ----- Sensor Log display ---------------------------------------------
 
     def add_sensor_log_row(self, time_str: str, temp: Optional[float],
@@ -909,10 +988,13 @@ class GrowthMonitor(QWidget):
             event_idx, score, buffer_dir, countdown_s,
         )
 
-    def _on_auto_capture_discard(self, buffer_dir: str):
-        """Re-emit the banner's discard signal at the GrowthMonitor level
-        so GrowthApp can wire the cleanup without knowing about the banner."""
-        self.auto_capture_event_discarded.emit(buffer_dir)
+    def _on_auto_capture_decision_internal(
+        self, event_idx: int, buffer_dir: str, state: str,
+    ):
+        """Re-emit the banner's decision signal at the GrowthMonitor level
+        so GrowthApp can route the state update without knowing about the
+        banner internals."""
+        self.auto_capture_decision.emit(event_idx, buffer_dir, state)
 
     def set_auto_capture_pause_enabled(self, enabled: bool):
         """Enable/disable the pause toggle. Called by GrowthApp at session

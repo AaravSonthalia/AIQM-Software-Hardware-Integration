@@ -49,8 +49,16 @@ class ClassifierBridge:
         self._repo = Path(ai_repo_root)
         self._bad_threshold = bad_threshold
 
-        # Add Classifier2 to sys.path so its modules are importable.
-        c2_dir = str(self._repo / "Classifier2")
+        # Auto-detect the Classifier2 layout. Justin's GitHub origin/main is
+        # still pre-reorg (Classifier2/ at repo root); some local clones (AJ's
+        # Mac) are post-reorg (src/classifiers/classifier2/). Prefer the
+        # post-reorg path when present, fall back to the pre-reorg one.
+        candidates = [
+            self._repo / "src" / "classifiers" / "classifier2",
+            self._repo / "Classifier2",
+        ]
+        c2_dir_path = next((p for p in candidates if p.exists()), candidates[0])
+        c2_dir = str(c2_dir_path)
         if c2_dir not in sys.path:
             sys.path.insert(0, c2_dir)
 
@@ -59,9 +67,9 @@ class ClassifierBridge:
 
         self._torch = torch
 
-        # Resolve model path.
+        # Resolve model path against whichever layout we detected.
         if model_path is None:
-            model_path = self._repo / "Classifier2" / "artifacts" / "best_model.pth"
+            model_path = c2_dir_path / "artifacts" / "best_model.pth"
 
         self._model, self._device = load_model(str(model_path))
 
@@ -70,9 +78,12 @@ class ClassifierBridge:
         self._bad_scores = load_bad_image_scores(self._model, self._device)
 
         # Import the classify function.
-        from evaluate import classify_winrate as _cw, preprocess_image
+        # Note (June 16 2026): ``preprocess_image`` used to be imported here
+        # and stored on ``self._preprocess`` but was never used downstream and
+        # is no longer exported from ``evaluate.py`` after the upstream
+        # reorganization. Removed to unbreak the import on all current clones.
+        from evaluate import classify_winrate as _cw
         self._classify_winrate = _cw
-        self._preprocess = preprocess_image
 
     # ------------------------------------------------------------------
 

@@ -5,6 +5,7 @@ Supports two frame sources:
   - Screen grab of kSA 400 window (primary — matches Classifier2 training data)
   - Direct vmbpy camera access (secondary — when kSA not running)
 """
+from __future__ import annotations  # Defer X | None evaluation for Python 3.9 (Mac venv).
 
 import time
 from collections import deque
@@ -20,7 +21,7 @@ from PyQt6.QtGui import QImage, QPixmap, QFont, QPainter, QColor, QPen
 import pyqtgraph as pg
 
 from gui.state import CameraState
-from gui.action_logger import ActionLogger
+from gui.heater_control.action_logger import ActionLogger
 
 
 class RheedImageLabel(QLabel):

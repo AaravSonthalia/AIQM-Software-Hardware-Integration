@@ -14,6 +14,21 @@ from typing import Optional
 import numpy as np
 
 
+# Auto-capture event states (used by event_state column in
+# auto_capture_events.csv). Set to PENDING at fire time; transitions to one
+# of the other three when the grower interacts with the AutoCaptureBanner or
+# the keep-default countdown fires. AUTO_SKIPPED is set at log time when
+# the quality gate rejected all 20 buffer frames — there's nothing to
+# review, so the event has no banner and no resolution path. Marking it
+# at log time gives the row a terminal state instead of leaving it as
+# pending forever.
+EVENT_STATE_PENDING = "pending"
+EVENT_STATE_KEPT_EXPLICIT = "kept_explicit"
+EVENT_STATE_KEPT_DEFAULT = "kept_default"
+EVENT_STATE_DISCARDED = "discarded"
+EVENT_STATE_AUTO_SKIPPED = "auto_skipped"
+
+
 class GrowthLogger:
     """Logs sensor data and timestamped entries during a growth session."""
 
@@ -35,6 +50,7 @@ class GrowthLogger:
         "timestamp", "elapsed_s", "event_idx",
         "change_score", "pyrometer_temp_C",
         "buffer_count", "buffer_dir",
+        "event_state", "state_changed_at",
     ]
     HEARTBEAT_FIELDS = [
         "timestamp", "elapsed_s", "heartbeat_idx",
@@ -44,6 +60,27 @@ class GrowthLogger:
         "timestamp", "elapsed_s", "event_idx",
         "channel", "old_value", "new_value", "delta",
         "pyrometer_temp_C",
+    ]
+    # Event labels written by the Events tab labeling form. The from/to
+    # columns are reserved for the deferred reconstruction-transition
+    # dropdowns — they exist now so future UI additions don't require a
+    # CSV schema migration. Each row is per-event_idx (upsert-by-key).
+    EVENT_LABEL_FIELDS = [
+        "event_idx",
+        "primary_reconstruction",
+        "change_from",
+        "change_to",
+        "notes",
+        "label_timestamp_iso",
+        # Mixture-label columns written by the Equalizer (May 19 2026 sprint).
+        # Each is a float in [0, 1]; ideally sum to ~1 after normalization.
+        # primary_reconstruction stays populated as argmax for back-compat and
+        # quick filtering by single-class users.
+        "recon_1x1",
+        "recon_tw",
+        "recon_c6x2",
+        "recon_rt13",
+        "recon_HTR",
     ]
 
     def __init__(self, base_dir: str = "logs/growths"):
@@ -271,6 +308,7 @@ class GrowthLogger:
         pyro_temp: Optional[float] = None,
         buffer_count: int = 0,
         buffer_dir: str = "",
+        event_state: str = EVENT_STATE_PENDING,
     ):
         """Append a row to auto_capture_events.csv for shadow-mode logging.
 
@@ -280,11 +318,23 @@ class GrowthLogger:
         and pyrometer trajectory after the session. ``buffer_count`` and
         ``buffer_dir`` capture how many context frames were dumped and
         where, so post-hoc analysis can locate them.
+
+        ``event_state`` defaults to ``"pending"`` at fire time and is updated
+        to one of ``"kept_explicit"`` / ``"kept_default"`` / ``"discarded"``
+        when the grower interacts with the AutoCaptureBanner (see
+        ``update_auto_capture_state``).
         """
         if not self._auto_capture_writer:
             return
+        timestamp = datetime.now().isoformat()
+        # Non-pending initial states (auto_skipped, etc.) are terminal at
+        # log time — set state_changed_at so the CSV stays internally
+        # consistent with the rule that any non-pending row has a stamp.
+        state_changed_at = (
+            timestamp if event_state != EVENT_STATE_PENDING else ""
+        )
         self._auto_capture_writer.writerow({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": timestamp,
             "elapsed_s": f"{elapsed_s:.2f}",
             "event_idx": event_idx,
             "change_score": f"{score:.4f}",
@@ -293,8 +343,178 @@ class GrowthLogger:
             ),
             "buffer_count": buffer_count,
             "buffer_dir": buffer_dir,
+            "event_state": event_state,
+            "state_changed_at": state_changed_at,
         })
         self._auto_capture_file.flush()
+
+    def update_auto_capture_state(
+        self,
+        event_idx: int,
+        new_state: str,
+    ) -> bool:
+        """Update event_state and state_changed_at for an existing event row.
+
+        Called when the grower interacts with the AutoCaptureBanner (Keep
+        Now, Discard) or when the keep-default countdown fires. Rewrites
+        auto_capture_events.csv in place — small file, infrequent updates,
+        simple semantics. Returns True if the row was found and updated.
+
+        Non-destructive design: discard updates the row state but does NOT
+        remove the buffer directory. The grower can recover discarded
+        events from the Events tab if they change their mind. See
+        ``feedback_aiqm_grower_friction.md`` for the design rationale.
+        """
+        if self._session_dir is None:
+            return False
+        csv_path = self._session_dir / "auto_capture_events.csv"
+        if not csv_path.exists():
+            return False
+
+        # Close the writer's file handle so we can rewrite in-place.
+        if self._auto_capture_file and not self._auto_capture_file.closed:
+            self._auto_capture_file.close()
+
+        with open(csv_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        timestamp = datetime.now().isoformat()
+        found = False
+        for row in rows:
+            if str(row.get("event_idx", "")) == str(event_idx):
+                row["event_state"] = new_state
+                row["state_changed_at"] = timestamp
+                found = True
+                break
+
+        if found:
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self.AUTO_CAPTURE_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+
+        # Reopen for append so subsequent log_auto_capture_event calls work.
+        # No header write — the file already has the header from start_session
+        # (or the rewrite above when found=True).
+        self._auto_capture_file = open(csv_path, "a", newline="")
+        self._auto_capture_writer = csv.DictWriter(
+            self._auto_capture_file, fieldnames=self.AUTO_CAPTURE_FIELDS,
+        )
+        return found
+
+    def read_event_labels(self) -> dict[int, dict]:
+        """Load all rows from events_labels.csv keyed by event_idx.
+
+        Returns an empty dict if no session is active, the file doesn't
+        exist yet (no labels applied), or the file can't be read. The
+        Events tab uses this once per session attach to seed an in-memory
+        cache; the cache is then kept in sync as the grower applies new
+        labels through update_event_label.
+        """
+        if self._session_dir is None:
+            return {}
+        csv_path = self._session_dir / "events_labels.csv"
+        if not csv_path.exists():
+            return {}
+        labels: dict[int, dict] = {}
+        try:
+            with open(csv_path, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        idx = int(row.get("event_idx", "") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    labels[idx] = dict(row)
+        except OSError:
+            return {}
+        return labels
+
+    def update_event_label(
+        self,
+        event_idx: int,
+        primary_reconstruction: Optional[str] = None,
+        change_from: Optional[str] = None,
+        change_to: Optional[str] = None,
+        notes: Optional[str] = None,
+        recon_1x1: Optional[float] = None,
+        recon_tw: Optional[float] = None,
+        recon_c6x2: Optional[float] = None,
+        recon_rt13: Optional[float] = None,
+        recon_HTR: Optional[float] = None,
+    ) -> bool:
+        """Atomically upsert a labeling row in events_labels.csv.
+
+        Reads the existing file (if any), updates or appends the row for
+        ``event_idx``, and rewrites the whole file. Each call is a
+        per-change atomic write — the design accepts ~3-5 rewrites per
+        labeled event (one per dropdown / notes commit) in exchange for
+        no "save button" cognitive load on the grower.
+
+        Only fields explicitly passed are updated; ``None`` means "leave
+        existing value alone." This lets the EventsTab call with just
+        ``primary_reconstruction=...`` when the dropdown changes without
+        clobbering a previously-typed notes string. ``label_timestamp_iso``
+        is always refreshed to record when the label was last touched.
+
+        File is created on first write — sessions with no labeling
+        activity won't leave behind an empty events_labels.csv.
+
+        Returns True on successful write, False on no-session or I/O error.
+        """
+        if self._session_dir is None:
+            return False
+        csv_path = self._session_dir / "events_labels.csv"
+
+        rows: list[dict] = []
+        if csv_path.exists():
+            try:
+                with open(csv_path, "r", newline="") as f:
+                    reader = csv.DictReader(f)
+                    rows = [dict(r) for r in reader]
+            except OSError:
+                return False
+
+        target = str(event_idx)
+        existing = next(
+            (r for r in rows if str(r.get("event_idx", "")) == target),
+            None,
+        )
+        if existing is None:
+            existing = {f: "" for f in self.EVENT_LABEL_FIELDS}
+            existing["event_idx"] = target
+            rows.append(existing)
+
+        if primary_reconstruction is not None:
+            existing["primary_reconstruction"] = primary_reconstruction
+        if change_from is not None:
+            existing["change_from"] = change_from
+        if change_to is not None:
+            existing["change_to"] = change_to
+        if notes is not None:
+            existing["notes"] = notes
+        for col_name, val in (
+            ("recon_1x1", recon_1x1),
+            ("recon_tw", recon_tw),
+            ("recon_c6x2", recon_c6x2),
+            ("recon_rt13", recon_rt13),
+            ("recon_HTR", recon_HTR),
+        ):
+            if val is not None:
+                existing[col_name] = f"{val:.4f}"
+        existing["label_timestamp_iso"] = datetime.now().isoformat()
+
+        try:
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=self.EVENT_LABEL_FIELDS,
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+        except OSError:
+            return False
+        return True
 
     def save_auto_capture_buffer(
         self,

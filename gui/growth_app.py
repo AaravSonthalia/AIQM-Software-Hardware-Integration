@@ -7,6 +7,7 @@ and ARM / START / STOP / DISARM session state transitions.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +18,11 @@ from PyQt6.QtCore import pyqtSlot, QTimer
 log = logging.getLogger(__name__)
 
 from gui.auto_capture import AutoCaptureEngine, PixelDiffChangeDetector
+from gui.growth_logger import (
+    EVENT_STATE_AUTO_SKIPPED,
+    EVENT_STATE_DISCARDED,
+    EVENT_STATE_PENDING,
+)
 from gui.state import CameraState, EvapControlState, MistralState, PyrometerState
 from gui.workers import (
     EvapControlWorker, MistralWorker, PyrometerWorker, RheedCameraWorker,
@@ -43,14 +49,23 @@ from gui.growth_logger import GrowthLogger
 AUTO_CAPTURE_THRESHOLD = 2.0
 AUTO_CAPTURE_BUFFER_SIZE = 20
 AUTO_CAPTURE_COOLDOWN_S = 10.0
+AUTO_CAPTURE_ADAPTIVE_SIGMA = 3.0
+AUTO_CAPTURE_ADAPTIVE_FLOOR = 0.5
 
-# Heartbeat anchor capture: every N minutes during a session, save the
-# latest RHEED frame regardless of detector flags. Gives every session a
-# coarse temporal scaffold so the team can review "what was happening at
-# minute X" even if the detector missed transitions. Per Justin's 30-50
-# total-frames-per-trajectory budget: at 10 min × 4 hr session = 24
-# anchors, leaving room for ~6-26 detector-flagged frames.
-HEARTBEAT_INTERVAL_MIN = 10.0
+# Heartbeat dense-capture: every N seconds during a session, save the
+# latest RHEED frame regardless of detector flags. Per the May 21 joint
+# decision and Yuxin's CS-side "background data" request, capture as
+# much continuous data as possible — frames between detector events
+# that show what's happening when nothing has been flagged. Lets the
+# model learn when *not* to act, and captures grower-initiated V/I
+# changes that detector-based capture would miss. PI affirmed 5 s as
+# the working default at the joint meeting.
+#
+# Tunable via env var AIQM_HEARTBEAT_INTERVAL_SECONDS for grower-side
+# adjustment without code edits.
+HEARTBEAT_INTERVAL_SECONDS = float(
+    os.environ.get("AIQM_HEARTBEAT_INTERVAL_SECONDS", "5.0")
+)
 
 # MISTRAL set-V/I change detection — derives "operator pressed Set Voltage /
 # Set Current" events from successive OCR'd setpoint values changing.
@@ -89,10 +104,11 @@ class GrowthApp(QMainWindow):
         self._sensor_log_timer.setInterval(1000)
         self._sensor_log_timer.timeout.connect(self._log_sensors)
 
-        # Heartbeat anchor-capture timer — fires every N minutes during a
-        # session and saves whatever the latest RHEED frame is.
+        # Heartbeat dense-capture timer — fires every N seconds during a
+        # session and saves whatever the latest RHEED frame is. See
+        # HEARTBEAT_INTERVAL_SECONDS for the May 21 joint decision context.
         self._heartbeat_timer = QTimer(self)
-        self._heartbeat_timer.setInterval(int(HEARTBEAT_INTERVAL_MIN * 60 * 1000))
+        self._heartbeat_timer.setInterval(int(HEARTBEAT_INTERVAL_SECONDS * 1000))
         self._heartbeat_timer.timeout.connect(self._on_heartbeat)
 
         # Auto-capture engine — shadow-mode pixel-diff change detection.
@@ -102,9 +118,17 @@ class GrowthApp(QMainWindow):
             threshold=AUTO_CAPTURE_THRESHOLD,
             cooldown_s=AUTO_CAPTURE_COOLDOWN_S,
             warmup_frames=AUTO_CAPTURE_BUFFER_SIZE,
+            adaptive_sigma=AUTO_CAPTURE_ADAPTIVE_SIGMA,
+            adaptive_floor=AUTO_CAPTURE_ADAPTIVE_FLOOR,
         )
+        # Hardcoded opt-in for specular-anchored ROI + std-of-|diff|;
+        # remove these kwargs to fall back to full-frame mean-of-|diff|.
         self.auto_capture_engine.set_detector(
-            PixelDiffChangeDetector(buffer_size=AUTO_CAPTURE_BUFFER_SIZE),
+            PixelDiffChangeDetector(
+                buffer_size=AUTO_CAPTURE_BUFFER_SIZE,
+                score_metric="std",
+                roi_mode="specular",
+            ),
         )
         self.auto_capture_engine.frame_captured.connect(
             self._on_auto_capture_event,
@@ -131,8 +155,23 @@ class GrowthApp(QMainWindow):
         self.monitor.auto_capture_pause_toggled.connect(
             self._on_auto_capture_pause_toggled,
         )
-        self.monitor.auto_capture_event_discarded.connect(
-            self._on_auto_capture_event_discarded,
+        self.monitor.auto_capture_decision.connect(
+            self._on_auto_capture_decision,
+        )
+
+        # Events tab listens to frame_captured AFTER GrowthApp's own
+        # handler, so the CSV row is already on disk when the tab re-reads
+        # it. Connection order is the synchronization mechanism — the
+        # engine emits to slots in the order they were connected.
+        self.auto_capture_engine.frame_captured.connect(
+            self.monitor.events_tab.on_frame_captured,
+        )
+        # Events tab also reflects banner Keep/Discard decisions in its
+        # state column + unreviewed badge. Same connection-order reasoning:
+        # GrowthApp's handler (above) writes the CSV first, the tab updates
+        # its UI second using the state arg from the signal payload.
+        self.monitor.auto_capture_decision.connect(
+            self.monitor.events_tab.on_decision_made,
         )
 
     # --- ARM / DISARM ------------------------------------------------------
@@ -216,6 +255,14 @@ class GrowthApp(QMainWindow):
         sample_id = self.monitor.sample_id_input.text().strip() or "unnamed"
         self.growth_log.start_session(sample_id)
 
+        # Point the events tab at this session's logger so backfill
+        # (handles GUI-restart-mid-session), the live append-on-signal,
+        # and labeling reads/writes all flow through the same source.
+        self.monitor.events_tab.attach_session(self.growth_log)
+        # Reset the other two session-scoped tables (Sensor Log + Growth
+        # Notes). Events tab handles its own reset inside attach_session.
+        self.monitor.clear_session_tables()
+
         interval_ms = int(self.monitor.config_interval_spin.value() * 1000)
         self._sensor_log_timer.setInterval(interval_ms)
         self._sensor_log_timer.start()
@@ -234,10 +281,18 @@ class GrowthApp(QMainWindow):
         self._last_v_set = None
         self._last_i_set = None
 
-        # Start heartbeat anchor capture (first fire after HEARTBEAT_INTERVAL_MIN;
-        # we don't fire-on-start to avoid saving a black frame before the
-        # camera has produced anything useful).
+        # Start heartbeat dense-capture (first fire after
+        # HEARTBEAT_INTERVAL_SECONDS; we don't fire-on-start to avoid
+        # saving a black frame before the camera has produced anything
+        # useful).
         self._heartbeat_timer.start()
+        _frames_per_hr = round(3600 / HEARTBEAT_INTERVAL_SECONDS)
+        _est_mb_per_hr = _frames_per_hr * 200 / 1024  # ~200 KB/frame PNG estimate
+        log.info(
+            "Heartbeat: every %.1f s -> ~%d frames/hr "
+            "(~%.0f MB/hr at ~200 KB/frame PNG estimate)",
+            HEARTBEAT_INTERVAL_SECONDS, _frames_per_hr, _est_mb_per_hr,
+        )
 
         self.monitor.set_state("running")
         self.statusBar().showMessage(f"Running \u2014 {sample_id}")
@@ -407,6 +462,13 @@ class GrowthApp(QMainWindow):
             event_idx=self._auto_capture_event_count,
             frames=context_frames,
         )
+        # Empty-buffer events have nothing to review — quality gate rejected
+        # all 20 frames. Mark as auto_skipped at log time so the CSV row
+        # gets a terminal state instead of sitting at pending forever.
+        initial_state = (
+            EVENT_STATE_AUTO_SKIPPED if buffer_count == 0
+            else EVENT_STATE_PENDING
+        )
         self.growth_log.log_auto_capture_event(
             event_idx=self._auto_capture_event_count,
             score=score,
@@ -414,6 +476,7 @@ class GrowthApp(QMainWindow):
             pyro_temp=pyro_temp,
             buffer_count=buffer_count,
             buffer_dir=buffer_dir,
+            event_state=initial_state,
         )
         # Surface the banner so the grower can discard if it looks spurious.
         # Default action (timeout) is to keep — the buffer is already on disk.
@@ -424,28 +487,27 @@ class GrowthApp(QMainWindow):
                 buffer_dir=buffer_dir,
             )
 
-    @pyqtSlot(str)
-    def _on_auto_capture_event_discarded(self, buffer_dir: str):
-        """Grower hit Discard on the banner — delete the buffer directory.
+    @pyqtSlot(int, str, str)
+    def _on_auto_capture_decision(
+        self, event_idx: int, buffer_dir: str, state: str,
+    ):
+        """Route the grower's decision (or default-keep timeout) for an
+        auto-captured event into the CSV.
 
-        The CSV row in auto_capture_events.csv stays as a record that the
-        detector fired (with the original buffer_count); only the visual
-        bytes are removed.
+        Updates the event's row in auto_capture_events.csv to reflect the
+        decision state — one of ``kept_explicit``, ``kept_default``, or
+        ``discarded``. **Non-destructive by design**: the buffer directory
+        is preserved on disk regardless of state, so a "discarded" event
+        can be recovered from the Events tab if the grower changes their
+        mind. Rationale: feedback_aiqm_grower_friction.md (decisions
+        worth making should be recorded; a 10-second decision shouldn't
+        be irreversible).
         """
-        if not buffer_dir or not self.growth_log.session_dir:
-            return
-        target = self.growth_log.session_dir / buffer_dir
-        if not target.is_dir():
-            return
-        import shutil
-        try:
-            shutil.rmtree(target)
+        self.growth_log.update_auto_capture_state(event_idx, state)
+        if state == EVENT_STATE_DISCARDED:
             self.statusBar().showMessage(
-                f"Discarded auto-capture buffer at {buffer_dir}", 3000,
-            )
-        except OSError as e:
-            self.statusBar().showMessage(
-                f"Failed to discard buffer: {e}", 3000,
+                f"Event #{event_idx} marked discarded (buffer preserved at {buffer_dir})",
+                3000,
             )
 
     @pyqtSlot(bool)
