@@ -634,7 +634,11 @@ class GrowthMonitor(QWidget):
         config_form.addRow("MISTRAL mode:", self.config_mistral_mode)
 
         self.config_evap_mode = QComboBox()
-        self.config_evap_mode.addItems(["dummy", "screengrab"])
+        # "elog" — direct-read of EvapControl's own .elo binary log
+        # (drivers/elog.py). No OCR, no window positioning. See
+        # drivers/evap_control.py:ElogReader. Default stays "screengrab"
+        # for backward compatibility until elog has live-lab validation.
+        self.config_evap_mode.addItems(["dummy", "elog", "screengrab"])
         self.config_evap_mode.setCurrentText("screengrab")
         config_form.addRow("Evap Control mode:", self.config_evap_mode)
 

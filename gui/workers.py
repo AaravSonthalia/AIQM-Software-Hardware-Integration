@@ -560,6 +560,9 @@ class EvapControlWorker(QThread):
         if self.mode == "screengrab":
             from drivers.evap_control import EvapControl
             return EvapControl()
+        elif self.mode == "elog":
+            from drivers.evap_control import ElogReader
+            return ElogReader()
         else:
             from drivers.evap_control import DummyEvapControl
             return DummyEvapControl()

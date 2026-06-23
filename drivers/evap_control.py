@@ -6,12 +6,23 @@ monitor. Canvas-drawn, no UIA controls — we screengrab + OCR the
 MBE > Pressure cell (chamber ion gauge, in mbar).
 
 The window must be visible on screen during reads.
+
+Also exposes ``ElogReader`` (added Jun 23 2026) — a direct-read
+alternative that reads MBE.Pressure straight out of EvapControl's
+own ``.elo`` binary log file via ``drivers.elog``. No window
+positioning, no OCR, no tesseract dependency. See ``drivers/elog.py``
+for the format. The screengrab path is kept as a fallback for
+sessions where the .elo file is unreachable.
 """
 
+import logging
 import re
+from pathlib import Path
 from typing import Optional
 
 from drivers.ocr import capture_window, find_window, ocr_crop
+
+log = logging.getLogger(__name__)
 
 
 # Crop for the 'Pressure' label + value in the MBE column, (x, y, w, h).
@@ -129,6 +140,104 @@ class EvapControl:
     @property
     def hwnd(self) -> int:
         return self._hwnd
+
+
+class ElogReader:
+    """Direct-read chamber pressure via EvapControl's own ``.elo`` log.
+
+    Drop-in for ``EvapControl``: same ``connect/read/disconnect`` shape so
+    ``EvapControlWorker`` swaps it in by changing the ``mode`` parameter.
+    Returns the same dict key (``chamber_pressure_mbar``) so downstream
+    fan-out (``EvapControlState.chamber_pressure_mbar`` → ``sensor_log.csv``)
+    is unchanged.
+
+    Path discovery uses ``elog.find_current_log()`` which targets
+    ``C:\\_Omicron_Software\\EvapControl\\evap_control_1.2.0.51\\evap_control_1.2.0.51\\log``.
+    Override via ``log_dir`` if the install path differs.
+
+    Per ``elog_direct_read_may15.md``: ``MBE.Pressure`` is one of 91
+    variables in the .elo schema; many more (substrate manipulator
+    setpoint+PV, all cell temperatures, plasma DC bias, FTM) are
+    available and worth surfacing in a follow-up — for now we ship the
+    smallest viable replacement of the screengrab pressure channel.
+
+    Midnight rotation: ``find_current_log()`` resolves today's filename
+    each call, so a session that spans midnight will pick up the new
+    file on the next ``read()``.
+    """
+
+    DEFAULT_LOG_DIR = (
+        r"C:\_Omicron_Software\EvapControl\evap_control_1.2.0.51"
+        r"\evap_control_1.2.0.51\log"
+    )
+
+    def __init__(
+        self,
+        log_dir: Optional[str] = None,
+        pressure_var: str = "MBE.Pressure",
+    ):
+        self._log_dir = log_dir or self.DEFAULT_LOG_DIR
+        self._pressure_var = pressure_var
+        self._connected = False
+        self._last_log_path: Optional[Path] = None
+
+    def connect(self) -> None:
+        # Resolve once at connect to fail fast — re-resolves at each read
+        # to handle midnight rotation. Failure here means EvapControl
+        # isn't running or the install path differs from default.
+        from drivers.elog import find_current_log
+
+        path = find_current_log(self._log_dir)
+        if path is None:
+            raise RuntimeError(
+                f"No live .elo file found in {self._log_dir}. Is EvapControl "
+                f"running? Today's expected file: "
+                f"log_<YYYY-MM-DD>_000000.elo"
+            )
+        self._last_log_path = path
+        self._connected = True
+        log.info("ElogReader connected: %s", path)
+
+    def read(self) -> dict[str, Optional[float]]:
+        result: dict[str, Optional[float]] = {"chamber_pressure_mbar": None}
+        if not self._connected:
+            return result
+
+        from drivers.elog import find_current_log, latest_value
+
+        # Re-resolve every read so we cleanly handle midnight log rotation
+        # mid-session without needing a reconnect.
+        path = find_current_log(self._log_dir)
+        if path is None:
+            return result
+        self._last_log_path = path
+
+        try:
+            _ts, val = latest_value(path, self._pressure_var)
+        except (KeyError, OSError, ValueError) as exc:
+            log.debug("ElogReader read failed: %s", exc)
+            return result
+
+        # Plausibility filter mirrors EvapControl's PRESSURE_RANGE_MBAR
+        lo, hi = PRESSURE_RANGE_MBAR
+        if not (lo <= val <= hi):
+            return result
+
+        result["chamber_pressure_mbar"] = val
+        return result
+
+    def disconnect(self) -> None:
+        self._last_log_path = None
+        self._connected = False
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    @property
+    def hwnd(self) -> int:
+        # Symmetry with EvapControl/DummyEvapControl; no window for ElogReader.
+        return 0
 
 
 class DummyEvapControl:
