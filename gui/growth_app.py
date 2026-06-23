@@ -74,6 +74,16 @@ HEARTBEAT_INTERVAL_SECONDS = float(
 SET_V_CHANGE_TOLERANCE = 0.05  # volts
 SET_I_CHANGE_TOLERANCE = 0.01  # amps
 
+WORKSPACE_DIR = Path(__file__).resolve().parents[1]
+
+
+def resolve_workspace_folder(folder: str | Path) -> Path:
+    """Resolve relative output folders inside this repository."""
+    path = Path(folder).expanduser()
+    if not path.is_absolute():
+        path = WORKSPACE_DIR / path
+    return path
+
 
 class GrowthApp(QMainWindow):
     """Main window for the OMBE Growth Monitor application."""
@@ -233,7 +243,7 @@ class GrowthApp(QMainWindow):
         save_path = self.monitor.config_save_path.text().strip()
         prefix = self.monitor.config_prefix.text().strip()
         if save_path:
-            self.growth_log._base_dir = Path(save_path)
+            self.growth_log._base_dir = resolve_workspace_folder(save_path)
         if prefix:
             self.growth_log._filename_prefix = prefix
 
