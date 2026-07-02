@@ -3,18 +3,40 @@ RHEED camera drivers — abstract interface + concrete implementations.
 
 Two acquisition modes:
   1. VmbCamera: Direct vmbpy access to Allied Vision Manta G-033B (GigE)
-  2. ScreenGrabCamera: Captures kSA 400 window via screen grab (primary for ML)
+  2. ScreenGrabCamera: Captures kSA 400 window via screen grab (fallback)
 
-The ScreenGrabCamera mode is preferred because Classifier2 was trained on kSA
-false-color screenshots — scraping gives the exact image format the classifier
-expects without needing to discover/apply the kSA LUT.
+Classifier2 does ``.convert('L')`` on every input frame — the model is
+grayscale. Both driver paths therefore aim for a **grayscale-equivalent
+L channel**. VmbCamera achieves this by writing the raw intensity into
+all three RGB channels ``(I, I, I)`` so ``L = 0.299·I + 0.587·I + 0.114·I
+= I``; ScreenGrabCamera does it by capturing kSA's BGW false-color LUT,
+which averages to the same L (see ``docs/ksa_palette_classifier_input.md``
++ ``path_3_grayscale_decoupling_design.md``).
+
+The historical preference for ScreenGrabCamera (Classifier2 trained on
+kSA screenshots) is retained as a fallback path, but VmbCamera is the
+direct-read future — no screengrab UI contamination (see Jun 15 test
+where a kSA tooltip appeared inside a captured RHEED frame).
 """
 
+import logging
 import threading
 from abc import ABC, abstractmethod
 from typing import Optional
 
 import numpy as np
+
+log = logging.getLogger(__name__)
+
+
+class FrameNotYetAvailableError(RuntimeError):
+    """The driver is connected and streaming but has not yet produced a frame.
+
+    Distinct from "camera not connected" (which is a real failure) and from
+    other RuntimeErrors surfaced by the underlying SDK. RheedCameraWorker
+    should treat this as a transient — no frame produced yet, retry on next
+    poll — rather than as a driver fault worth surfacing to the grower.
+    """
 
 
 class RheedCamera(ABC):
@@ -56,6 +78,26 @@ class VmbCamera(RheedCamera):
     so the poll-based ``RheedCameraWorker`` consumes this driver unchanged.
     """
 
+    # Time to wait in connect() for the streaming thread to become ready
+    # (or fail). 10s is generous — Manta G-033B on Bulbasaur typically
+    # completes VmbSystem + camera open + start_streaming in <2s. Tunable
+    # if a slower camera shows up.
+    CONNECT_TIMEOUT_S = 10.0
+
+    # Time to wait in disconnect() for the streaming thread to exit.
+    # 5s covers the worst case where TriggerSoftware.run() is mid-call.
+    DISCONNECT_TIMEOUT_S = 5.0
+
+    # Consecutive trigger/frame failures before the stream loop backs off
+    # to a slower retry cadence. Prevents busy-looping at trigger_hz when
+    # the camera has silently gone offline.
+    MAX_CONSECUTIVE_TRIGGER_FAILS = 5
+
+    # Backoff wait after MAX_CONSECUTIVE_TRIGGER_FAILS raises — enough
+    # to let a transient recover (network hiccup, kSA cycling the port)
+    # without spinning the CPU.
+    TRIGGER_BACKOFF_S = 2.0
+
     def __init__(
         self,
         camera_index: int = 0,
@@ -83,8 +125,16 @@ class VmbCamera(RheedCamera):
         self._ready_event = threading.Event()
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
-        self._connect_error: Optional[Exception] = None
-        self._last_error: str = ""
+        # Any exception that terminated the stream thread. Populated by
+        # _stream_loop's ``except`` block, read by ``read_frame`` so
+        # mid-session stream death surfaces to the caller with its real
+        # cause instead of a bare "Camera not connected."
+        self._stream_error: Optional[Exception] = None
+        # Guards writes to _stream_error, _last_frame_error, and reads
+        # of the same by external threads. Independent of _frame_lock so
+        # the SDK callback doesn't wait on read_frame.
+        self._error_lock = threading.Lock()
+        self._last_frame_error: Optional[str] = None
 
     def connect(self) -> None:
         # Fail fast with a clear message if the SDK is missing, before
@@ -101,7 +151,9 @@ class VmbCamera(RheedCamera):
         # disconnect must not observe stale event state.
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
-        self._connect_error = None
+        with self._error_lock:
+            self._stream_error = None
+            self._last_frame_error = None
         with self._frame_lock:
             self._latest_frame = None
 
@@ -112,15 +164,21 @@ class VmbCamera(RheedCamera):
 
         # Block until the thread is streaming, has reported a setup failure,
         # or hangs past the timeout.
-        if not self._ready_event.wait(timeout=10.0):
+        if not self._ready_event.wait(timeout=self.CONNECT_TIMEOUT_S):
             self._stop_event.set()
             raise RuntimeError(
-                "Vimba camera connect timed out — no response from the "
-                "streaming thread within 10 s."
+                f"Vimba camera connect timed out — no response from the "
+                f"streaming thread within {self.CONNECT_TIMEOUT_S:.0f} s."
             )
-        if self._connect_error is not None:
-            raise self._connect_error
+        with self._error_lock:
+            setup_error = self._stream_error
+        if setup_error is not None:
+            raise setup_error
         self._connected = True
+        log.info(
+            "VmbCamera connected: camera_index=%d, trigger_hz=%.2f, bit_depth=%d",
+            self._camera_index, self._trigger_hz, self._bit_depth,
+        )
 
     def _stream_loop(self) -> None:
         """Background thread — owns every vmbpy call for one connect cycle.
@@ -131,6 +189,10 @@ class VmbCamera(RheedCamera):
         thread respects the SDK's thread affinity; the ``with`` blocks
         release the camera even on error, so kSA — or a reconnect — can
         re-acquire it.
+
+        Trigger failures don't kill the loop — a bounded consecutive-fail
+        counter forces a short backoff so a transient (network hiccup,
+        kSA cycling the port) has room to recover without spinning the CPU.
         """
         try:
             from vmbpy import VmbSystem
@@ -154,15 +216,39 @@ class VmbCamera(RheedCamera):
                         # connect() unblocks here — the pipeline is live.
                         self._ready_event.set()
                         period = 1.0 / self._trigger_hz
+                        consecutive_trigger_fails = 0
                         while not self._stop_event.is_set():
-                            cam.TriggerSoftware.run()
+                            try:
+                                cam.TriggerSoftware.run()
+                                consecutive_trigger_fails = 0
+                            except Exception as exc:  # noqa: BLE001
+                                consecutive_trigger_fails += 1
+                                with self._error_lock:
+                                    self._last_frame_error = (
+                                        f"TriggerSoftware.run: {exc}"
+                                    )
+                                if (
+                                    consecutive_trigger_fails
+                                    >= self.MAX_CONSECUTIVE_TRIGGER_FAILS
+                                ):
+                                    log.warning(
+                                        "VmbCamera: %d consecutive trigger fails; "
+                                        "backing off %.1fs before retry",
+                                        consecutive_trigger_fails,
+                                        self.TRIGGER_BACKOFF_S,
+                                    )
+                                    self._stop_event.wait(self.TRIGGER_BACKOFF_S)
+                                    consecutive_trigger_fails = 0
+                                    continue
                             # Interruptible pacing — disconnect() wakes this
                             # at once instead of after a full period.
                             self._stop_event.wait(period)
                     finally:
                         cam.stop_streaming()
         except Exception as exc:
-            self._connect_error = exc
+            with self._error_lock:
+                self._stream_error = exc
+            log.error("VmbCamera stream loop exited on error: %s", exc)
         finally:
             self._connected = False
             # Unblock connect() even if setup failed before the set() above.
@@ -187,8 +273,12 @@ class VmbCamera(RheedCamera):
             rgb = self._to_rgb_uint8(img)
             with self._frame_lock:
                 self._latest_frame = rgb
-        except Exception as exc:
-            self._last_error = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            # Record but don't kill the stream — one bad frame shouldn't
+            # take down the whole session. Guarded by _error_lock so
+            # concurrent reads from read_frame see a consistent value.
+            with self._error_lock:
+                self._last_frame_error = f"frame handler: {exc}"
 
     def _to_rgb_uint8(self, img: np.ndarray) -> np.ndarray:
         """Map a raw camera frame to the GUI's RGB-uint8 (H, W, 3) contract.
@@ -197,37 +287,67 @@ class VmbCamera(RheedCamera):
         per-frame max-normalization would drift the scale between frames
         with identical raw pixels but different peak intensity, injecting
         synthetic change scores into the std-of-|diff| detector.
+
+        **Monochrome mapping**: the raw intensity is written into ALL THREE
+        RGB channels so ``L = 0.299·R + 0.587·G + 0.114·B = intensity``.
+        Historically this driver wrote the intensity only into the green
+        channel, which capped Classifier2's L input at 150 instead of 255
+        (Classifier2 does .convert('L') internally — the model is grayscale).
+        See ``docs/ksa_palette_classifier_input.md`` (May 22 2026).
         """
         if img.dtype != np.uint8:
             img = (
                 img.astype(np.float32) / self._max_value * 255.0
             ).clip(0, 255).astype(np.uint8)
-        # Monochrome intensity → green channel (existing GUI convention).
         if img.ndim == 2:
-            rgb = np.zeros((*img.shape, 3), dtype=np.uint8)
-            rgb[:, :, 1] = img
-            return rgb
+            # (I, I, I) — matches ScreenGrabCamera's BGW-averaged L values.
+            return np.stack([img, img, img], axis=-1)
         return img
 
     def read_frame(self) -> np.ndarray:
         """Return the most recent streamed frame as RGB uint8 (H, W, 3).
 
         Non-blocking — returns whatever the streaming thread captured last.
-        Raises if no frame has arrived yet; RheedCameraWorker treats that as
-        a transient error and retries on its next poll.
+
+        Raises:
+            RuntimeError: the stream thread died with an underlying cause
+                (surfaced from _stream_error), OR the driver was never
+                connected. The error message names the real cause so the
+                worker's state.error carries useful information.
+            FrameNotYetAvailableError: the driver is connected and streaming
+                but no frame has arrived yet. Worker should treat as transient
+                and retry on next poll rather than surfacing to the grower.
         """
+        # Surface a stream-thread crash first — if _stream_error is set,
+        # _connected has already been flipped to False by _stream_loop's
+        # finally block, so checking this before the connected guard means
+        # the caller sees "why the camera stopped," not just "not connected."
+        with self._error_lock:
+            stream_err = self._stream_error
+        if stream_err is not None:
+            raise RuntimeError(f"Vimba stream terminated: {stream_err}") from stream_err
+
         if not self._connected:
             raise RuntimeError("Camera not connected.")
         with self._frame_lock:
-            if self._latest_frame is None:
-                raise RuntimeError("No frame available yet.")
-            return self._latest_frame.copy()
+            latest = self._latest_frame
+        if latest is None:
+            raise FrameNotYetAvailableError(
+                "Vimba camera is streaming but no frame has arrived yet — "
+                "expected within one trigger period after connect."
+            )
+        return latest.copy()
 
     def disconnect(self) -> None:
         self._connected = False
         self._stop_event.set()
         if self._stream_thread is not None:
-            self._stream_thread.join(timeout=5.0)
+            self._stream_thread.join(timeout=self.DISCONNECT_TIMEOUT_S)
+            if self._stream_thread.is_alive():
+                log.warning(
+                    "VmbCamera stream thread did not exit within %.1fs; "
+                    "leaking as daemon.", self.DISCONNECT_TIMEOUT_S,
+                )
             self._stream_thread = None
         with self._frame_lock:
             self._latest_frame = None
