@@ -649,7 +649,14 @@ class GrowthMonitor(QWidget):
         config_form.addRow("Exactus baud:", self.config_exactus_baud)
 
         self.config_mistral_mode = QComboBox()
-        self.config_mistral_mode.addItems(["dummy", "screengrab"])
+        # "jsonrpc" — direct-read of the Scandes JSON-RPC 2.0 backend at
+        # http://10.0.42.231:9000/api (discovered Jun 23 2026). Multi-client
+        # safe alongside a running MistralGui. See drivers/mistral_jsonrpc.py
+        # and scripts/test_mistral_jsonrpc_discovery.py. Selecting this mode
+        # before running the discovery probe on Bulbasaur produces a
+        # connected driver with all-None V/I readings (read_config empty)
+        # — no crashes, just no data until set_read_config populates methods.
+        self.config_mistral_mode.addItems(["dummy", "screengrab", "jsonrpc"])
         self.config_mistral_mode.setCurrentText("screengrab")
         config_form.addRow("MISTRAL mode:", self.config_mistral_mode)
 
