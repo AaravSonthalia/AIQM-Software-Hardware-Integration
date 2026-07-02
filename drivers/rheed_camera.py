@@ -361,32 +361,52 @@ class ScreenGrabCamera(RheedCamera):
     """
     Captures frames from the kSA 400 window via screen grab.
 
-    This is the primary acquisition mode for ML classification because
-    Classifier2 was trained on kSA colored screenshots (false-color LUT).
+    Historically the primary path for ML classification because Classifier2
+    was trained on kSA false-color screenshots. Now serves as a fallback
+    while ``VmbCamera`` (direct-read) is being lab-validated — see
+    ``docs/path_a_vimba_integration_plan.md`` and the ``(I, I, I)`` palette
+    fix that makes both paths produce equivalent L-channel input to the
+    classifier.
 
-    On the MBE PC: uses win32gui/mss to capture the window directly.
-    Over remote desktop: uses OpenCV to grab from a VNC/RDP session.
+    Two capture paths, selected by ``sys.platform``:
 
-    Falls back to full-screen capture with window title search.
+    * **win32** (Bulbasaur): finds the kSA Live Video window HWND via
+      ``ctypes.windll.user32``, grabs its rectangle with ``mss``, and
+      returns just that region. If no Live Video window is found, raises
+      RuntimeError rather than silently falling back to the main kSA
+      frame (which would feed the classifier the whole kSA UI).
+    * **cross-platform** (Mac dev / VNC): grabs the entire primary
+      monitor. Emits a one-shot warning so the grower knows this is
+      fallback behavior, not the intended production path.
+
+    Chrome cropping removes the kSA title bar / menu / toolbar (above)
+    and status bar (below) so the classifier sees only the RHEED image
+    region.
 
     Parameters
     ----------
     window_title : str
         Substring to search for in window titles (default "Live Video").
+        Matches either the detached top-level Live Video window or the
+        MDI child pane inside the kSA 400 main frame.
     crop_chrome : bool
-        If True, crop kSA window chrome (title bar + menu + toolbar above,
-        status bar below) from the captured frame so the detector only
-        sees the actual RHEED image area. Default True.
+        If True, crop kSA window chrome (title bar + menu + toolbar
+        above, status bar below) so the classifier sees only the RHEED
+        image area. Default True.
     chrome_top_px : int
-        Pixels to crop from the top. Default 75 — measured from the
-        kSA 400 - AVT Manta_G live-video window screenshot 2026-04-25
-        (title=29 + menu=22 + toolbar=24 = 75; covers all chrome above
-        the image content). Set crop_chrome=False if the value drifts
-        on Bulbasaur (different DPI / theme).
+        Pixels to crop from the top. Default 75 — measured 2026-04-25
+        (title=29 + menu=22 + toolbar=24 = 75). Verify with
+        :meth:`visualize_crop` on Bulbasaur if the value drifts under
+        different DPI / theme.
     chrome_bottom_px : int
-        Pixels to crop from the bottom. Default 30 — covers the kSA
-        status bar ("Exposure: ... NUM") plus the bottom window border.
+        Pixels to crop from the bottom. Default 30 — kSA status bar
+        ("Exposure: ... NUM") plus bottom window border.
     """
+
+    # Consecutive read_frame failures before we mark disconnected so the
+    # worker's reconnect path can trigger. Symmetric with ExactusSerialPyrometer
+    # and VmbCamera — the entire driver fleet uses the same convention.
+    MAX_CONSECUTIVE_FAILS = 5
 
     def __init__(
         self,
@@ -401,6 +421,11 @@ class ScreenGrabCamera(RheedCamera):
         self._crop_chrome = crop_chrome
         self._chrome_top_px = chrome_top_px
         self._chrome_bottom_px = chrome_bottom_px
+        self._consecutive_fails = 0
+        # One-shot warning gate for the cross-platform (whole-monitor) grab.
+        # Set on first invocation so we log only once per session — repeat
+        # logging at 1Hz would drown the log.
+        self._warned_cross_platform = False
 
     @staticmethod
     def _find_live_video_window(search_term: str = "Live Video") -> int:
@@ -473,44 +498,81 @@ class ScreenGrabCamera(RheedCamera):
         if child_hwnd.value:
             return int(child_hwnd.value)
 
-        # Priority 3: fallback to main window
-        return int(main_hwnd.value)
+        # No Live Video pane found — do NOT silently fall back to the
+        # main kSA window. That path would capture the entire kSA UI
+        # (menus, toolbars, MDI panes) and feed it to the classifier,
+        # which would still return a label — silently wrong. Better to
+        # return 0 and let the caller surface the real failure.
+        log.warning(
+            "ScreenGrabCamera: found kSA main window but no Live Video "
+            "child/detached pane. Ensure kSA 400's Live Video window is "
+            "open (View menu). Refusing to fall back to the main frame."
+        )
+        return 0
 
     def connect(self) -> None:
-        # Try platform-specific window capture
-        import sys
+        """Verify screen-capture dependencies are importable and mark connected.
 
-        if sys.platform == "win32":
-            self._setup_win32()
-        else:
-            self._setup_cross_platform()
-
+        The two capture paths (win32 vs cross-platform) share the same
+        dependency (``mss``); the historical platform split at ``connect()``
+        time was dead differentiation. The legitimate platform dispatch
+        lives in ``read_frame()`` where the paths actually differ.
+        """
+        self._setup()
         self._connected = True
+        self._consecutive_fails = 0
+        log.info(
+            "ScreenGrabCamera connected: window='%s', capture=%s, "
+            "crop_chrome=%s (top=%d, bottom=%d)",
+            self._window_title, self._capture_method,
+            self._crop_chrome, self._chrome_top_px, self._chrome_bottom_px,
+        )
 
-    def _setup_win32(self) -> None:
-        """Set up win32-based window capture (runs on MBE PC)."""
+    def _setup(self) -> None:
+        """Import mss (raise if missing) and record the capture method."""
         try:
             import mss  # noqa: F401
-            self._capture_method = "mss"
-        except ImportError:
-            raise ImportError("mss required for screen capture: pip install mss")
-
-    def _setup_cross_platform(self) -> None:
-        """Set up cross-platform capture (e.g., over VNC from Mac)."""
-        try:
-            import mss  # noqa: F401
-            self._capture_method = "mss"
-        except ImportError:
-            raise ImportError("mss required for screen capture: pip install mss")
+        except ImportError as exc:
+            raise ImportError(
+                "mss required for screen capture: pip install mss"
+            ) from exc
+        self._capture_method = "mss"
 
     def read_frame(self) -> np.ndarray:
         if not self._connected:
-            raise RuntimeError("Screen grab not connected.")
+            raise RuntimeError("ScreenGrabCamera not connected.")
 
         import sys
 
-        frame = self._grab_win32() if sys.platform == "win32" else self._grab_cross_platform()
-        return self._crop_chrome_pixels(frame)
+        try:
+            if sys.platform == "win32":
+                frame = self._grab_win32()
+            else:
+                frame = self._grab_cross_platform()
+            cropped = self._crop_chrome_pixels(frame)
+        except RuntimeError:
+            self._register_failure()
+            raise
+        self._consecutive_fails = 0
+        return cropped
+
+    def _register_failure(self) -> None:
+        """Track consecutive failures — mark disconnected past the threshold.
+
+        Symmetric with ExactusSerialPyrometer and VmbCamera: after
+        MAX_CONSECUTIVE_FAILS raises in a row, flip ``_connected`` to
+        False so the worker's reconnect path can trigger (e.g., grower
+        reopened the kSA Live Video window and we should re-verify).
+        """
+        self._consecutive_fails += 1
+        if self._consecutive_fails >= self.MAX_CONSECUTIVE_FAILS:
+            log.warning(
+                "ScreenGrabCamera: %d consecutive frame failures; marking "
+                "disconnected so the worker can retry connect. Typical "
+                "cause: kSA Live Video window closed or minimized.",
+                self._consecutive_fails,
+            )
+            self._connected = False
 
     def _crop_chrome_pixels(self, frame: np.ndarray) -> np.ndarray:
         """Crop title/menu/toolbar above and status bar below the RHEED image.
@@ -529,20 +591,21 @@ class ScreenGrabCamera(RheedCamera):
         return frame[top:bottom, :]
 
     def _grab_win32(self) -> np.ndarray:
-        """Capture kSA window on Windows using win32gui + mss."""
+        """Capture kSA Live Video window on Windows using win32 + mss."""
         import ctypes
         import ctypes.wintypes
         import mss
 
-        # Find the Live Video child window inside kSA 400's MDI frame.
+        # Find the Live Video window (detached top-level or MDI child).
+        # If _find_live_video_window returns 0, raise cleanly rather than
+        # silently falling back to the main kSA frame.
         hwnd = self._find_live_video_window(self._window_title)
         if not hwnd:
             raise RuntimeError(
-                "kSA 400 not found. Check that kSA 400 is running "
-                "with the Live Video window open."
+                "kSA Live Video window not found. Open View → Live Video "
+                "in kSA 400, then rearm the session."
             )
 
-        # Get window rectangle
         rect = ctypes.wintypes.RECT()
         ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
 
@@ -555,22 +618,93 @@ class ScreenGrabCamera(RheedCamera):
 
         with mss.mss() as sct:
             screenshot = sct.grab(monitor)
-            img = np.array(screenshot)[:, :, :3]  # Drop alpha, keep BGR
-            return img[:, :, ::-1]  # BGR -> RGB
+        return self._bgra_to_rgb(np.array(screenshot))
 
     def _grab_cross_platform(self) -> np.ndarray:
-        """Capture via mss full-screen (for remote desktop scenarios)."""
+        """Capture whole primary monitor via mss — fallback for dev sessions.
+
+        This path returns the ENTIRE primary display, not just the kSA
+        window (no ctypes.windll access outside Windows). Fine for Mac-
+        side GUI development, wrong for production data collection.
+        The one-shot warning at first call keeps the log signal-to-noise
+        high — repeat spam at 1Hz would drown other messages.
+        """
         import mss
 
+        if not self._warned_cross_platform:
+            self._warned_cross_platform = True
+            log.warning(
+                "ScreenGrabCamera cross-platform grab is capturing the "
+                "ENTIRE primary monitor. This is dev-only fallback — for "
+                "production data collection, run on Bulbasaur with the "
+                "win32 path so we crop to the kSA window."
+            )
+
         with mss.mss() as sct:
-            # Grab primary monitor
-            monitor = sct.monitors[1]
+            monitor = sct.monitors[1]  # index 1 = primary display
             screenshot = sct.grab(monitor)
-            img = np.array(screenshot)[:, :, :3]
-            return img[:, :, ::-1]  # BGR -> RGB
+        return self._bgra_to_rgb(np.array(screenshot))
+
+    @staticmethod
+    def _bgra_to_rgb(bgra: np.ndarray) -> np.ndarray:
+        """Convert an mss BGRA screenshot array to RGB uint8 (H, W, 3).
+
+        mss returns BGRA; the GUI's contract is RGB. Drops the alpha
+        channel and reverses the color axis in one pass.
+        """
+        return bgra[:, :, :3][:, :, ::-1]
+
+    def get_info(self) -> dict:
+        """Return static config summary for state.device_info / debug logs."""
+        import sys
+        return {
+            "name": "ScreenGrabCamera",
+            "platform": sys.platform,
+            "capture_method": self._capture_method or "not_connected",
+            "window_title": self._window_title,
+            "crop_chrome": self._crop_chrome,
+            "chrome_top_px": self._chrome_top_px,
+            "chrome_bottom_px": self._chrome_bottom_px,
+        }
+
+    def visualize_crop(self, frame: np.ndarray) -> np.ndarray:
+        """Overlay the crop boundaries on a captured frame for calibration QA.
+
+        The default ``chrome_top_px=75`` / ``chrome_bottom_px=30`` were
+        measured on a specific kSA screenshot (2026-04-25). If Bulbasaur's
+        DPI or theme changes, the crop can silently mis-align — call this
+        method on a fresh grab to visually verify the crop still targets
+        the correct kSA image region.
+
+        Returns a copy of ``frame`` with two horizontal green lines drawn
+        at the crop boundaries and a small text label. Save with PIL for
+        visual review::
+
+            from PIL import Image
+            cam = ScreenGrabCamera()
+            cam.connect()
+            raw = cam._grab_win32()  # pre-crop
+            annotated = cam.visualize_crop(raw)
+            Image.fromarray(annotated).save("crop_qa.png")
+        """
+        vis = frame.copy()
+        h = vis.shape[0]
+        top = max(0, min(self._chrome_top_px, h - 1))
+        bottom_offset = max(0, min(self._chrome_bottom_px, h - 1))
+        bottom = h - bottom_offset
+        # Green horizontal lines — 2 px thick for visibility on 12-bit data.
+        vis[top : top + 2, :, 0] = 0
+        vis[top : top + 2, :, 1] = 255
+        vis[top : top + 2, :, 2] = 0
+        vis[bottom - 2 : bottom, :, 0] = 0
+        vis[bottom - 2 : bottom, :, 1] = 255
+        vis[bottom - 2 : bottom, :, 2] = 0
+        return vis
 
     def disconnect(self) -> None:
         self._connected = False
+        self._consecutive_fails = 0
+        self._warned_cross_platform = False
 
     @property
     def connected(self) -> bool:
