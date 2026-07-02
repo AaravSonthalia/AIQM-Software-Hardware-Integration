@@ -9,10 +9,13 @@ Two modes:
   2. ScreenGrabPyrometer: pywinauto scrape of TemperaSure GUI window
 """
 
+import logging
 import struct
 from typing import Optional
 
 from heater_control import TemperatureSensor
+
+log = logging.getLogger(__name__)
 
 
 # ─── Modbus register map (from Exactus manual) ───
@@ -370,64 +373,169 @@ class ScreenGrabPyrometer(TemperatureSensor):
 
 class ExactusSerialPyrometer(TemperatureSensor):
     """
-    BASF Exactus optical thermometer — binary serial protocol.
+    BASF Exactus optical thermometer — binary streaming serial protocol.
 
-    Each packet is 5 bytes:
-      [0x81, B0, B1, B2, B3]
-    where B0..B3 is an IEEE 754 big-endian float32 (temperature in °C).
+    Packet format (as of this driver's understanding; **source unverified**
+    against the BASF Exactus manual — ask Aarav Sonthalia, who added this
+    class in the Jun 22 cherry-pick, for the authoritative reference):
 
-    The reader syncs to the 0x81 header byte, then reads the 4-byte body.
-    Call from a background thread; read_temperature() blocks until one
-    valid packet arrives or the serial timeout fires.
+        [0x81, B0, B1, B2, B3]      — 5 bytes per sample
+         │     └───────────────────── IEEE 754 float32 (temperature, °C)
+         └────────────────────────── header / sync byte
+
+    Endianness is ``>f`` (big-endian) by default; switch ``FLOAT_STRUCT``
+    if the device is little-endian.
+
+    Sits alongside :class:`ModbusPyrometer` (RTU) and :class:`ScreenGrabPyrometer`
+    (pywinauto). All three currently default to ``port="COM4"`` and only
+    one can hold the port at a time — TemperaSure in particular takes it
+    exclusively (see ``docs/ksa400_manual_findings.md``).
+
+    Read flow: ``read_temperature()`` syncs to the ``0x81`` header, reads
+    the 4-byte float body, validates against the plausibility range, and
+    returns °C. Call from a background thread; each read blocks until one
+    packet arrives or the serial timeout fires. Consecutive failures
+    (:attr:`_MAX_CONSECUTIVE_FAILS`) mark the driver disconnected so the
+    worker's reconnect path can trigger.
     """
 
+    # Packet framing constants — modify if the manual reveals a different shape.
     HEADER = 0x81
     BODY_LEN = 4
+    FLOAT_STRUCT = ">f"  # ">f" = big-endian; "<f" = little-endian
+
+    # Plausibility bounds — matches ModbusPyrometer._detect_word_order.
+    # Anything outside this range is treated as a mis-framed packet
+    # (sync happened on 0x81 that was actually a data byte).
+    TEMP_MIN_C = -100.0
+    TEMP_MAX_C = 3000.0
+
+    # Bounded header-sync loop — if we can't find 0x81 within this many
+    # bytes, something's wrong (wrong baud, wrong device, wrong port).
+    # At ~50 bytes/s worst case per byte-timeout, this is <10s of hunting.
+    MAX_SYNC_BYTES = 256
+
+    # Consecutive read failures before marking self disconnected. The
+    # worker sees connected=False and can trigger a reconnect. Cheap
+    # detection of USB drop / device reset / TemperaSure grabbing the port.
+    MAX_CONSECUTIVE_FAILS = 5
 
     def __init__(
         self,
         port: str = "COM4",
         baudrate: int = 115200,
         timeout: float = 2.0,
+        parity: str = "N",
+        stopbits: int = 1,
+        bytesize: int = 8,
     ):
+        # Framing params mirror ModbusPyrometer defaults. Serial's own
+        # defaults have historically shifted — pin them explicitly here
+        # so the wire format is reproducible independent of pyserial
+        # version.
         self._port = port
         self._baudrate = baudrate
         self._timeout = timeout
+        self._parity = parity
+        self._stopbits = stopbits
+        self._bytesize = bytesize
         self._serial = None
         self._connected = False
+        self._consecutive_fails = 0
 
     def connect(self) -> None:
         try:
             import serial
-        except ImportError:
-            raise ImportError("pyserial not installed: pip install pyserial")
+        except ImportError as exc:
+            raise ImportError(
+                "pyserial not installed: pip install pyserial"
+            ) from exc
 
-        import serial as _serial
-
-        self._serial = _serial.Serial(
+        # pyserial's ``Serial(port=..., ...)`` opens the port at
+        # construction time when ``port`` is truthy — no separate
+        # ``open()`` call is needed. Keep this call short and rely on
+        # constructor semantics; an explicit ``is_open`` re-check would
+        # be dead code.
+        self._serial = serial.Serial(
             port=self._port,
             baudrate=self._baudrate,
+            parity=self._parity,
+            stopbits=self._stopbits,
+            bytesize=self._bytesize,
             timeout=self._timeout,
         )
-        if not self._serial.is_open:
-            self._serial.open()
+        # Discard any partial/stale bytes sitting in the OS buffer from
+        # before we opened — otherwise the first ``read_temperature()``
+        # may sync on a ``0x81`` that's the middle of a stale packet.
+        self._serial.reset_input_buffer()
+
         self._connected = True
+        self._consecutive_fails = 0
+        log.info(
+            "ExactusSerialPyrometer connected: %s @ %d 8%s%d",
+            self._port, self._baudrate, self._parity, self._stopbits,
+        )
 
     def disconnect(self) -> None:
         if self._serial is not None:
             try:
                 self._serial.close()
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 — pyserial close can raise many types
+                log.debug("ExactusSerialPyrometer close raised; ignoring", exc_info=True)
             self._serial = None
         self._connected = False
+        self._consecutive_fails = 0
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    def get_info(self) -> dict:
+        """Static device-config summary for state.device_info.
+
+        Binary streaming doesn't expose a runtime identity read (unlike
+        Modbus RTU's REG_NAME0/REG_SN0), so this returns the connection
+        parameters so the GUI shows *something* in place of the literal
+        mode string.
+        """
+        return {
+            "name": "BASF Exactus (binary streaming)",
+            "port": self._port,
+            "baud": self._baudrate,
+            "framing": f"8{self._parity}{self._stopbits}",
+        }
 
     def read_temperature(self) -> float:
-        """Block until one complete Exactus packet is received, return °C."""
+        """Block until one complete Exactus packet is received, return °C.
+
+        Raises:
+            RuntimeError: not connected, sync timeout, short packet,
+                or the parsed float lies outside ``[TEMP_MIN_C, TEMP_MAX_C]``.
+                On the ``MAX_CONSECUTIVE_FAILS``-th consecutive raise,
+                the driver additionally flips ``self._connected`` to False
+                so the worker's reconnect path can trigger.
+        """
         if not self._connected or self._serial is None:
             raise RuntimeError("ExactusSerialPyrometer not connected.")
 
-        # Sync to header byte — discard any partial/stale bytes
+        try:
+            temp_c = self._read_one_packet()
+        except RuntimeError:
+            self._register_failure()
+            raise
+        self._consecutive_fails = 0
+        return temp_c
+
+    # -- Internals ---------------------------------------------------------
+
+    def _read_one_packet(self) -> float:
+        """Sync to header, read body, unpack + validate. Raises on failure."""
+        # Bounded header-sync loop. Each read(1) call is bounded by
+        # ``self._timeout`` at the pyserial layer; we additionally cap the
+        # number of bytes we're willing to hunt through so a wrong-baud
+        # stream fails fast rather than churning until the loop naturally
+        # exits on an empty read.
+        bytes_hunted = 0
         while True:
             b = self._serial.read(1)
             if not b:
@@ -436,6 +544,12 @@ class ExactusSerialPyrometer(TemperatureSensor):
                 )
             if b[0] == self.HEADER:
                 break
+            bytes_hunted += 1
+            if bytes_hunted >= self.MAX_SYNC_BYTES:
+                raise RuntimeError(
+                    f"No Exactus 0x81 header in {self.MAX_SYNC_BYTES} bytes — "
+                    f"check baud rate ({self._baudrate}) and port ({self._port})."
+                )
 
         body = self._serial.read(self.BODY_LEN)
         if len(body) < self.BODY_LEN:
@@ -444,7 +558,26 @@ class ExactusSerialPyrometer(TemperatureSensor):
                 f"got {len(body)}."
             )
 
-        return struct.unpack(">f", body)[0]
+        temp_c = struct.unpack(self.FLOAT_STRUCT, body)[0]
+        if not (self.TEMP_MIN_C < temp_c < self.TEMP_MAX_C):
+            raise RuntimeError(
+                f"Exactus implausible temperature {temp_c!r} °C "
+                f"(outside [{self.TEMP_MIN_C}, {self.TEMP_MAX_C}] °C) — "
+                f"likely mis-framed packet or wrong endianness "
+                f"(FLOAT_STRUCT={self.FLOAT_STRUCT!r})."
+            )
+        return float(temp_c)
+
+    def _register_failure(self) -> None:
+        """Increment fail counter and mark disconnected past the threshold."""
+        self._consecutive_fails += 1
+        if self._consecutive_fails >= self.MAX_CONSECUTIVE_FAILS:
+            log.warning(
+                "ExactusSerialPyrometer: %d consecutive read failures; "
+                "marking disconnected so worker reconnect can trigger.",
+                self._consecutive_fails,
+            )
+            self._connected = False
 
 
 class DummyPyrometer(TemperatureSensor):
