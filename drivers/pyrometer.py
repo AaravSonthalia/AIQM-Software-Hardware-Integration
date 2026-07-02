@@ -52,9 +52,30 @@ class ModbusPyrometer(TemperatureSensor):
     """
     Direct Modbus RTU interface to BASF Exactus pyrometer via IFD-5 (RS-422).
 
-    Ported from the existing pyrometer_script.py with pymodbus compatibility
-    wrappers for different API versions.
+    Ported from the existing pyrometer_script.py (Jacques Attinger, Yang
+    Research Group) with pymodbus compatibility wrappers for different API
+    versions. This is the *proven* pyrometer direct-read path — Jacques's
+    script works against real Bulbasaur hardware; the class here mirrors
+    that behavior with class-level constants for the two plausibility
+    ranges (temperature + set_rate) so callers can tune per deployment.
+
+    Reads: ``read_temperature`` / ``read_current`` / ``read_ambient`` all
+    validate the returned float against ``TEMP_MIN_C..TEMP_MAX_C`` before
+    returning. Values outside the range raise RuntimeError — matches
+    ``ExactusSerialPyrometer`` semantics so both pyrometer paths behave
+    identically for the worker's error-handling logic.
     """
+
+    # Plausibility bounds — Jacques's pyrometer_script.py plausible_temp
+    # at line 117: ``def plausible_temp(x): return -100.0 < x < 3000.0``.
+    TEMP_MIN_C = -100.0
+    TEMP_MAX_C = 3000.0
+
+    # Valid sample-rate range for ``set_rate``. Jacques's script at
+    # line 168 uses [1, 1000] Hz with the caveat "adjust if your device
+    # supports more". Keep symmetric.
+    RATE_MIN_HZ = 1
+    RATE_MAX_HZ = 1000
 
     def __init__(
         self,
@@ -80,10 +101,10 @@ class ModbusPyrometer(TemperatureSensor):
     def connect(self) -> None:
         try:
             from pymodbus.client import ModbusSerialClient
-        except ImportError:
+        except ImportError as exc:
             raise ImportError(
                 "pymodbus not installed: pip install pymodbus pyserial"
-            )
+            ) from exc
 
         self._client = ModbusSerialClient(
             port=self._port,
@@ -102,43 +123,89 @@ class ModbusPyrometer(TemperatureSensor):
         # Auto-detect word order
         self._detect_word_order()
         self._connected = True
+        log.info(
+            "ModbusPyrometer connected: %s @ %d 8%s%d id=%d word_swap=%s",
+            self._port, self._baudrate, self._parity, self._stopbits,
+            self._device_id, self._word_swap,
+        )
 
     def _detect_word_order(self) -> None:
-        """Read temperature and flip word order if result is implausible."""
+        """Read temperature and flip word order if result is implausible.
+
+        If both word orders return implausible values, the flag stays False
+        (constructor default) and the first real ``read_temperature`` call
+        will raise a proper plausibility RuntimeError with the real number
+        so the caller can see what's wrong.
+        """
         try:
             t = self._read_f32(REG_CH1_TEMP, word_swap=False)
-            if not (-100.0 < t < 3000.0):
-                t = self._read_f32(REG_CH1_TEMP, word_swap=True)
-                if -100.0 < t < 3000.0:
-                    self._word_swap = True
-        except Exception:
-            pass  # Will fail properly on first real read
+        except Exception as exc:  # noqa: BLE001 — pymodbus can raise many types
+            log.debug("ModbusPyrometer word-order detect failed: %s", exc)
+            return
+        if self.TEMP_MIN_C < t < self.TEMP_MAX_C:
+            return  # First reading is plausible; keep _word_swap=False.
+        # First reading implausible — try the swap.
+        try:
+            t = self._read_f32(REG_CH1_TEMP, word_swap=True)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "ModbusPyrometer word-order swap detect failed: %s", exc,
+            )
+            return
+        if self.TEMP_MIN_C < t < self.TEMP_MAX_C:
+            self._word_swap = True
+            log.info(
+                "ModbusPyrometer word-order auto-detect: swap ON (T=%.2f°C)",
+                t,
+            )
+        else:
+            log.warning(
+                "ModbusPyrometer word-order detect: both orders implausible "
+                "(swap=True gave T=%.2f); staying word_swap=False", t,
+            )
 
     def disconnect(self) -> None:
         if self._client is not None:
             try:
                 self._client.close()
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 — pymodbus close can raise many types
+                log.debug("ModbusPyrometer close raised; ignoring", exc_info=True)
             self._client = None
         self._connected = False
 
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
     def read_temperature(self) -> float:
-        """Read channel 1 temperature in degrees C."""
+        """Read channel 1 temperature in °C, validated against plausibility bounds.
+
+        Raises ``RuntimeError`` if not connected or if the returned value
+        lies outside ``[TEMP_MIN_C, TEMP_MAX_C]``. The bounds match Jacques's
+        script (line 117) and ``ExactusSerialPyrometer`` so both pyrometer
+        paths share the same failure mode.
+        """
         if not self._connected or self._client is None:
-            raise RuntimeError("Pyrometer not connected.")
-        return self._read_f32(REG_CH1_TEMP, self._word_swap)
+            raise RuntimeError("ModbusPyrometer not connected.")
+        t = self._read_f32(REG_CH1_TEMP, self._word_swap)
+        if not (self.TEMP_MIN_C < t < self.TEMP_MAX_C):
+            raise RuntimeError(
+                f"ModbusPyrometer implausible temperature {t:.3f}°C "
+                f"(outside [{self.TEMP_MIN_C}, {self.TEMP_MAX_C}] °C) — "
+                f"check word_swap={self._word_swap}, device_id={self._device_id}"
+            )
+        return t
 
     def read_current(self) -> float:
-        """Read channel 1 signal current."""
+        """Read channel 1 signal current (arbitrary Modbus units)."""
         if not self._connected or self._client is None:
-            raise RuntimeError("Pyrometer not connected.")
+            raise RuntimeError("ModbusPyrometer not connected.")
         return self._read_f32(REG_CH1_CURR, self._word_swap)
 
     def read_ambient(self) -> float:
         """Read ambient temperature (if supported by firmware)."""
         if not self._connected or self._client is None:
-            raise RuntimeError("Pyrometer not connected.")
+            raise RuntimeError("ModbusPyrometer not connected.")
         return self._read_f32(REG_AMBIENT, self._word_swap)
 
     def get_info(self) -> dict:
@@ -146,42 +213,76 @@ class ModbusPyrometer(TemperatureSensor):
         if not self._connected or self._client is None:
             return {}
 
-        info = {}
+        info: dict = {}
         try:
             info["name"] = self._read_ascii(REG_NAME0, 32)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ModbusPyrometer get_info name read failed: %s", exc)
         try:
             info["serial"] = self._read_ascii(REG_SN0, 9)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ModbusPyrometer get_info serial read failed: %s", exc)
         try:
             ver = self._read_u16(REG_VER)
             info["version"] = f"{ver >> 8}.{ver & 0xFF}"
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ModbusPyrometer get_info version read failed: %s", exc)
         try:
             info["rate_hz"] = self._read_u16(REG_RATE)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ModbusPyrometer get_info rate read failed: %s", exc)
         return info
 
     def set_rate(self, hz: int, persist: bool = False) -> None:
-        """Set pyrometer sample rate. Optionally persist to EEPROM."""
-        if not self._connected or self._client is None:
-            raise RuntimeError("Pyrometer not connected.")
+        """Set pyrometer sample rate. Optionally persist to EEPROM.
 
-        self._write_register(REG_RATE, hz)
+        Rate is clamped to the valid range ``[RATE_MIN_HZ, RATE_MAX_HZ]``
+        — matches Jacques's script (line 168). A caller trying to set a
+        wildly-out-of-range value (which would silently truncate to u16
+        and misconfigure the device) sees ``ValueError`` before any wire
+        traffic.
+        """
+        if not (self.RATE_MIN_HZ <= hz <= self.RATE_MAX_HZ):
+            raise ValueError(
+                f"rate must be between {self.RATE_MIN_HZ} and "
+                f"{self.RATE_MAX_HZ} Hz, got {hz}"
+            )
+        if not self._connected or self._client is None:
+            raise RuntimeError("ModbusPyrometer not connected.")
+
+        wr = self._write_register(REG_RATE, hz)
+        # Jacques inspects the write result — if pymodbus flags an error,
+        # we should raise rather than silently continue.
+        if hasattr(wr, "isError") and wr.isError():
+            raise RuntimeError(
+                f"ModbusPyrometer set_rate({hz}) failed at 0x{REG_RATE:04X}"
+            )
         if persist:
             try:
-                self._write_register(REG_CMD, CMD_SAVE)
-            except Exception:
-                pass  # EEPROM save not supported on all firmware
+                wr2 = self._write_register(REG_CMD, CMD_SAVE)
+                if hasattr(wr2, "isError") and wr2.isError():
+                    log.debug(
+                        "ModbusPyrometer EEPROM save flagged error — some "
+                        "firmware doesn't support CMD_SAVE; setting will be "
+                        "lost on reboot but is applied now."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "ModbusPyrometer EEPROM save raised (%s); firmware may "
+                    "not support the CMD_SAVE opcode. Setting is applied "
+                    "for this session but not persisted.", exc,
+                )
 
     # ─── Low-level Modbus helpers ───
 
     def _read_holding(self, addr: int, count: int):
-        """Read holding registers with pymodbus version compatibility."""
+        """Read holding registers with pymodbus version compatibility.
+
+        pymodbus renamed the device-ID kwarg between versions (``unit`` →
+        ``slave`` → ``device_id``); this loop tries each in turn and falls
+        back to the current name. TypeError specifically catches the
+        "unexpected keyword argument" error — other exceptions propagate.
+        """
         for kw in ("device_id", "slave", "unit"):
             try:
                 return self._client.read_holding_registers(
@@ -205,27 +306,42 @@ class ModbusPyrometer(TemperatureSensor):
             address=addr, value=value, device_id=self._device_id
         )
 
+    @staticmethod
+    def _resp_ok(rr, need: int) -> bool:
+        """Predicate matching Jacques's ``_resp_ok`` — checks all three fields.
+
+        A pymodbus response is "OK" only if it has ``isError()`` returning
+        False AND it exposes ``.registers`` with at least ``need`` entries.
+        Skipping any of these checks means an AttributeError or IndexError
+        surfaces from the caller instead of a clean RuntimeError.
+        """
+        return (
+            hasattr(rr, "isError")
+            and not rr.isError()
+            and hasattr(rr, "registers")
+            and len(rr.registers) >= need
+        )
+
     def _read_f32(self, addr: int, word_swap: bool = False) -> float:
         rr = self._read_holding(addr, 2)
-        if hasattr(rr, "isError") and rr.isError():
-            raise RuntimeError(f"Modbus read error at 0x{addr:04X}")
-        regs = rr.registers
-        if len(regs) < 2:
-            raise RuntimeError(f"Short reply at 0x{addr:04X}")
-        hi, lo = regs
+        if not self._resp_ok(rr, 2):
+            raise RuntimeError(
+                f"Modbus read error at 0x{addr:04X} (needs 2 regs)"
+            )
+        hi, lo = rr.registers[:2]
         if word_swap:
             hi, lo = lo, hi
         return _regs_to_f32(hi, lo)
 
     def _read_u16(self, addr: int) -> int:
         rr = self._read_holding(addr, 1)
-        if hasattr(rr, "isError") and rr.isError():
+        if not self._resp_ok(rr, 1):
             raise RuntimeError(f"Modbus read error at 0x{addr:04X}")
         return rr.registers[0]
 
     def _read_ascii(self, addr: int, n_regs: int) -> str:
         rr = self._read_holding(addr, n_regs)
-        if hasattr(rr, "isError") and rr.isError():
+        if not self._resp_ok(rr, n_regs):
             raise RuntimeError(f"Modbus read error at 0x{addr:04X}")
         return _regs_to_ascii(rr.registers)
 
