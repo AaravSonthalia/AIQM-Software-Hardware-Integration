@@ -501,6 +501,24 @@ class MistralWorker(QThread):
         if self.mode == "screengrab":
             from drivers.mistral import MistralGui
             return MistralGui()
+        elif self.mode == "jsonrpc":
+            # Direct-read via the Jun 23 2026 discovered backend at
+            # http://10.0.42.231:9000/api (see docs/mistral_jsonrpc_discovery.md
+            # and drivers/mistral_jsonrpc.py). Multi-client safe at the HTTP
+            # layer — the client won't disrupt a live MistralGui session.
+            #
+            # Read-config is NOT populated yet: until the discovery probes
+            # identify the actual V/I method names, read() returns the
+            # 4-key all-None dict. The worker still emits state (connected
+            # true, values None) so the GUI shows a working driver with
+            # no readings — same shape as before, no crashes.
+            #
+            # After discovery: populate MistralJsonRpcClient.set_read_config
+            # here (or add a DEFAULT_READ_CONFIG class attribute to the
+            # client) with the discovered method names, then this driver
+            # replaces MistralGui as the primary path.
+            from drivers.mistral_jsonrpc import MistralJsonRpcClient
+            return MistralJsonRpcClient()
         else:
             from drivers.mistral import DummyMistralGui
             return DummyMistralGui()
