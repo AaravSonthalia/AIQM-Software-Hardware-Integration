@@ -54,6 +54,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))  # for gui.auto_capture
 from rheed_change_detector import (  # noqa: E402
     compute_diffs_buffer_mean,
     compute_diffs_previous,
@@ -61,6 +62,10 @@ from rheed_change_detector import (  # noqa: E402
     list_frames,
     load_frame_grayscale,
     smooth,
+)
+from gui.auto_capture import (  # noqa: E402
+    ConfirmationResult,
+    confirm_event_by_plateau_shift,
 )
 
 
@@ -191,6 +196,61 @@ def adaptive_threshold_per_frame(
 
 
 # ---------------------------------------------------------------------------
+# Offline plateau-shift confirmation
+# ---------------------------------------------------------------------------
+
+def confirm_events_offline(
+    events: list,
+    frames: list[Path],
+    pre_window: int = 5,
+    post_window: int = 5,
+    skip: int = 2,
+    threshold: float = 1.0,
+    metric: str = "std",
+) -> list[ConfirmationResult]:
+    """Run confirm_event_by_plateau_shift on each detected event.
+
+    The live engine will do this via a PENDING_CONFIRMATION state that
+    delays emission for N frames after each trigger; here we replay it
+    offline against the on-disk frames. For each event, load a window of
+    ``pre_window + post_window + 2*skip + 1`` frames centered such that
+    the event's peak sits at the local trigger index, then call the
+    plateau function unchanged.
+
+    Result list is aligned by index with ``events`` — one entry per event
+    in the same order. Events too close to the frame-list boundary to fit
+    the full window return ``ConfirmationResult(False, 0.0,
+    "windows_out_of_range")`` so they're distinguishable from rejected
+    events in the report.
+    """
+    needed = pre_window + post_window + 2 * skip + 1
+    trigger_local_idx = pre_window + skip
+
+    results: list[ConfirmationResult] = []
+    for ev in events:
+        start = ev.peak_idx - trigger_local_idx
+        end = start + needed
+        if start < 0 or end > len(frames):
+            results.append(
+                ConfirmationResult(False, 0.0, "windows_out_of_range")
+            )
+            continue
+        window = [load_frame_grayscale(frames[i]) for i in range(start, end)]
+        results.append(
+            confirm_event_by_plateau_shift(
+                window,
+                trigger_idx=trigger_local_idx,
+                pre_window_size=pre_window,
+                post_window_size=post_window,
+                skip_around_trigger=skip,
+                confirmation_threshold=threshold,
+                score_metric=metric,
+            )
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Section builders — each returns an HTML string
 # ---------------------------------------------------------------------------
 
@@ -210,6 +270,12 @@ class ReportInputs:
     # Adaptive bookkeeping — None when running in fixed-threshold mode.
     adaptive_sigma: float | None = None
     adaptive_thresholds: np.ndarray | None = None  # per-frame, len == flagged
+    # Plateau-shift confirmation — None when confirmation is off.
+    # confirmation_results is aligned by index with the event list from
+    # group_events(flagged, raw, frames) at build time.
+    confirmation_results: list[ConfirmationResult] | None = None
+    confirmation_threshold: float | None = None
+    confirmation_metric: str | None = None
 
 
 def build_summary(inp: ReportInputs) -> str:
@@ -247,6 +313,35 @@ def build_summary(inp: ReportInputs) -> str:
         ("Flagged frames", f"{int(flagged_mask.sum())} ({100 * flagged_mask.mean():.1f}%)"),
         ("Discrete events", f"{len(events)}"),
     ]
+
+    # If plateau confirmation ran, break down events by outcome. The
+    # reduced count is the number that survive the confirmation pass —
+    # what the live engine would emit if the plateau check were wired in.
+    if inp.confirmation_results is not None:
+        confirmed = sum(1 for r in inp.confirmation_results if r.confirmed)
+        rejected = sum(
+            1 for r in inp.confirmation_results
+            if r.reason == "rejected_below_threshold"
+        )
+        oor = sum(
+            1 for r in inp.confirmation_results
+            if r.reason == "windows_out_of_range"
+        )
+        too_small = sum(
+            1 for r in inp.confirmation_results
+            if r.reason == "buffer_too_small"
+        )
+        rows.append((
+            "Plateau confirmation",
+            f"threshold {inp.confirmation_threshold:.2f}, "
+            f"metric {inp.confirmation_metric}",
+        ))
+        rows.append((
+            "Events after confirmation",
+            f"{confirmed} confirmed · {rejected} rejected · "
+            f"{oor} out-of-range · {too_small} buffer-too-small",
+        ))
+
     body = "".join(
         f'<tr><td class="label">{escape(label)}</td><td>{escape(value)}</td></tr>'
         for label, value in rows
@@ -390,10 +485,32 @@ def build_event_gallery(inp: ReportInputs, max_events: int = 20) -> str:
         b64_peak = array_to_b64_png(peak)
         b64_diff = array_to_b64_png(diff, cmap="hot")
 
+        # Confirmation badge (green = confirmed, red = rejected, gray =
+        # unable to test). Reads like a linter report — the eye can
+        # quickly scan the gallery and cross-check the confirmation
+        # decision against the visible frame content.
+        confirmation_badge = ""
+        if inp.confirmation_results is not None:
+            r = inp.confirmation_results[n - 1]
+            if r.reason == "confirmed":
+                color, label = "#166534", "CONFIRMED"
+            elif r.reason == "rejected_below_threshold":
+                color, label = "#991b1b", "REJECTED"
+            else:
+                color, label = "#6b7280", "UNTESTABLE"
+            confirmation_badge = (
+                f' <span style="background: {color}; color: white; '
+                f'padding: 0.15em 0.55em; border-radius: 3px; '
+                f'font-size: 0.85em; margin-left: 0.6em;">'
+                f'{label} · Δ={r.diff_score:.2f} · {escape(r.reason)}'
+                f'</span>'
+            )
+
         header = (
             f'<div class="event-header">Event #{n} — '
             f'frames {ev.start_idx}–{ev.end_idx} (duration {ev.duration}), '
-            f'peak score {ev.peak_diff:.2f} at frame {peak_idx}</div>'
+            f'peak score {ev.peak_diff:.2f} at frame {peak_idx}'
+            f'{confirmation_badge}</div>'
         )
         cells = (
             f'<div class="frame">'
@@ -580,6 +697,29 @@ def parse_args() -> argparse.Namespace:
                         "During warmup, --threshold is used as a fallback. Default 20 — "
                         "tuned against Rahim's 02_06 dataset where the first real event "
                         "occurs around frame 25; warmup=30 misses it entirely.")
+    # Plateau-shift confirmation (May 22 PI proposal). Offline mirror of
+    # what AutoCaptureEngine's PENDING_CONFIRMATION path will do once
+    # engine integration lands — see gui/auto_capture.py:269 for the
+    # underlying function.
+    p.add_argument("--confirmation-threshold", type=float, default=None,
+                   help="If set, run plateau-shift confirmation on each flagged event. "
+                        "The threshold is the minimum std(|pre_mean - post_mean|) required "
+                        "to CONFIRM an event; smaller shifts are rejected as bumps/artifacts. "
+                        "Suggested starting value ~0.5 (half the live floor of 1.0) — the "
+                        "confirmation should be less strict than the trigger, not more.")
+    p.add_argument("--confirmation-metric", choices=["std", "mean"], default="std",
+                   help="'std' (default) rejects uniform brightness shifts because they have "
+                        "no spatial variability — the right choice for reconstruction "
+                        "transitions, which ARE spatially structured. 'mean' also confirms "
+                        "uniform shifts; use only if you want to catch flash-like events.")
+    p.add_argument("--confirmation-pre-window", type=int, default=5,
+                   help="Frames averaged for the pre-event plateau (default 5).")
+    p.add_argument("--confirmation-post-window", type=int, default=5,
+                   help="Frames averaged for the post-event plateau (default 5).")
+    p.add_argument("--confirmation-skip", type=int, default=2,
+                   help="Frames on each side of the trigger to exclude from both plateaus "
+                        "(default 2). Prevents transition frames themselves from polluting "
+                        "either plateau.")
     return p.parse_args()
 
 
@@ -625,6 +765,42 @@ def main() -> int:
         flagged = smoothed > args.threshold
         flagged[0] = False
 
+    # Plateau-shift confirmation runs after flagging, on the grouped
+    # events. Uses primary_raw for event grouping so the peak_idx aligns
+    # with what the timeseries/gallery display.
+    confirmation_results = None
+    if args.confirmation_threshold is not None:
+        events_for_confirmation = group_events(flagged, primary_raw, frames)
+        print(
+            f"running plateau-shift confirmation on {len(events_for_confirmation)} "
+            f"events (threshold={args.confirmation_threshold}, "
+            f"metric={args.confirmation_metric}, "
+            f"pre/post={args.confirmation_pre_window}/{args.confirmation_post_window}, "
+            f"skip={args.confirmation_skip})..."
+        )
+        confirmation_results = confirm_events_offline(
+            events_for_confirmation,
+            frames,
+            pre_window=args.confirmation_pre_window,
+            post_window=args.confirmation_post_window,
+            skip=args.confirmation_skip,
+            threshold=args.confirmation_threshold,
+            metric=args.confirmation_metric,
+        )
+        confirmed = sum(1 for r in confirmation_results if r.confirmed)
+        rejected = sum(
+            1 for r in confirmation_results
+            if r.reason == "rejected_below_threshold"
+        )
+        oor = sum(
+            1 for r in confirmation_results
+            if r.reason == "windows_out_of_range"
+        )
+        print(
+            f"  confirmation: {confirmed} confirmed, {rejected} rejected, "
+            f"{oor} out-of-range"
+        )
+
     inputs = ReportInputs(
         frames_dir=args.frames_dir,
         frames=frames,
@@ -639,6 +815,9 @@ def main() -> int:
         flagged=flagged,
         adaptive_sigma=args.adaptive_sigma,
         adaptive_thresholds=adaptive_thresholds,
+        confirmation_results=confirmation_results,
+        confirmation_threshold=args.confirmation_threshold,
+        confirmation_metric=args.confirmation_metric if confirmation_results else None,
     )
 
     print("rendering HTML...")
