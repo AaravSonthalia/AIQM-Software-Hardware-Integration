@@ -139,9 +139,44 @@ def test_disconnected_returns_none_dict():
     print("[disconnected_read] PASS — returns all-None dict cleanly")
 
 
+def test_nan_plasma_values_treated_as_none():
+    """Plasma NaN (source off) → None in read() so CSV shows empty, not 'nan'.
+
+    Jun 23 2026 finding: EvapControl writes literal float NaN into
+    Plasma.DCBias / Plasma.forward / Plasma.reflected whenever the plasma
+    is off. Downstream we want those to appear as "unavailable" (empty
+    CSV cell) rather than the literal string "nan".
+    """
+    schema = [
+        ("MBE.Pressure", "%.2e mbar"),
+        ("MBE-Mani.PV", "%.1f C"),
+        ("Plasma.DCBias", "%.1f V"),
+        ("Plasma.forward", "%.1f W"),
+        ("Plasma.reflected", "%.1f W"),
+    ]
+    now = dt.datetime.now(dt.timezone.utc)
+    nan = float("nan")
+    records = [(now, [5.2e-9, 750.0, nan, nan, nan])]
+    with tempfile.TemporaryDirectory() as tmp:
+        write_elog(_today_path(tmp), schema, records)
+        r = ElogReader(log_dir=tmp)
+        r.connect()
+        d = r.read()
+        # Non-plasma vars unaffected
+        assert abs(d["chamber_pressure_mbar"] - 5.2e-9) < 1e-14
+        assert abs(d["substrate_temp_pv_C"] - 750.0) < 0.1
+        # Plasma vars filtered to None — not the float NaN value
+        for key in ("plasma_dc_bias_V", "plasma_forward_W", "plasma_reflected_W"):
+            assert d[key] is None, (
+                f"{key}: expected None (from NaN filter), got {d[key]!r}"
+            )
+    print("[nan_plasma] PASS — NaN values filtered to None")
+
+
 if __name__ == "__main__":
     test_basic()
     test_partial_schema()
     test_pressure_plausibility()
     test_disconnected_returns_none_dict()
+    test_nan_plasma_values_treated_as_none()
     print("\nALL TESTS PASSED")

@@ -16,6 +16,7 @@ sessions where the .elo file is unreachable.
 """
 
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Optional
@@ -277,6 +278,16 @@ class ElogReader:
 
         for elog_name, (val, _fmt) in var_values.items():
             out_key = self._var_map[elog_name]
+            # NaN → None (leave the key at its initialized None value).
+            # EvapControl writes literal float NaN into plasma variables
+            # (Plasma.DCBias / Plasma.forward / Plasma.reflected) whenever
+            # the plasma source is off. Passing NaN downstream renders as
+            # the string "nan" in sensor_log.csv, which looks like a bug.
+            # Treating NaN as "unavailable" gives the CSV an empty cell —
+            # the same shape it would have if the variable were absent
+            # from the elog schema entirely.
+            if isinstance(val, float) and math.isnan(val):
+                continue
             # Pressure: plausibility-filter to UHV range.
             if out_key == "chamber_pressure_mbar":
                 lo, hi = PRESSURE_RANGE_MBAR
