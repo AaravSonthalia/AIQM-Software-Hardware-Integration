@@ -6,11 +6,11 @@ import time
 from typing import Optional
 
 import numpy as np
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QMutex, QThread, pyqtSignal
 import pyvisa
 
 from gui.state import (
-    CameraState, EvapControlState, MistralState, PowerSupplyState,
+    CameraState, ClassifierState, EvapControlState, MistralState, PowerSupplyState,
     PyrometerState, TemperatureState,
 )
 from owon_power_supply import OWONPowerSupply
@@ -602,3 +602,223 @@ class EvapControlWorker(QThread):
 
     def stop(self):
         self.running = False
+
+
+class ClassifierWorker(QThread):
+    """Runs Classifier2 inference off the UI thread at a bounded rate.
+
+    Consumes RHEED frames via :py:meth:`on_rheed_state` — connect this
+    slot to ``RheedCameraWorker.state_updated``. Publishes
+    ``ClassifierState`` with EMA-smoothed percentages normalized via the
+    "Equalizer recipe" (clip negatives → divide by sum → uniform
+    fallback), matching ``scripts/equalizer_ui.py:auto_fit``.
+
+    Threading contract:
+        - :py:meth:`on_rheed_state` runs in the SENDER's thread (the RHEED
+          worker's thread). It writes the latest frame under a QMutex —
+          no blocking work, just an attribute swap. Drop-old semantics:
+          stale unclassified frames are silently overwritten by newer
+          ones, preventing queue growth when the classifier is slower
+          than the camera.
+        - :py:meth:`run` executes in this worker's own thread. It reads
+          the latest frame under the mutex, classifies, normalizes,
+          updates the EMA, and emits ``state_updated`` at
+          ``POLL_INTERVAL_S`` cadence.
+
+    OOD handling:
+        When the classifier's ``quality`` drops below
+        ``OOD_QUALITY_THRESHOLD``, ``ClassifierState.is_ood`` is set True
+        and the EMA is NOT advanced — the smoothed percentages freeze at
+        their last confident values. The UI is expected to grey out the
+        sliders while ``is_ood``.
+
+    Failure handling:
+        - Startup: bridge load failure emits ``error`` and returns
+          (thread ends; recreate the worker to retry).
+        - Runtime: classify failures are counted; after
+          ``MAX_CONSECUTIVE_FAILS`` in a row the worker emits an error
+          state and resets the counter. The loop continues so a transient
+          issue can recover on its own.
+    """
+
+    state_updated = pyqtSignal(ClassifierState)
+
+    # Class-level knobs — instance-override in tests via monkey-patching.
+    POLL_INTERVAL_S = 0.5           # 2 Hz classification cadence
+    EMA_ALPHA = 0.2                 # ~5 s time constant at 2 Hz
+    OOD_QUALITY_THRESHOLD = 0.3     # below this = freeze EMA + set is_ood
+    MAX_CONSECUTIVE_FAILS = 5       # symmetric with Jul-2 driver-hardening pattern
+
+    def __init__(self, ai_repo_root, model_path=None):
+        super().__init__()
+        self.ai_repo_root = ai_repo_root
+        self.model_path = model_path
+        self.running = False
+
+        # Frame handoff — mutex-protected latest frame (drop-old, not FIFO).
+        self._frame_mutex = QMutex()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_frame_number = -1
+
+        # Per-cycle state carried across iterations.
+        self._smoothed: dict[str, float] = {}   # float internal for EMA math
+        self._consecutive_failures = 0
+        self._last_classified_frame_number = -1
+
+    # ---- Slot: runs in the sender's thread; mutex-protected write ----
+    def on_rheed_state(self, camera_state: CameraState) -> None:
+        """Store the latest frame + number under mutex. Runs in sender's thread.
+
+        Fast attribute swap; no I/O, no inference. Silently overwrites any
+        prior unclassified frame (drop-old semantics).
+        """
+        if camera_state.frame is None:
+            return
+        self._frame_mutex.lock()
+        try:
+            self._latest_frame = camera_state.frame
+            self._latest_frame_number = camera_state.frame_number
+        finally:
+            self._frame_mutex.unlock()
+
+    def _create_bridge(self):
+        """Factory for the ClassifierBridge. Override in tests via monkey-patch."""
+        from gui.classifier_bridge import ClassifierBridge
+        return ClassifierBridge(self.ai_repo_root, self.model_path)
+
+    def run(self) -> None:
+        """Main loop — load bridge once, then classify at POLL_INTERVAL_S."""
+        from gui.recon_labels import RECON_LABELS
+
+        self.running = True
+
+        # Emit initial loading state so the UI can show "Loading classifier…"
+        state = ClassifierState()  # loading=True, ready=False, error=""
+        self.state_updated.emit(state)
+
+        # Load bridge — blocking, ~1-2 s. This is precisely why we're on our
+        # own thread: the UI stays responsive during model load.
+        try:
+            bridge = self._create_bridge()
+        except Exception as e:
+            state.loading = False
+            state.ready = False
+            state.error = f"Failed to load classifier: {e}"
+            self.state_updated.emit(state)
+            return
+
+        # Ready — initialize EMA at uniform, emit uniform placeholder.
+        # First real inference will EMA-blend into this baseline, so the
+        # sliders visibly "settle" onto the model's answer rather than
+        # snapping — feels more natural to growers.
+        self._smoothed = {lbl: 20.0 for lbl in RECON_LABELS}
+        uniform = {lbl: 20 for lbl in RECON_LABELS}
+        state.loading = False
+        state.ready = True
+        state.error = ""
+        state.normalized_percent = uniform.copy()
+        state.smoothed_percent = uniform.copy()
+        self.state_updated.emit(state)
+
+        # Main polling loop
+        while self.running:
+            # Snapshot the latest frame under mutex
+            self._frame_mutex.lock()
+            try:
+                frame = self._latest_frame
+                frame_number = self._latest_frame_number
+            finally:
+                self._frame_mutex.unlock()
+
+            # Skip if no frame yet, or same frame we already classified
+            if frame is None or frame_number == self._last_classified_frame_number:
+                time.sleep(self.POLL_INTERVAL_S)
+                continue
+
+            # Classify — the heavy work happens here in this worker's thread
+            t0 = time.time()
+            try:
+                result = bridge.classify(frame)
+                inference_ms = (time.time() - t0) * 1000.0
+                self._consecutive_failures = 0
+            except Exception as e:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILS:
+                    state.error = (
+                        f"Classifier failed {self._consecutive_failures}x: {e}"
+                    )
+                    self.state_updated.emit(state)
+                    self._consecutive_failures = 0  # reset after emitting; retry
+                time.sleep(self.POLL_INTERVAL_S)
+                continue
+
+            self._last_classified_frame_number = frame_number
+
+            # Normalize via Equalizer recipe (clip → sum → divide → uniform fallback)
+            scores = result.get("classification_scores", {}) or {}
+            normalized, raw_sum = self._normalize(scores)
+
+            # OOD gate: freeze the EMA when the model isn't confident
+            quality = float(result.get("quality") or 0.0)
+            is_ood = quality < self.OOD_QUALITY_THRESHOLD
+
+            if not is_ood:
+                for lbl in RECON_LABELS:
+                    new = float(normalized.get(lbl, 0))
+                    self._smoothed[lbl] = (
+                        self.EMA_ALPHA * new
+                        + (1.0 - self.EMA_ALPHA) * self._smoothed.get(lbl, 0.0)
+                    )
+
+            # Emit populated state
+            state.error = ""
+            state.last_frame_number = frame_number
+            state.raw_scores = dict(scores)
+            state.normalized_percent = normalized
+            state.smoothed_percent = {
+                lbl: int(round(v)) for lbl, v in self._smoothed.items()
+            }
+            state.raw_sum = raw_sum
+            state.quality = quality
+            state.is_bad = bool(result.get("is_bad", False))
+            state.bad_confidence = float(result.get("bad_confidence", 0.0))
+            state.is_ood = is_ood
+            state.inference_ms = inference_ms
+            self.state_updated.emit(state)
+
+            time.sleep(self.POLL_INTERVAL_S)
+
+    def stop(self) -> None:
+        """Signal the run loop to exit at its next iteration."""
+        self.running = False
+
+    @staticmethod
+    def _normalize(scores: dict) -> tuple[dict, float]:
+        """Equalizer recipe: clip → sum → divide → uniform fallback.
+
+        Returns ``(percentages, raw_sum)`` where:
+            - ``percentages`` — dict[label, int] summing to 100 across
+              ``RECON_LABELS``.
+            - ``raw_sum`` — sum of the raw scores BEFORE clip, for the
+              "Sum: X.XX" transparency label on the UI. Tells the grower
+              how much scaling the display is doing.
+
+        Uniform fallback triggers when the positive mass is zero (all
+        scores <= 0), producing 20/20/20/20/20 as a neutral display.
+        """
+        from gui.recon_labels import RECON_LABELS
+        vals = np.array(
+            [float(scores.get(lbl, 0.0)) for lbl in RECON_LABELS],
+            dtype=np.float64,
+        )
+        raw_sum = float(vals.sum())  # BEFORE clip — for transparency
+        vals = np.clip(vals, 0.0, None)
+        s = vals.sum()
+        if s <= 0:
+            vals = np.full(len(RECON_LABELS), 1.0 / len(RECON_LABELS))
+        else:
+            vals = vals / s
+        return (
+            {lbl: int(round(100 * v)) for lbl, v in zip(RECON_LABELS, vals)},
+            raw_sum,
+        )
