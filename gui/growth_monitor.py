@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLineEdit, QTextEdit, QSizePolicy, QFrame,
     QDoubleSpinBox, QComboBox, QFormLayout, QFileDialog,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QGroupBox, QSlider,
+    QAbstractItemView, QGroupBox, QSlider, QCheckBox,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QFont, QShortcut, QKeySequence
@@ -680,6 +680,15 @@ class GrowthMonitor(QWidget):
         self.config_evap_mode.setCurrentText("screengrab")
         config_form.addRow("Evap Control mode:", self.config_evap_mode)
 
+        # Enable/disable the live classifier. Off = classifier worker
+        # never starts, main-tab sliders stay at zero and status shows
+        # "Classifier disabled". Useful when the classifier is misbehaving
+        # (e.g. Bulbasaur without torch) or when a grower explicitly
+        # doesn't want it — the rest of the app runs unchanged.
+        self.config_classifier_enabled = QCheckBox()
+        self.config_classifier_enabled.setChecked(True)
+        config_form.addRow("Live classifier:", self.config_classifier_enabled)
+
         top_half.addWidget(config_group)
 
         # --- Sensor Log (upper-right) ---
@@ -862,65 +871,191 @@ class GrowthMonitor(QWidget):
             self._current_frame = state.frame
             self._display_frame(state.frame)
 
+    # Value-label style presets. Kept as constants so update_classifier_state
+    # doesn't allocate style strings per emission (5-slider hot path at 2 Hz).
+    _RECON_VAL_STYLE_NORMAL = "font-size: 11px; color: #0d9488;"
+    _RECON_VAL_STYLE_ARGMAX = (
+        "font-size: 13px; color: #14b8a6; font-weight: bold;"
+    )
+    _RECON_VAL_STYLE_PLACEHOLDER = "font-size: 11px; color: #666;"
+    _RECON_STATUS_STYLE_INFO = "font-size: 10px; color: #888;"
+    _RECON_STATUS_STYLE_WARN = "font-size: 10px; color: #d97706;"  # amber
+    _RECON_STATUS_STYLE_ERROR = "font-size: 10px; color: #c33;"    # red
+    _ARGMAX_HIGHLIGHT_THRESHOLD = 30  # only highlight when clearly above uniform-20
+
     def update_classifier_state(self, state: ClassifierState):
         """Route ClassifierState to the recon sliders + status label.
 
-        Display modes:
-            - loading  : status = "Loading classifier…", sliders unchanged
-            - error    : status = "⚠ <error>" in red, sliders unchanged
-            - waiting  : status = "Waiting for frames…", sliders at uniform 20
-            - is_ood   : status = "OOD — quality X.XX", sliders frozen at
-                         last confident value (worker enforces freeze)
-            - normal   : status = "Sum: X.XX  |  Nms", sliders show
-                         smoothed_percent
+        Five display modes, chosen in this order:
+
+        1. **loading** — bridge still initializing. Status: "Loading
+           classifier…"; sliders left at whatever they were.
+        2. **error** — bridge load or classify failed. Status: red
+           "⚠ <error>"; sliders left unchanged.
+        3. **warming up** — worker is ready but no non-OOD frame has
+           arrived yet, so ``smoothed_percent`` is just the ready-time
+           uniform-20 placeholder. Value labels show "—" (not "20%")
+           so growers don't misread the placeholder as a real
+           prediction. Status: "Waiting for frames…" or
+           "Warming up — quality X.XX; no confident data yet".
+        4. **OOD** — at least one confident classification has occurred,
+           but the current frame is out-of-distribution. Sliders remain
+           frozen at the last confident smoothed value (the worker
+           enforces the freeze). Status: amber
+           "OOD — quality X.XX | Nms | showing last confident".
+        5. **normal** — confident classification, sliders reflect the
+           freshly-EMA'd smoothed_percent. Status includes raw_sum,
+           quality, and inference time for transparency. If any class
+           clearly leads (> 30%), its value label is highlighted in
+           bold + brighter teal for at-a-glance readability.
+
+        Every non-error state also sets a hover-tooltip on the status
+        label that includes the model version and explains what the
+        current status means — useful for growers who don't speak ML
+        fluently and for anyone debugging on Bulbasaur.
 
         Sliders are read-only (Option A) so ``blockSignals`` isn't
-        strictly required, but it's cheap and future-proof if we ever
-        re-enable interactivity for a grower-override mode.
+        strictly required, but it's cheap insurance if we ever re-enable
+        interactivity for a grower-override mode.
         """
+        model_line = f"Model: {state.model_version}\n" if state.model_version else ""
+
         if state.loading:
             self._recon_status_label.setText("Loading classifier…")
-            self._recon_status_label.setStyleSheet(
-                "font-size: 10px; color: #888;"
+            self._recon_status_label.setStyleSheet(self._RECON_STATUS_STYLE_INFO)
+            self._recon_status_label.setToolTip(
+                "Loading the classifier model. First arm of a session "
+                "takes 1-2 seconds; subsequent arms in the same session "
+                "reuse the loaded bridge."
             )
             return
         if state.error:
             self._recon_status_label.setText(f"⚠ {state.error}")
-            self._recon_status_label.setStyleSheet(
-                "font-size: 10px; color: #c33;"
+            self._recon_status_label.setStyleSheet(self._RECON_STATUS_STYLE_ERROR)
+            self._recon_status_label.setToolTip(
+                f"{state.error}\n\n"
+                "Common causes: torch not installed on this machine, "
+                "best_model.pth missing, AI_for_quantum repo not cloned. "
+                "Uncheck 'Live classifier' in the config panel to disarm "
+                "and re-arm without the classifier."
             )
             return
 
-        # Ready — update sliders from smoothed_percent
         smoothed = state.smoothed_percent
-        if smoothed:
-            for name, slider in self._recon_sliders.items():
-                v = int(smoothed.get(name, 0))
-                slider.blockSignals(True)
-                slider.setValue(v)
-                slider.blockSignals(False)
-                self._recon_value_labels[name].setText(f"{v}%")
 
-        # Status line: OOD > waiting > normal
+        # Warming-up state: no confident classification has ever arrived,
+        # so the smoothed_percent values are placeholders — mark them "—"
+        # in the value labels so growers don't misread them.
+        if not state.has_confident_data:
+            if smoothed:
+                for name, slider in self._recon_sliders.items():
+                    slider.blockSignals(True)
+                    slider.setValue(int(smoothed.get(name, 0)))
+                    slider.blockSignals(False)
+                    self._recon_value_labels[name].setText("—")
+                    self._recon_value_labels[name].setStyleSheet(
+                        self._RECON_VAL_STYLE_PLACEHOLDER,
+                    )
+            if state.last_frame_number < 0:
+                self._recon_status_label.setText("Waiting for frames…")
+            else:
+                self._recon_status_label.setText(
+                    f"Warming up — quality {state.quality:.2f}; "
+                    f"no confident data yet"
+                )
+            self._recon_status_label.setStyleSheet(self._RECON_STATUS_STYLE_INFO)
+            self._recon_status_label.setToolTip(
+                f"{model_line}"
+                "Waiting for a frame the model recognizes with "
+                f"confidence (quality ≥ {self._OOD_TOOLTIP_THRESHOLD}). "
+                "Sliders show a neutral placeholder until then — the "
+                "'—' means 'no data yet', not 'model predicts 20%'."
+            )
+            return
+
+        # Confident-data state: sliders reflect real (EMA-smoothed) values.
+        # Compute argmax to decide whether to highlight a leading class.
+        argmax_label = (
+            max(smoothed.items(), key=lambda kv: kv[1])[0] if smoothed else None
+        )
+        max_v = smoothed.get(argmax_label, 0) if argmax_label else 0
+        highlight_winner = max_v > self._ARGMAX_HIGHLIGHT_THRESHOLD
+
+        for name, slider in self._recon_sliders.items():
+            v = int(smoothed.get(name, 0))
+            slider.blockSignals(True)
+            slider.setValue(v)
+            slider.blockSignals(False)
+            val_lbl = self._recon_value_labels[name]
+            val_lbl.setText(f"{v}%")
+            if highlight_winner and name == argmax_label:
+                val_lbl.setStyleSheet(self._RECON_VAL_STYLE_ARGMAX)
+            else:
+                val_lbl.setStyleSheet(self._RECON_VAL_STYLE_NORMAL)
+
+        # Enrich status line with quality + inference time for transparency
         if state.is_ood:
             self._recon_status_label.setText(
-                f"OOD — quality {state.quality:.2f}; showing last confident"
+                f"OOD — quality {state.quality:.2f} | "
+                f"{state.inference_ms:.0f} ms | showing last confident"
             )
-            self._recon_status_label.setStyleSheet(
-                "font-size: 10px; color: #d97706;"  # amber
-            )
-        elif state.last_frame_number < 0:
-            self._recon_status_label.setText("Waiting for frames…")
-            self._recon_status_label.setStyleSheet(
-                "font-size: 10px; color: #888;"
+            self._recon_status_label.setStyleSheet(self._RECON_STATUS_STYLE_WARN)
+            self._recon_status_label.setToolTip(
+                f"{model_line}"
+                "Out-of-distribution: the model saw a frame unlike "
+                "anything in its training set (quality below the "
+                f"{self._OOD_TOOLTIP_THRESHOLD} threshold). Sliders "
+                "are frozen at the last confident prediction until a "
+                "recognizable frame arrives. This is expected during "
+                "reconstruction transitions and beam-block events."
             )
         else:
             self._recon_status_label.setText(
-                f"Sum: {state.raw_sum:.2f}  |  {state.inference_ms:.0f} ms"
+                f"Sum: {state.raw_sum:.2f} | quality {state.quality:.2f} | "
+                f"{state.inference_ms:.0f} ms"
             )
-            self._recon_status_label.setStyleSheet(
-                "font-size: 10px; color: #888;"
+            self._recon_status_label.setStyleSheet(self._RECON_STATUS_STYLE_INFO)
+            self._recon_status_label.setToolTip(
+                f"{model_line}"
+                "Sum: total of raw model scores before normalization "
+                "(around 1.0 means the model is behaving; far from 1.0 "
+                "means the Equalizer recipe is doing heavy scaling).\n"
+                "Quality: the model's confidence in this specific frame.\n"
+                "Ms: time to classify this frame."
             )
+
+    # Documented for the tooltip messages so they stay in sync with
+    # ClassifierWorker.OOD_QUALITY_THRESHOLD; hard-coded because the
+    # worker class-level constant isn't cheap to reach from a Qt slot
+    # hot-path. Update both if the threshold moves.
+    _OOD_TOOLTIP_THRESHOLD = 0.3
+
+    def set_classifier_disabled(self):
+        """Show explicit "disabled" state — invoked from GrowthApp._on_arm
+        when the user unchecks "Live classifier" in the config panel.
+
+        Sliders zero out, value labels reset, status label makes the
+        disabled state explicit so growers don't wonder why the
+        classifier isn't reporting.
+        """
+        for name, slider in self._recon_sliders.items():
+            slider.blockSignals(True)
+            slider.setValue(0)
+            slider.blockSignals(False)
+            self._recon_value_labels[name].setText("0%")
+            self._recon_value_labels[name].setStyleSheet(
+                self._RECON_VAL_STYLE_PLACEHOLDER,
+            )
+        self._recon_status_label.setText(
+            "Classifier disabled — re-arm with the config toggle checked"
+        )
+        self._recon_status_label.setStyleSheet(self._RECON_STATUS_STYLE_INFO)
+        self._recon_status_label.setToolTip(
+            "The 'Live classifier' checkbox in the config panel is "
+            "unchecked, so the classifier worker never started for "
+            "this session. Everything else (camera, pyrometer, MISTRAL, "
+            "auto-capture) runs as normal."
+        )
 
     # ----- RHEED frame display --------------------------------------------
 
@@ -1136,14 +1271,19 @@ class GrowthMonitor(QWidget):
         self.rheed_image_label.clear()
         self.auto_capture_label.setText("Auto-capture: idle")
         # Classifier sliders back to zero + idle status; the next arm will
-        # trigger a fresh "Loading classifier…" cycle.
+        # trigger a fresh "Loading classifier…" cycle. Also reset the
+        # value-label styles in case the previous session left an argmax
+        # highlight or placeholder style behind.
         for name, slider in self._recon_sliders.items():
             slider.blockSignals(True)
             slider.setValue(0)
             slider.blockSignals(False)
             self._recon_value_labels[name].setText("0%")
+            self._recon_value_labels[name].setStyleSheet(
+                self._RECON_VAL_STYLE_NORMAL,
+            )
         self._recon_status_label.setText("Classifier idle")
-        self._recon_status_label.setStyleSheet("font-size: 10px; color: #888;")
+        self._recon_status_label.setStyleSheet(self._RECON_STATUS_STYLE_INFO)
         self._start_time = None
         self._current_frame = None
         self._latest_psu = None

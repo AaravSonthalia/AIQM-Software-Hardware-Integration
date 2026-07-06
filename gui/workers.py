@@ -664,6 +664,12 @@ class ClassifierWorker(QThread):
         self._smoothed: dict[str, float] = {}   # float internal for EMA math
         self._consecutive_failures = 0
         self._last_classified_frame_number = -1
+        # Latches True on first non-OOD classification; never resets within
+        # a single worker lifetime (recreate the worker to reset).
+        self._has_confident_data = False
+        # Model identity ("filename (YYYY-MM-DD)") — resolved once at
+        # bridge-load time in run() and emitted on every subsequent state.
+        self._model_version = ""
 
     # ---- Slot: runs in the sender's thread; mutex-protected write ----
     def on_rheed_state(self, camera_state: CameraState) -> None:
@@ -707,6 +713,11 @@ class ClassifierWorker(QThread):
             self.state_updated.emit(state)
             return
 
+        # Derive model identity string once — filename + file mtime as
+        # YYYY-MM-DD. Falls back to "unknown" if the bridge didn't expose
+        # a model_path attribute or the file has vanished since load.
+        self._model_version = self._derive_model_version(bridge)
+
         # Ready — initialize EMA at uniform, emit uniform placeholder.
         # First real inference will EMA-blend into this baseline, so the
         # sliders visibly "settle" onto the model's answer rather than
@@ -718,6 +729,7 @@ class ClassifierWorker(QThread):
         state.error = ""
         state.normalized_percent = uniform.copy()
         state.smoothed_percent = uniform.copy()
+        state.model_version = self._model_version
         self.state_updated.emit(state)
 
         # Main polling loop
@@ -769,6 +781,7 @@ class ClassifierWorker(QThread):
                         self.EMA_ALPHA * new
                         + (1.0 - self.EMA_ALPHA) * self._smoothed.get(lbl, 0.0)
                     )
+                self._has_confident_data = True
 
             # Emit populated state
             state.error = ""
@@ -783,7 +796,9 @@ class ClassifierWorker(QThread):
             state.is_bad = bool(result.get("is_bad", False))
             state.bad_confidence = float(result.get("bad_confidence", 0.0))
             state.is_ood = is_ood
+            state.has_confident_data = self._has_confident_data
             state.inference_ms = inference_ms
+            state.model_version = self._model_version
             self.state_updated.emit(state)
 
             time.sleep(self.POLL_INTERVAL_S)
@@ -791,6 +806,30 @@ class ClassifierWorker(QThread):
     def stop(self) -> None:
         """Signal the run loop to exit at its next iteration."""
         self.running = False
+
+    @staticmethod
+    def _derive_model_version(bridge) -> str:
+        """Return "filename (YYYY-MM-DD)" for the loaded model checkpoint.
+
+        Reads ``bridge.model_path`` (set by ClassifierBridge post-Jul-6);
+        falls back to "unknown" if the attribute doesn't exist or the
+        file is missing. Never raises — this is UI transparency, not
+        critical-path logic.
+        """
+        from datetime import datetime as _dt
+        from pathlib import Path as _Path
+
+        try:
+            model_path = getattr(bridge, "model_path", None)
+            if model_path is None:
+                return "unknown"
+            p = _Path(model_path)
+            if not p.exists():
+                return f"{p.name} (missing)"
+            mtime = _dt.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d")
+            return f"{p.name} ({mtime})"
+        except Exception:
+            return "unknown"
 
     @staticmethod
     def _normalize(scores: dict) -> tuple[dict, float]:

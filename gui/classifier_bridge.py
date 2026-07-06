@@ -75,6 +75,9 @@ class ClassifierBridge:
         if model_path is None:
             model_path = c2_dir_path / "artifacts" / "best_model.pth"
 
+        # Store resolved path publicly so callers (e.g. ClassifierWorker)
+        # can read filename + mtime for the model-version indicator.
+        self.model_path = Path(model_path)
         self._model, self._device = load_model(str(model_path))
 
         # Pre-compute reference scores (one-time cost).

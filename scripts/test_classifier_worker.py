@@ -149,6 +149,52 @@ def _fake_frame() -> np.ndarray:
 # Tests
 # ---------------------------------------------------------------------------
 
+class ModelVersionTests(unittest.TestCase):
+    """Pure-function tests for _derive_model_version — no bridge or torch."""
+
+    def test_no_model_path_attribute_returns_unknown(self):
+        class MockBridge:
+            pass
+        self.assertEqual(
+            ClassifierWorker._derive_model_version(MockBridge()),
+            "unknown",
+        )
+
+    def test_missing_file_returns_missing_marker(self):
+        class MockBridge:
+            model_path = Path("/nonexistent/best_model.pth")
+        self.assertEqual(
+            ClassifierWorker._derive_model_version(MockBridge()),
+            "best_model.pth (missing)",
+        )
+
+    def test_real_file_returns_filename_and_date(self):
+        import tempfile
+        from datetime import datetime as _dt
+        with tempfile.NamedTemporaryFile(suffix=".pth", delete=False) as f:
+            f.write(b"fake model bytes")
+            fake_pth = Path(f.name)
+        try:
+            class MockBridge:
+                model_path = fake_pth
+            v = ClassifierWorker._derive_model_version(MockBridge())
+            self.assertIn(fake_pth.name, v)
+            self.assertIn(_dt.now().strftime("%Y-%m-%d"), v)
+        finally:
+            fake_pth.unlink(missing_ok=True)
+
+    def test_exception_is_swallowed(self):
+        """UI-transparency helper must never raise — bad path → 'unknown'."""
+        class MockBridgeRaises:
+            @property
+            def model_path(self):
+                raise RuntimeError("boom")
+        self.assertEqual(
+            ClassifierWorker._derive_model_version(MockBridgeRaises()),
+            "unknown",
+        )
+
+
 class NormalizeTests(unittest.TestCase):
     """Pure-logic tests for the Equalizer-recipe normalization."""
 
@@ -430,6 +476,71 @@ class RunLoopTests(unittest.TestCase):
         error_states = [s for s in states if s.error]
         self.assertGreater(len(error_states), 0)
         self.assertIn("Classifier failed", error_states[-1].error)
+
+    def test_has_confident_data_stays_false_when_all_ood(self):
+        """All-OOD frames never trip the has_confident_data latch."""
+        good = {"1x1": 1.0, "Twinned (2x1)": 0.0, "c(6x2)": 0.0,
+                "rt13xrt13": 0.0, "HTR": 0.0}
+        # Quality below OOD_QUALITY_THRESHOLD (0.3) on every frame
+        bridge = FakeBridge(scores_seq=[good], quality=0.1)
+        w, states = self._make_worker(bridge)
+
+        w.start()
+        try:
+            self.assertTrue(_wait_for(lambda: len(states) >= 2))
+            for i in range(1, 5):
+                self._feed_frame(w, i)
+                self.assertTrue(_wait_for(
+                    lambda i=i: any(s.last_frame_number == i for s in states)
+                ))
+        finally:
+            self._stop_and_wait(w)
+
+        # Ready-time emission is not is_ood (quality=0 but no inference yet).
+        # All post-frame emissions must show has_confident_data=False.
+        post_frame_states = [s for s in states if s.last_frame_number > 0]
+        self.assertGreater(len(post_frame_states), 0)
+        for s in post_frame_states:
+            self.assertTrue(s.is_ood, f"frame {s.last_frame_number} should be OOD")
+            self.assertFalse(
+                s.has_confident_data,
+                f"frame {s.last_frame_number}: has_confident_data should stay False",
+            )
+
+    def test_has_confident_data_latches_true_and_stays_true(self):
+        """One non-OOD frame flips the latch; subsequent OOD frames keep it True."""
+        good = {"1x1": 1.0, "Twinned (2x1)": 0.0, "c(6x2)": 0.0,
+                "rt13xrt13": 0.0, "HTR": 0.0}
+        # First frame quality=0.9 (non-OOD), rest quality=0.1 (OOD)
+        bridge = FakeBridge(
+            scores_seq=[good],
+            quality=[0.9, 0.1, 0.1, 0.1, 0.1],
+        )
+        w, states = self._make_worker(bridge)
+
+        w.start()
+        try:
+            self.assertTrue(_wait_for(lambda: len(states) >= 2))
+            for i in range(1, 6):
+                self._feed_frame(w, i)
+                self.assertTrue(_wait_for(
+                    lambda i=i: any(s.last_frame_number == i for s in states)
+                ))
+        finally:
+            self._stop_and_wait(w)
+
+        by_frame = {s.last_frame_number: s for s in states if s.last_frame_number > 0}
+        # Frame 1 (non-OOD) latches the flag
+        self.assertFalse(by_frame[1].is_ood)
+        self.assertTrue(by_frame[1].has_confident_data,
+                        "frame 1 should latch has_confident_data True")
+        # Frames 2-5 (OOD) — has_confident_data must remain True
+        for i in range(2, 6):
+            self.assertTrue(by_frame[i].is_ood, f"frame {i} should be OOD")
+            self.assertTrue(
+                by_frame[i].has_confident_data,
+                f"frame {i}: has_confident_data must stay True once latched",
+            )
 
     def test_stop_exits_run_loop(self):
         """Clean stop → thread exits within the poll interval + slack.

@@ -163,9 +163,22 @@ class ClassifierState:
     is_bad: bool = False
     bad_confidence: float = 0.0
     is_ood: bool = False
+    # Latches True on the first non-OOD classification and stays True
+    # for the rest of the session. Lets the UI distinguish "OOD, showing
+    # last confident data" from "OOD, no confident data has ever
+    # arrived" (in which case ``smoothed_percent`` is just the ready-time
+    # uniform-20 placeholder and shouldn't be shown as if it were a
+    # real prediction).
+    has_confident_data: bool = False
 
     # Perf
     inference_ms: float = 0.0
+
+    # Model identity — filename + mtime of best_model.pth, set once at
+    # bridge-load time and repeated on every emission. Non-empty means
+    # the bridge loaded successfully. Displayed in the UI's tooltip so
+    # growers can tell at a glance which model checkpoint is running.
+    model_version: str = ""
 
 
 @dataclass

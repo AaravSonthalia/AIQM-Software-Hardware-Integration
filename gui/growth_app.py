@@ -119,6 +119,11 @@ class GrowthApp(QMainWindow):
         self.mistral_worker: Optional[MistralWorker] = None
         self.evap_worker: Optional[EvapControlWorker] = None
         self.classifier_worker: Optional[ClassifierWorker] = None
+        # Latest classifier state, cached from _on_classifier_state so the
+        # auto-capture event handler can snapshot it into each event
+        # directory (saves the model's opinion at trigger time — feeds the
+        # CS-team training-data pipeline).
+        self._latest_classifier: Optional[ClassifierState] = None
         self.growth_log = GrowthLogger()
 
         # Periodic sensor logging timer (1 second interval while running)
@@ -221,8 +226,12 @@ class GrowthApp(QMainWindow):
         # responsive during the ~1-2 s model load. If AI_for_quantum or
         # torch is missing, the worker emits an error state and the
         # sliders show "Classifier unavailable" — non-blocking for the
-        # rest of the app.
-        if not self.classifier_worker or not self.classifier_worker.isRunning():
+        # rest of the app. Skipped entirely when the config checkbox is
+        # unchecked so a misbehaving classifier can't block a session.
+        classifier_enabled = self.monitor.config_classifier_enabled.isChecked()
+        if classifier_enabled and (
+            not self.classifier_worker or not self.classifier_worker.isRunning()
+        ):
             self.classifier_worker = ClassifierWorker(
                 ai_repo_root=_resolve_ai_repo_root(),
             )
@@ -234,6 +243,17 @@ class GrowthApp(QMainWindow):
                 self._on_classifier_state,
             )
             self.classifier_worker.start()
+        elif not classifier_enabled:
+            # Defensive stop: if a previous arm cycle left a classifier
+            # worker running and the user re-armed with the checkbox
+            # off, kill it so the UI doesn't get updates from a stale
+            # worker while showing "disabled".
+            if self.classifier_worker and self.classifier_worker.isRunning():
+                self._stop_worker(self.classifier_worker)
+                self.classifier_worker = None
+            # Explicit "disabled" signal to the monitor so the sliders
+            # show a clear message instead of just staying at "idle".
+            self.monitor.set_classifier_disabled()
 
         if not self.pyrometer_worker or not self.pyrometer_worker.isRunning():
             exactus_port = self.monitor.config_exactus_port.text().strip() or "COM4"
@@ -482,7 +502,15 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot(ClassifierState)
     def _on_classifier_state(self, state: ClassifierState):
-        """Forward classifier worker state to the monitor's slider slot."""
+        """Forward classifier worker state to the monitor's slider slot.
+
+        Also caches the state so ``_on_auto_capture_event`` can snapshot
+        it into each event's buffer directory. The cache holds the most
+        recent emission by reference — no deep copy — because the worker
+        replaces state dict fields (raw_scores etc.) with new objects on
+        each cycle rather than mutating them.
+        """
+        self._latest_classifier = state
         self.monitor.update_classifier_state(state)
 
     @pyqtSlot(CameraState)
@@ -567,6 +595,18 @@ class GrowthApp(QMainWindow):
             buffer_dir=buffer_dir,
             event_state=initial_state,
         )
+        # Snapshot the latest classifier state into the event directory.
+        # Gives Justin's team a per-event training pair — visual context
+        # buffer + the model's opinion at trigger time — for every flagged
+        # event, essentially free. Only writes when there's a buffer dir
+        # (buffer_count > 0) AND a classifier state to snapshot.
+        if buffer_count > 0 and buffer_dir and self._latest_classifier is not None:
+            self._save_classifier_snapshot(
+                buffer_dir=buffer_dir,
+                event_idx=self._auto_capture_event_count,
+                event_score=score,
+            )
+
         # Surface the banner so the grower can discard if it looks spurious.
         # Default action (timeout) is to keep — the buffer is already on disk.
         if buffer_count > 0:
@@ -574,6 +614,60 @@ class GrowthApp(QMainWindow):
                 event_idx=self._auto_capture_event_count,
                 score=score,
                 buffer_dir=buffer_dir,
+            )
+
+    def _save_classifier_snapshot(
+        self, buffer_dir: str, event_idx: int, event_score: float,
+    ) -> None:
+        """Write ``classifier_state.json`` next to the event's frame buffer.
+
+        Note: the snapshot reflects the *most recent* classifier emission,
+        which may be up to ``ClassifierWorker.POLL_INTERVAL_S`` (~0.5 s)
+        older than the frame that triggered the auto-capture. That
+        latency is acceptable for training-data purposes; if it ever
+        becomes limiting, the fix is to classify the flagged frame
+        synchronously here instead of using the cached state.
+        """
+        import json
+        from datetime import datetime as _dt
+
+        cs = self._latest_classifier
+        if cs is None:  # defensive — caller already checked, keep for lint
+            return
+
+        smoothed = cs.smoothed_percent or {}
+        argmax_class = (
+            max(smoothed.items(), key=lambda kv: kv[1])[0]
+            if smoothed and cs.has_confident_data
+            else None
+        )
+        snapshot = {
+            "timestamp_iso": _dt.now().isoformat(),
+            "event_idx": event_idx,
+            "event_score": float(event_score),
+            "elapsed_s": self.monitor.get_elapsed_seconds(),
+            "predicted_class": argmax_class,
+            "smoothed_percent": {k: int(v) for k, v in smoothed.items()},
+            "normalized_percent": {
+                k: int(v) for k, v in (cs.normalized_percent or {}).items()
+            },
+            "raw_scores": {k: float(v) for k, v in (cs.raw_scores or {}).items()},
+            "raw_sum": float(cs.raw_sum),
+            "quality": float(cs.quality),
+            "is_bad": bool(cs.is_bad),
+            "bad_confidence": float(cs.bad_confidence),
+            "is_ood": bool(cs.is_ood),
+            "has_confident_data": bool(cs.has_confident_data),
+            "inference_ms": float(cs.inference_ms),
+            "model_version": cs.model_version,
+            "last_classified_frame_number": int(cs.last_frame_number),
+        }
+        out_path = Path(buffer_dir) / "classifier_state.json"
+        try:
+            out_path.write_text(json.dumps(snapshot, indent=2))
+        except Exception as e:
+            log.warning(
+                "Failed to write classifier snapshot to %s: %s", out_path, e,
             )
 
     @pyqtSlot(int, str, str)
