@@ -543,25 +543,73 @@ class RunLoopTests(unittest.TestCase):
             )
 
     def test_stop_exits_run_loop(self):
-        """Clean stop → thread exits within the poll interval + slack.
+        """Clean stop mid-session → thread exits within poll interval + slack.
 
-        Waits for the ready-state emission (not just isRunning()) before
-        stopping: the codebase-wide worker pattern sets ``self.running =
-        True`` at the top of ``run()``, so an early ``stop()`` racing
-        with that assignment can leave ``running`` stuck at True. Waiting
-        for a real emission guarantees ``run()`` is past that line.
+        The ``_wait_for`` past the first emissions used to be a workaround
+        for the ``self.running = True`` in ``run()`` race — with the fix
+        (workers set ``running = True`` in ``__init__``), it's no longer
+        strictly necessary here. It's kept so the test exercises the
+        realistic "stop was called while worker was actively polling"
+        scenario. See ``test_stop_before_start_still_exits`` for the
+        specific race-fix regression check.
         """
         bridge = FakeBridge()
         w, states = self._make_worker(bridge)
 
         w.start()
         try:
-            self.assertTrue(_wait_for(lambda: len(states) >= 2))  # past the race
+            self.assertTrue(_wait_for(lambda: len(states) >= 2))
             self.assertTrue(w.isRunning())
         finally:
             w.stop()
             self.assertTrue(w.wait(2000))
             self.assertFalse(w.isRunning())
+
+    def test_stop_before_start_still_exits(self):
+        """Regression test for the stop()-before-run race (Jul 6 2026 fix).
+
+        Prior behaviour: ``self.running = True`` at the top of ``run()``
+        clobbered the ``False`` a preceding ``stop()`` had set — the
+        loop then ran forever, ignoring the stop request. The fix moves
+        the True assignment to ``__init__``.
+
+        This test forces the exact race scenario:
+
+            1. Construct worker (``running == True`` immediately from
+               ``__init__``).
+            2. Call ``stop()`` BEFORE ``start()`` (``running == False``).
+            3. Call ``start()`` — ``run()`` executes, but with the fix
+               there's no early assignment to clobber the ``False``,
+               so ``while self.running`` skips the loop and the thread
+               exits cleanly.
+
+        Without the fix, ``w.wait()`` times out here and the assertion
+        fires.
+        """
+        bridge = FakeBridge()
+        w, states = self._make_worker(bridge)
+
+        # __init__ side of the fix.
+        self.assertTrue(
+            w.running,
+            "worker must be running=True immediately from __init__ "
+            "(pre-fix regression check)",
+        )
+
+        # Force the race: stop before start.
+        w.stop()
+        self.assertFalse(w.running)
+
+        # start() the thread — with the fix, run() honors the pre-set
+        # False and exits without spinning the polling loop.
+        w.start()
+        self.assertTrue(
+            w.wait(2000),
+            "worker must exit within 2s when stop was called before "
+            "start — if this times out, the run()-clobbers-stop race "
+            "has been reintroduced",
+        )
+        self.assertFalse(w.isRunning())
 
 
 if __name__ == "__main__":

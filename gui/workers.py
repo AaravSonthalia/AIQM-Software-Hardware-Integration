@@ -26,14 +26,17 @@ class PowerSupplyWorker(QThread):
         self.resource = resource
         self.poll_interval = poll_interval
         self.psu: Optional[OWONPowerSupply] = None
-        self.running = False
+        # Set in __init__ (not run()) to close the stop()-before-run
+        # race — if stop() fires between start() and the first line of
+        # run(), it must not be undone by a re-assignment. See
+        # worker_run_race_followup memory for the full rationale.
+        self.running = True
         self._command_queue = []
         self._consecutive_failures = 0
         self._poll_counter = 0
 
     def run(self):
         """Main worker loop."""
-        self.running = True
         state = PowerSupplyState()
 
         # Connect
@@ -158,12 +161,13 @@ class ThermocoupleWorker(QThread):
         super().__init__()
         self.port = port
         self.poll_interval = poll_interval
-        self.running = False
+        # True from __init__ to close the stop()-before-run race
+        # (see PowerSupplyWorker for the full comment).
+        self.running = True
         self._sensor = None
 
     def run(self):
         """Main worker loop."""
-        self.running = True
         state = TemperatureState()
 
         # Import here to avoid hard dependency at module level
@@ -254,12 +258,13 @@ class RheedCameraWorker(QThread):
         super().__init__()
         self.mode = mode
         self.poll_interval = poll_interval
-        self.running = False
+        # True from __init__ to close the stop()-before-run race
+        # (see PowerSupplyWorker for the full comment).
+        self.running = True
         self._camera = None
 
     def run(self):
         """Main worker loop — connect camera and emit frames."""
-        self.running = True
         state = CameraState(mode=self.mode)
 
         # Create camera driver based on mode
@@ -349,12 +354,13 @@ class PyrometerWorker(QThread):
         self.samples_per_poll = max(1, int(samples_per_poll))
         self.port = port
         self.baudrate = baudrate
-        self.running = False
+        # True from __init__ to close the stop()-before-run race
+        # (see PowerSupplyWorker for the full comment).
+        self.running = True
         self._sensor = None
 
     def run(self):
         """Main worker loop — connect pyrometer and emit temperatures."""
-        self.running = True
         state = PyrometerState(mode=self.mode)
 
         try:
@@ -456,11 +462,12 @@ class MistralWorker(QThread):
         super().__init__()
         self.mode = mode
         self.poll_interval = poll_interval
-        self.running = False
+        # True from __init__ to close the stop()-before-run race
+        # (see PowerSupplyWorker for the full comment).
+        self.running = True
         self._driver = None
 
     def run(self):
-        self.running = True
         state = MistralState(mode=self.mode)
         self._driver = self._create_driver()
 
@@ -536,11 +543,12 @@ class EvapControlWorker(QThread):
         super().__init__()
         self.mode = mode
         self.poll_interval = poll_interval
-        self.running = False
+        # True from __init__ to close the stop()-before-run race
+        # (see PowerSupplyWorker for the full comment).
+        self.running = True
         self._driver = None
 
     def run(self):
-        self.running = True
         state = EvapControlState(mode=self.mode)
         self._driver = self._create_driver()
 
@@ -653,7 +661,9 @@ class ClassifierWorker(QThread):
         super().__init__()
         self.ai_repo_root = ai_repo_root
         self.model_path = model_path
-        self.running = False
+        # True from __init__ to close the stop()-before-run race
+        # (see PowerSupplyWorker for the full comment).
+        self.running = True
 
         # Frame handoff — mutex-protected latest frame (drop-old, not FIFO).
         self._frame_mutex = QMutex()
@@ -695,8 +705,6 @@ class ClassifierWorker(QThread):
     def run(self) -> None:
         """Main loop — load bridge once, then classify at POLL_INTERVAL_S."""
         from gui.recon_labels import RECON_LABELS
-
-        self.running = True
 
         # Emit initial loading state so the UI can show "Loading classifier…"
         state = ClassifierState()  # loading=True, ready=False, error=""
