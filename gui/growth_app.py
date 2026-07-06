@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from PyQt6.QtWidgets import QMainWindow
-from PyQt6.QtCore import pyqtSlot, QTimer
+from PyQt6.QtCore import pyqtSlot, Qt, QTimer
 
 log = logging.getLogger(__name__)
 
@@ -23,9 +24,12 @@ from gui.growth_logger import (
     EVENT_STATE_DISCARDED,
     EVENT_STATE_PENDING,
 )
-from gui.state import CameraState, EvapControlState, MistralState, PyrometerState
+from gui.state import (
+    CameraState, ClassifierState, EvapControlState, MistralState, PyrometerState,
+)
 from gui.workers import (
-    EvapControlWorker, MistralWorker, PyrometerWorker, RheedCameraWorker,
+    ClassifierWorker, EvapControlWorker, MistralWorker,
+    PyrometerWorker, RheedCameraWorker,
 )
 from gui.growth_monitor import GrowthMonitor
 from gui.growth_logger import GrowthLogger
@@ -85,6 +89,23 @@ def resolve_workspace_folder(folder: str | Path) -> Path:
     return path
 
 
+def _resolve_ai_repo_root() -> str:
+    """Find the AI_for_quantum repo path for ClassifierBridge.
+
+    Matches ``gui/events_tab.py::_default_ai_repo_root`` — precedence:
+    ``AI_REPO_ROOT`` env var → Bulbasaur default (Windows) → Mac default.
+    Duplicated here rather than shared because the two callers otherwise
+    have no other coupling; move to a shared module if a third caller
+    appears.
+    """
+    env = os.environ.get("AI_REPO_ROOT")
+    if env:
+        return env
+    if sys.platform == "win32":
+        return r"C:\Users\Lab10\AI_for_quantum"
+    return "/Users/aj/test-claude/projects/ai-for-quantum"
+
+
 class GrowthApp(QMainWindow):
     """Main window for the OMBE Growth Monitor application."""
 
@@ -97,6 +118,7 @@ class GrowthApp(QMainWindow):
         self.pyrometer_worker: Optional[PyrometerWorker] = None
         self.mistral_worker: Optional[MistralWorker] = None
         self.evap_worker: Optional[EvapControlWorker] = None
+        self.classifier_worker: Optional[ClassifierWorker] = None
         self.growth_log = GrowthLogger()
 
         # Periodic sensor logging timer (1 second interval while running)
@@ -191,6 +213,28 @@ class GrowthApp(QMainWindow):
             self.camera_worker.state_updated.connect(self._on_camera_state)
             self.camera_worker.start()
 
+        # Live RHEED classifier — reads frames from the camera worker via a
+        # DirectConnection slot (mutex-protected write in sender's thread,
+        # no receiver event loop required) and emits smoothed
+        # classification percentages that drive the main-tab sliders.
+        # Bridge load happens inside the worker thread so the UI stays
+        # responsive during the ~1-2 s model load. If AI_for_quantum or
+        # torch is missing, the worker emits an error state and the
+        # sliders show "Classifier unavailable" — non-blocking for the
+        # rest of the app.
+        if not self.classifier_worker or not self.classifier_worker.isRunning():
+            self.classifier_worker = ClassifierWorker(
+                ai_repo_root=_resolve_ai_repo_root(),
+            )
+            self.camera_worker.state_updated.connect(
+                self.classifier_worker.on_rheed_state,
+                Qt.ConnectionType.DirectConnection,
+            )
+            self.classifier_worker.state_updated.connect(
+                self._on_classifier_state,
+            )
+            self.classifier_worker.start()
+
         if not self.pyrometer_worker or not self.pyrometer_worker.isRunning():
             exactus_port = self.monitor.config_exactus_port.text().strip() or "COM4"
             exactus_baud = int(self.monitor.config_exactus_baud.currentText())
@@ -234,6 +278,9 @@ class GrowthApp(QMainWindow):
 
         self._stop_worker(self.evap_worker)
         self.evap_worker = None
+
+        self._stop_worker(self.classifier_worker)
+        self.classifier_worker = None
 
         self.monitor.reset_displays()
         self.monitor.set_state("idle")
@@ -432,6 +479,11 @@ class GrowthApp(QMainWindow):
         )
 
     # --- Worker state fan-out to monitor -----------------------------------
+
+    @pyqtSlot(ClassifierState)
+    def _on_classifier_state(self, state: ClassifierState):
+        """Forward classifier worker state to the monitor's slider slot."""
+        self.monitor.update_classifier_state(state)
 
     @pyqtSlot(CameraState)
     def _on_camera_state(self, state: CameraState):

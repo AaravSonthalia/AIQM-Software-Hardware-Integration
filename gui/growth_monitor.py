@@ -43,7 +43,7 @@ def _default_save_path() -> str:
     return "logs/growths"
 
 from gui.state import (
-    CameraState, EvapControlState, MistralState,
+    CameraState, ClassifierState, EvapControlState, MistralState,
     PowerSupplyState, PyrometerState,
 )
 from gui.widgets import ValueDisplay
@@ -426,17 +426,22 @@ class GrowthMonitor(QWidget):
         right = QVBoxLayout()
         right.setSpacing(8)
 
-        # Reconstruction estimate sliders
-        recon_label = QLabel("Reconstruction Estimate (%)")
+        # Live classification sliders — driven by the classifier worker
+        # (see gui/workers.py::ClassifierWorker). Read-only for MVP; the
+        # grower-override flow is a follow-up. Section header, canonical
+        # label list from gui.recon_labels, and a per-cycle status line
+        # below the sliders showing the raw-score sum + inference time.
+        from gui.recon_labels import RECON_LABELS
+
+        recon_label = QLabel("Live Classification (%)")
         recon_label.setStyleSheet("font-size: 13px; font-weight: bold;")
         right.addWidget(recon_label)
 
         self._recon_sliders: dict[str, QSlider] = {}
         self._recon_value_labels: dict[str, QLabel] = {}
-        recon_names = ["1x1", "Twinned (2x1)", "c(6x2)", "rt13xrt13", "HTR"]
         recon_grid = QHBoxLayout()
         recon_grid.setSpacing(6)
-        for name in recon_names:
+        for name in RECON_LABELS:
             col = QVBoxLayout()
             col.setSpacing(2)
             lbl = QLabel(name)
@@ -446,6 +451,7 @@ class GrowthMonitor(QWidget):
             slider = QSlider(Qt.Orientation.Vertical)
             slider.setRange(0, 100)
             slider.setValue(0)
+            slider.setEnabled(False)  # Option A: read-only display
             slider.setTickPosition(QSlider.TickPosition.TicksRight)
             slider.setTickInterval(25)
             slider.setFixedHeight(90)
@@ -464,10 +470,15 @@ class GrowthMonitor(QWidget):
             recon_grid.addLayout(col)
             self._recon_sliders[name] = slider
             self._recon_value_labels[name] = val_lbl
-            slider.valueChanged.connect(
-                lambda v, n=name: self._recon_value_labels[n].setText(f"{v}%")
-            )
         right.addLayout(recon_grid)
+
+        # Transparency label: shows raw-score sum, inference time, OOD flag,
+        # or error text depending on classifier state. Same slot updates
+        # both this label and the slider values (see update_classifier_state).
+        self._recon_status_label = QLabel("Classifier idle")
+        self._recon_status_label.setStyleSheet("font-size: 10px; color: #888;")
+        self._recon_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        right.addWidget(self._recon_status_label)
 
         # Note input
         note_label = QLabel("Log Entry")
@@ -851,6 +862,66 @@ class GrowthMonitor(QWidget):
             self._current_frame = state.frame
             self._display_frame(state.frame)
 
+    def update_classifier_state(self, state: ClassifierState):
+        """Route ClassifierState to the recon sliders + status label.
+
+        Display modes:
+            - loading  : status = "Loading classifier…", sliders unchanged
+            - error    : status = "⚠ <error>" in red, sliders unchanged
+            - waiting  : status = "Waiting for frames…", sliders at uniform 20
+            - is_ood   : status = "OOD — quality X.XX", sliders frozen at
+                         last confident value (worker enforces freeze)
+            - normal   : status = "Sum: X.XX  |  Nms", sliders show
+                         smoothed_percent
+
+        Sliders are read-only (Option A) so ``blockSignals`` isn't
+        strictly required, but it's cheap and future-proof if we ever
+        re-enable interactivity for a grower-override mode.
+        """
+        if state.loading:
+            self._recon_status_label.setText("Loading classifier…")
+            self._recon_status_label.setStyleSheet(
+                "font-size: 10px; color: #888;"
+            )
+            return
+        if state.error:
+            self._recon_status_label.setText(f"⚠ {state.error}")
+            self._recon_status_label.setStyleSheet(
+                "font-size: 10px; color: #c33;"
+            )
+            return
+
+        # Ready — update sliders from smoothed_percent
+        smoothed = state.smoothed_percent
+        if smoothed:
+            for name, slider in self._recon_sliders.items():
+                v = int(smoothed.get(name, 0))
+                slider.blockSignals(True)
+                slider.setValue(v)
+                slider.blockSignals(False)
+                self._recon_value_labels[name].setText(f"{v}%")
+
+        # Status line: OOD > waiting > normal
+        if state.is_ood:
+            self._recon_status_label.setText(
+                f"OOD — quality {state.quality:.2f}; showing last confident"
+            )
+            self._recon_status_label.setStyleSheet(
+                "font-size: 10px; color: #d97706;"  # amber
+            )
+        elif state.last_frame_number < 0:
+            self._recon_status_label.setText("Waiting for frames…")
+            self._recon_status_label.setStyleSheet(
+                "font-size: 10px; color: #888;"
+            )
+        else:
+            self._recon_status_label.setText(
+                f"Sum: {state.raw_sum:.2f}  |  {state.inference_ms:.0f} ms"
+            )
+            self._recon_status_label.setStyleSheet(
+                "font-size: 10px; color: #888;"
+            )
+
     # ----- RHEED frame display --------------------------------------------
 
     def _display_frame(self, frame: np.ndarray):
@@ -911,9 +982,9 @@ class GrowthMonitor(QWidget):
         # Clear the note input for next entry
         self.log_note_input.clear()
 
-        # Reset sliders to 0 after commit
-        for slider in self._recon_sliders.values():
-            slider.setValue(0)
+        # Sliders are classifier-driven (read-only) — no reset needed.
+        # The next classifier emission will keep them in sync with the
+        # live model output.
 
         self.commit_requested.emit(entry)
 
@@ -1064,6 +1135,15 @@ class GrowthMonitor(QWidget):
         self.pressure_display.value.setText("---")
         self.rheed_image_label.clear()
         self.auto_capture_label.setText("Auto-capture: idle")
+        # Classifier sliders back to zero + idle status; the next arm will
+        # trigger a fresh "Loading classifier…" cycle.
+        for name, slider in self._recon_sliders.items():
+            slider.blockSignals(True)
+            slider.setValue(0)
+            slider.blockSignals(False)
+            self._recon_value_labels[name].setText("0%")
+        self._recon_status_label.setText("Classifier idle")
+        self._recon_status_label.setStyleSheet("font-size: 10px; color: #888;")
         self._start_time = None
         self._current_frame = None
         self._latest_psu = None
