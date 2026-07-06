@@ -18,12 +18,16 @@ from typing import Optional
 
 import numpy as np
 
-# Label mapping: GUI display labels → Classifier2 internal labels.
-# Classifier2 uses: ['(1 x 1)', 'Twinned(2 x 1)', 'c(6 x 2)', '(√13 x √13)', 'HTR']
-# GUI uses shorter versions for slider space.
-GUI_LABELS = ["(1x1)", "Tw(2x1)", "c(6x2)", "rt13", "HTR"]
-C2_LABELS = ["(1 x 1)", "Twinned(2 x 1)", "c(6 x 2)", "(√13 x √13)", "HTR"]
-_C2_TO_GUI = dict(zip(C2_LABELS, GUI_LABELS))
+# Label constants live in gui/recon_labels.py so the bridge, the main-tab
+# sliders, and any future component share one source of truth. The
+# ``GUI_LABELS`` / ``C2_LABELS`` names are kept as aliases so existing
+# importers (scripts/classifier_demo.py) keep working; new code should
+# import from ``gui.recon_labels`` directly.
+from gui.recon_labels import RECON_LABELS, CLASSIFIER2_TO_GUI
+
+GUI_LABELS = RECON_LABELS
+C2_LABELS = list(CLASSIFIER2_TO_GUI.keys())
+_C2_TO_GUI = CLASSIFIER2_TO_GUI
 
 
 class ClassifierBridge:
