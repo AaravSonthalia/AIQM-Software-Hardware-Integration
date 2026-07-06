@@ -310,6 +310,18 @@ class GrowthMonitor(QWidget):
         self._latest_camera: Optional[CameraState] = None
         self._latest_mistral: Optional[MistralState] = None
         self._latest_evap: Optional[EvapControlState] = None
+        # Classifier state — cached by update_classifier_state so _on_commit
+        # can pair the classifier's smoothed_percent with the grower's slider
+        # values in every log entry (for Yuxin's #1 active-comparisons signal).
+        self._latest_classifier: Optional[ClassifierState] = None
+        # Grower-correction UI state (Jul 6 2026 — deliverable #5):
+        #   _correction_active — True while the ✎ Correct toggle is on.
+        #   _adjusting — reentrancy guard for Pattern A proportional
+        #     adjustment; without it, the valueChanged signal cascade from
+        #     one slider recursively re-triggers via the others we
+        #     programmatically set, and Qt happily blows the stack.
+        self._correction_active: bool = False
+        self._adjusting: bool = False
         self._current_frame: Optional[np.ndarray] = None
 
         self._build_ui()
@@ -433,9 +445,39 @@ class GrowthMonitor(QWidget):
         # below the sliders showing the raw-score sum + inference time.
         from gui.recon_labels import RECON_LABELS
 
+        # Header row: title on the left, ✎ Correct toggle on the right.
+        # Toggle unlocks the sliders for grower correction (Pattern A
+        # proportional adjustment; sum always sits at 100). Auto-locks
+        # after LOG ENTRY so every correction is a per-entry decision,
+        # not a session-wide setting. See _on_correction_toggled +
+        # _on_grower_slider_changed for the interaction logic.
+        recon_header = QHBoxLayout()
+        recon_header.setContentsMargins(0, 0, 0, 0)
         recon_label = QLabel("Live Classification (%)")
         recon_label.setStyleSheet("font-size: 13px; font-weight: bold;")
-        right.addWidget(recon_label)
+        recon_header.addWidget(recon_label, 1)
+
+        self.correction_btn = QPushButton("✎ Correct")
+        self.correction_btn.setCheckable(True)
+        self.correction_btn.setFixedHeight(24)
+        self.correction_btn.setStyleSheet(
+            "QPushButton { background-color: #1a1a1a; color: #aaa; "
+            "border: 1px solid #444; padding: 2px 10px; font-size: 11px; }"
+            "QPushButton:checked { background-color: #7f1d3d; color: #fff; "
+            "border: 1px solid #e11d48; }"
+            "QPushButton:disabled { color: #444; border-color: #2a2a2a; }"
+        )
+        self.correction_btn.setToolTip(
+            "Toggle to override the classifier's live prediction. Sliders "
+            "become draggable and stay summed to 100% (proportional "
+            "adjustment). The next LOG ENTRY captures both your belief and "
+            "the classifier's — the pair feeds Yuxin's active-comparisons "
+            "training signal. Auto-locks after each LOG ENTRY so every "
+            "correction is a fresh decision."
+        )
+        self.correction_btn.clicked.connect(self._on_correction_toggled)
+        recon_header.addWidget(self.correction_btn, 0)
+        right.addLayout(recon_header)
 
         self._recon_sliders: dict[str, QSlider] = {}
         self._recon_value_labels: dict[str, QLabel] = {}
@@ -455,13 +497,7 @@ class GrowthMonitor(QWidget):
             slider.setTickPosition(QSlider.TickPosition.TicksRight)
             slider.setTickInterval(25)
             slider.setFixedHeight(90)
-            slider.setStyleSheet(
-                "QSlider::groove:vertical { background: #333; width: 6px; }"
-                "QSlider::handle:vertical { background: #0d9488; height: 12px; "
-                "margin: 0 -4px; border-radius: 6px; }"
-                "QSlider::sub-page:vertical { background: #555; }"
-                "QSlider::add-page:vertical { background: #0d9488; }"
-            )
+            slider.setStyleSheet(self._SLIDER_STYLE_LIVE)
             col.addWidget(slider, alignment=Qt.AlignmentFlag.AlignHCenter)
             val_lbl = QLabel("0%")
             val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -471,6 +507,16 @@ class GrowthMonitor(QWidget):
             self._recon_sliders[name] = slider
             self._recon_value_labels[name] = val_lbl
         right.addLayout(recon_grid)
+
+        # Grower-correction Pattern A signal wiring. The handler no-ops
+        # unless self._correction_active is True, so classifier-driven
+        # slider updates (which use blockSignals for their own reasons)
+        # never trigger it. Default-arg capture on ``n`` is required to
+        # dodge Python's late-binding closure-over-loop-variable trap.
+        for name, slider in self._recon_sliders.items():
+            slider.valueChanged.connect(
+                lambda v, n=name: self._on_grower_slider_changed(n, v)
+            )
 
         # Transparency label: shows raw-score sum, inference time, OOD flag,
         # or error text depending on classifier state. Same slot updates
@@ -881,6 +927,30 @@ class GrowthMonitor(QWidget):
     _RECON_STATUS_STYLE_INFO = "font-size: 10px; color: #888;"
     _RECON_STATUS_STYLE_WARN = "font-size: 10px; color: #d97706;"  # amber
     _RECON_STATUS_STYLE_ERROR = "font-size: 10px; color: #c33;"    # red
+    # Correction-mode styles: rose (#e11d48) to distinguish grower-driven
+    # sliders from classifier-driven at a glance. Same color also on the
+    # ✎ Correct button checked state so the whole section reads "in
+    # correction" instantly.
+    _RECON_STATUS_STYLE_CORRECTION = (
+        "font-size: 10px; color: #e11d48; font-weight: bold;"
+    )
+    _RECON_VAL_STYLE_CORRECTION = (
+        "font-size: 11px; color: #e11d48; font-weight: bold;"
+    )
+    _SLIDER_STYLE_LIVE = (
+        "QSlider::groove:vertical { background: #333; width: 6px; }"
+        "QSlider::handle:vertical { background: #0d9488; height: 12px; "
+        "margin: 0 -4px; border-radius: 6px; }"
+        "QSlider::sub-page:vertical { background: #555; }"
+        "QSlider::add-page:vertical { background: #0d9488; }"
+    )
+    _SLIDER_STYLE_CORRECTION = (
+        "QSlider::groove:vertical { background: #3f0a1a; width: 6px; }"
+        "QSlider::handle:vertical { background: #e11d48; height: 14px; "
+        "margin: 0 -5px; border-radius: 7px; }"
+        "QSlider::sub-page:vertical { background: #555; }"
+        "QSlider::add-page:vertical { background: #e11d48; }"
+    )
     _ARGMAX_HIGHLIGHT_THRESHOLD = 30  # only highlight when clearly above uniform-20
 
     def update_classifier_state(self, state: ClassifierState):
@@ -917,7 +987,22 @@ class GrowthMonitor(QWidget):
         Sliders are read-only (Option A) so ``blockSignals`` isn't
         strictly required, but it's cheap insurance if we ever re-enable
         interactivity for a grower-override mode.
+
+        Correction-mode short-circuit: when self._correction_active is
+        True, the grower is currently driving the sliders and the
+        classifier's live output must NOT overwrite them. We still cache
+        the state (so _on_commit can pair grower vs classifier in the
+        log entry) and keep the status label showing the correction-mode
+        message set by _on_correction_toggled. All slider/value-label
+        rendering paths below are skipped.
         """
+        # Cache first — needed for _on_commit's classifier_recon_* fields
+        # even when correction mode has suppressed slider updates.
+        self._latest_classifier = state
+
+        if self._correction_active:
+            return
+
         model_line = f"Model: {state.model_version}\n" if state.model_version else ""
 
         if state.loading:
@@ -1037,7 +1122,19 @@ class GrowthMonitor(QWidget):
         Sliders zero out, value labels reset, status label makes the
         disabled state explicit so growers don't wonder why the
         classifier isn't reporting.
+
+        Also disables the ✎ Correct button: correcting a classifier that
+        isn't running would produce a "grower belief with no classifier
+        pair" log entry, which pollutes Yuxin's #1 active-comparisons
+        signal (the whole point of the pair is having both sides).
         """
+        # Force correction off first — otherwise the setEnabled(False)
+        # loop below re-locks sliders that the correction toggle would
+        # otherwise have left enabled.
+        if self._correction_active:
+            self.correction_btn.setChecked(False)
+            self._on_correction_toggled(False)
+        self.correction_btn.setEnabled(False)
         for name, slider in self._recon_sliders.items():
             slider.blockSignals(True)
             slider.setValue(0)
@@ -1075,6 +1172,201 @@ class GrowthMonitor(QWidget):
         )
         self.rheed_image_label.setPixmap(pixmap)
 
+    # ----- Grower correction (deliverable #5) -----------------------------
+
+    def _on_correction_toggled(self, checked: bool):
+        """Handler for the ✎ Correct toggle.
+
+        On (checked=True):
+            - Unlock sliders (setEnabled True) so the grower can drag.
+            - Immediately normalize existing slider values to sum-100 so
+              the correction state starts from a clean total, even when
+              the classifier's smoothed_percent rounded to 99 or 101.
+            - Swap slider handle color to rose (#e11d48) so it's obvious
+              at a glance which mode is active.
+            - Replace the status label with the correction-mode message.
+
+        Off (checked=False):
+            - Lock sliders (setEnabled False), restore teal handle color.
+            - Re-render the last classifier state (if any) so the sliders
+              resume tracking the live model. Idle fallback if the
+              classifier never emitted.
+
+        Sync the button state defensively so callers who invoke this
+        directly (tests, reset paths, auto-lock in _on_commit) leave the
+        UI in a self-consistent state — clicked(bool) from a real button
+        click already matches, so setChecked here is a cheap no-op for
+        that path.
+        """
+        self._correction_active = checked
+        if self.correction_btn.isChecked() != checked:
+            self.correction_btn.setChecked(checked)
+        for slider in self._recon_sliders.values():
+            slider.setEnabled(checked)
+
+        if checked:
+            self._normalize_sliders_to_100()
+            for slider in self._recon_sliders.values():
+                slider.setStyleSheet(self._SLIDER_STYLE_CORRECTION)
+            for name, slider in self._recon_sliders.items():
+                self._recon_value_labels[name].setText(f"{slider.value()}%")
+                self._recon_value_labels[name].setStyleSheet(
+                    self._RECON_VAL_STYLE_CORRECTION,
+                )
+            self._recon_status_label.setText(
+                "✎ Correction mode — drag sliders (sum stays at 100%)"
+            )
+            self._recon_status_label.setStyleSheet(
+                self._RECON_STATUS_STYLE_CORRECTION,
+            )
+            self._recon_status_label.setToolTip(
+                "Grower correction is active. Drag any slider — the other "
+                "four adjust proportionally to keep the total at 100%. The "
+                "next LOG ENTRY captures both your belief and the "
+                "classifier's, then auto-locks this toggle so the next "
+                "entry is a fresh decision.\n\n"
+                "Uncheck to resume classifier-driven display without "
+                "logging a correction."
+            )
+        else:
+            for slider in self._recon_sliders.values():
+                slider.setStyleSheet(self._SLIDER_STYLE_LIVE)
+            if self._latest_classifier is not None:
+                self.update_classifier_state(self._latest_classifier)
+            else:
+                for name, slider in self._recon_sliders.items():
+                    slider.blockSignals(True)
+                    slider.setValue(0)
+                    slider.blockSignals(False)
+                    self._recon_value_labels[name].setText("0%")
+                    self._recon_value_labels[name].setStyleSheet(
+                        self._RECON_VAL_STYLE_NORMAL,
+                    )
+                self._recon_status_label.setText("Classifier idle")
+                self._recon_status_label.setStyleSheet(
+                    self._RECON_STATUS_STYLE_INFO,
+                )
+                self._recon_status_label.setToolTip("")
+
+    def _normalize_sliders_to_100(self):
+        """Force the 5 sliders to sum to 100 via proportional scaling.
+
+        Called on correction-mode entry so the first draggable state
+        starts from a clean total, even when the classifier's
+        smoothed_percent sums to 99 or 101 due to integer rounding, or
+        when the sliders are all at 0 (fresh session, classifier idle).
+
+        Edge cases:
+            - Total already 100 → no-op.
+            - Total is 0 → uniform distribution (20 each with residual on
+              the first slider — this is what "no signal, all classes
+              equally likely" means).
+            - Non-integer proportional result → assign residual to the
+              largest slider so the integer sum lands exactly on 100.
+
+        Uses blockSignals so this normalization pass doesn't trigger
+        the grower-slider handler (which would try to re-normalize
+        recursively).
+        """
+        values = {n: s.value() for n, s in self._recon_sliders.items()}
+        total = sum(values.values())
+        if total == 100:
+            return
+
+        n_sliders = len(values)
+        if total == 0:
+            base = 100 // n_sliders
+            residual = 100 - base * n_sliders
+            new_values = {
+                name: base + (1 if i < residual else 0)
+                for i, name in enumerate(values)
+            }
+        else:
+            new_values = {
+                n: int(round(v * 100 / total)) for n, v in values.items()
+            }
+            diff = 100 - sum(new_values.values())
+            if diff != 0:
+                largest = max(new_values, key=new_values.get)
+                new_values[largest] += diff
+
+        for name, v in new_values.items():
+            slider = self._recon_sliders[name]
+            slider.blockSignals(True)
+            slider.setValue(max(0, min(100, v)))
+            slider.blockSignals(False)
+
+    def _on_grower_slider_changed(self, changed_name: str, new_value: int):
+        """Grower dragged a slider — proportionally adjust the others so
+        the total returns to 100 (Pattern A). No-op when correction is
+        off, no-op when we're already inside a programmatic adjustment
+        (recursion guard).
+
+        Algorithm:
+            1. The 4 other sliders' new sum must equal 100 - new_value.
+            2. If those 4 currently sum to 0, distribute the target sum
+               uniformly (with integer residual on the first sliders).
+            3. Otherwise, scale each by (its_current / current_sum) *
+               target — integer-rounded — then push any rounding
+               residual (±1 or ±2) onto the currently-largest one so
+               the integer total lands exactly on 100.
+
+        The _adjusting guard is the primary recursion defense: it
+        rejects the re-entry that happens when our own setValue()
+        below fires *this* handler again for a sibling slider. The
+        blockSignals() calls are belt-and-suspenders — cheap enough
+        and make the intent explicit at the call site.
+        """
+        if not self._correction_active or self._adjusting:
+            return
+
+        self._adjusting = True
+        try:
+            others = [
+                (n, s) for n, s in self._recon_sliders.items()
+                if n != changed_name
+            ]
+            others_target_sum = 100 - new_value
+            current_others_sum = sum(s.value() for _, s in others)
+
+            if current_others_sum == 0:
+                # No signal to preserve → uniform distribute.
+                n_others = len(others)
+                base = others_target_sum // n_others
+                residual = others_target_sum - base * n_others
+                new_values = {
+                    name: base + (1 if i < residual else 0)
+                    for i, (name, _) in enumerate(others)
+                }
+            else:
+                # Preserve relative shape, scale to hit target sum.
+                new_values = {
+                    name: int(round(s.value() * others_target_sum
+                                    / current_others_sum))
+                    for name, s in others
+                }
+                diff = others_target_sum - sum(new_values.values())
+                if diff != 0:
+                    largest = max(new_values, key=new_values.get)
+                    new_values[largest] += diff
+
+            for name, v in new_values.items():
+                slider = self._recon_sliders[name]
+                slider.blockSignals(True)
+                slider.setValue(max(0, min(100, v)))
+                slider.blockSignals(False)
+
+            # Refresh all value labels so what the grower sees matches
+            # what will land in the CSV. Uses the correction style so
+            # the row keeps its "grower is driving" visual state.
+            for name, slider in self._recon_sliders.items():
+                self._recon_value_labels[name].setText(f"{slider.value()}%")
+                self._recon_value_labels[name].setStyleSheet(
+                    self._RECON_VAL_STYLE_CORRECTION,
+                )
+        finally:
+            self._adjusting = False
+
     # ----- LOG ENTRY handler ----------------------------------------------
 
     def _on_commit(self):
@@ -1107,15 +1399,48 @@ class GrowthMonitor(QWidget):
             "note": self.log_note_input.toPlainText().strip(),
         }
 
-        # Capture reconstruction estimates from sliders
+        # Capture reconstruction estimates from sliders. When correction
+        # is off, these mirror the classifier's smoothed_percent (sliders
+        # are read-only and driven by update_classifier_state). When
+        # correction is on, these are the grower's belief — Pattern A
+        # keeps their sum at 100.
         for name, slider in self._recon_sliders.items():
             entry[f"recon_{name}"] = str(slider.value())
+
+        # Snapshot the classifier's live prediction alongside the
+        # grower's slider values so every log entry becomes a paired
+        # (grower, classifier) datum for Yuxin's #1 active-comparisons
+        # signal (see yuxin_deliverables_jul06.md). Blank when the
+        # classifier never emitted (disabled for this session, or not
+        # yet loaded).
+        if self._latest_classifier is not None:
+            smoothed = self._latest_classifier.smoothed_percent
+            for name in self._recon_sliders:
+                entry[f"classifier_recon_{name}"] = str(
+                    smoothed.get(name, 0)
+                )
+            entry["grower_corrected"] = (
+                "True" if self._correction_active else "False"
+            )
+        else:
+            for name in self._recon_sliders:
+                entry[f"classifier_recon_{name}"] = ""
+            entry["grower_corrected"] = ""
 
         # Add row to Growth Notes table
         self._add_growth_note_row(entry)
 
         # Clear the note input for next entry
         self.log_note_input.clear()
+
+        # Auto-lock correction after every LOG ENTRY so the next entry
+        # is a fresh decision — prevents stale grower values from
+        # bleeding across log entries when the growth has moved on. If
+        # correction was off, this is a no-op (setChecked(False) on an
+        # unchecked button doesn't fire clicked).
+        if self._correction_active:
+            self.correction_btn.setChecked(False)
+            self._on_correction_toggled(False)
 
         # Sliders are classifier-driven (read-only) — no reset needed.
         # The next classifier emission will keep them in sync with the
@@ -1270,6 +1595,14 @@ class GrowthMonitor(QWidget):
         self.pressure_display.value.setText("---")
         self.rheed_image_label.clear()
         self.auto_capture_label.setText("Auto-capture: idle")
+        # Force grower correction off before wiping slider state so the
+        # next session starts on a clean classifier-driven display, and
+        # so the button visual state matches the internal state (a stuck
+        # ✓ ✎ Correct button on a fresh session would be misleading).
+        if self._correction_active:
+            self.correction_btn.setChecked(False)
+            self._on_correction_toggled(False)
+        self.correction_btn.setEnabled(True)
         # Classifier sliders back to zero + idle status; the next arm will
         # trigger a fresh "Loading classifier…" cycle. Also reset the
         # value-label styles in case the previous session left an argmax
@@ -1278,6 +1611,7 @@ class GrowthMonitor(QWidget):
             slider.blockSignals(True)
             slider.setValue(0)
             slider.blockSignals(False)
+            slider.setStyleSheet(self._SLIDER_STYLE_LIVE)
             self._recon_value_labels[name].setText("0%")
             self._recon_value_labels[name].setStyleSheet(
                 self._RECON_VAL_STYLE_NORMAL,
@@ -1291,3 +1625,4 @@ class GrowthMonitor(QWidget):
         self._latest_camera = None
         self._latest_mistral = None
         self._latest_evap = None
+        self._latest_classifier = None

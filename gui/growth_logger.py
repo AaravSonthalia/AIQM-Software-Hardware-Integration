@@ -50,8 +50,27 @@ class GrowthLogger:
     COMMIT_FIELDS = [
         "timestamp", "time_display", "elapsed_s", "sample_id", "grower",
         "pyrometer_temp_C", "voltage_V", "current_A",
+        # Slider values at LOG time. When ``grower_corrected == False`` these
+        # equal the classifier's smoothed_percent (sliders are read-only and
+        # mirror the classifier). When ``grower_corrected == True`` these
+        # represent the grower's belief, sum to 100 (Pattern A proportional
+        # adjustment enforces it), and can differ from ``classifier_recon_*``.
         "recon_1x1", "recon_Twinned (2x1)", "recon_c(6x2)",
         "recon_rt13xrt13", "recon_HTR",
+        # Classifier's smoothed_percent at LOG time — always populated when a
+        # classifier state has been received this session, regardless of
+        # correction toggle. Empty when the classifier is disabled or the
+        # session logged before any frame was classified. Pairs with the
+        # matching ``recon_*`` columns to form the active-comparisons training
+        # signal for Yuxin's #1 deliverable (see yuxin_deliverables_jul06.md).
+        "classifier_recon_1x1", "classifier_recon_Twinned (2x1)",
+        "classifier_recon_c(6x2)", "classifier_recon_rt13xrt13",
+        "classifier_recon_HTR",
+        # "True" when the grower had ``✎ Correct`` active at LOG time (may
+        # equal classifier values if grower agreed without dragging), "False"
+        # when correction was off, "" when the classifier itself was disabled
+        # for the session.
+        "grower_corrected",
         "note", "frame_path",
     ]
     AUTO_CAPTURE_FIELDS = [
