@@ -119,6 +119,56 @@ class EvapControlState:
 
 
 @dataclass
+class ClassifierState:
+    """Current state of the RHEED classifier worker.
+
+    Lifecycle:
+        - Initial: ``loading=True, ready=False, error=""``
+        - After model loads: ``loading=False, ready=True``
+        - Failure: ``loading=False, ready=False, error="..."``
+
+    Score field provenance — per-cycle transformation chain:
+        1. Bridge returns raw win-rates in ``raw_scores`` (0-1 per class,
+           sum unconstrained — Bradley-Terry pairwise, not softmax).
+        2. Equalizer recipe (clip negatives → divide by sum → uniform
+           fallback) produces ``normalized_percent`` (0-100, sums to 100).
+        3. EMA over successive cycles produces ``smoothed_percent`` —
+           this is what the UI sliders display. Frozen while ``is_ood``.
+
+    Confidence signals:
+        - ``is_bad`` — classifier's own low-quality flag (bad-reference
+          bank matched better than any real-class reference). Independent
+          of ``is_ood``.
+        - ``is_ood`` — derived by the worker from ``quality`` below the
+          worker's OOD threshold. Signals the UI to grey out the sliders
+          and stop advancing the EMA.
+
+    Sentinel: ``last_frame_number == -1`` means no frame has been
+    classified yet this session.
+    """
+    # Lifecycle
+    loading: bool = True
+    ready: bool = False
+    error: str = ""
+
+    # Latest inference — see class docstring for the transformation chain
+    last_frame_number: int = -1
+    raw_scores: dict[str, float] = field(default_factory=dict)
+    normalized_percent: dict[str, int] = field(default_factory=dict)
+    smoothed_percent: dict[str, int] = field(default_factory=dict)
+    raw_sum: float = 0.0  # for the "Sum: X.XX" transparency label
+
+    # Confidence / OOD
+    quality: float = 0.0
+    is_bad: bool = False
+    bad_confidence: float = 0.0
+    is_ood: bool = False
+
+    # Perf
+    inference_ms: float = 0.0
+
+
+@dataclass
 class ActionLogEntry:
     """A single entry in the action log."""
     timestamp: datetime = field(default_factory=datetime.now)
