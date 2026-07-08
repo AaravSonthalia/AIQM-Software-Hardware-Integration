@@ -1413,6 +1413,11 @@ class GrowthMonitor(QWidget):
         # signal (see yuxin_deliverables_jul06.md). Blank when the
         # classifier never emitted (disabled for this session, or not
         # yet loaded).
+        #
+        # classifier_status column disambiguates why classifier_recon_*
+        # might be blank or 0. Set even when _latest_classifier is None
+        # so downstream analysis can distinguish DISABLED from OK-with-
+        # 0-confidence (see growth_logger.py COMMIT_FIELDS comment).
         if self._latest_classifier is not None:
             smoothed = self._latest_classifier.smoothed_percent
             for name in self._recon_sliders:
@@ -1422,10 +1427,21 @@ class GrowthMonitor(QWidget):
             entry["grower_corrected"] = (
                 "True" if self._correction_active else "False"
             )
+            # Lifecycle branch — errors and loading are checked before
+            # "OK" so a state with e.g. both loading=True and error=""
+            # doesn't get called OK prematurely. Order matches
+            # ClassifierState's documented lifecycle transitions.
+            if self._latest_classifier.error:
+                entry["classifier_status"] = "ERROR"
+            elif self._latest_classifier.loading:
+                entry["classifier_status"] = "LOADING"
+            else:
+                entry["classifier_status"] = "OK"
         else:
             for name in self._recon_sliders:
                 entry[f"classifier_recon_{name}"] = ""
             entry["grower_corrected"] = ""
+            entry["classifier_status"] = "DISABLED"
 
         # Add row to Growth Notes table
         self._add_growth_note_row(entry)

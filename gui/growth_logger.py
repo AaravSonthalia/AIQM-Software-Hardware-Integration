@@ -71,6 +71,18 @@ class GrowthLogger:
         # when correction was off, "" when the classifier itself was disabled
         # for the session.
         "grower_corrected",
+        # Classifier lifecycle state at LOG time. Four values:
+        #   OK       — classifier ready + emitting valid classifications
+        #   LOADING  — worker up but no successful classify() yet
+        #   ERROR    — worker emitted an error (missing model, bad state)
+        #   DISABLED — classifier never armed for this session (config off)
+        # Disambiguates the classifier_recon_* columns downstream. A "0"
+        # in classifier_recon_1x1 could mean "classifier confident it's
+        # not 1x1" (OK), "classifier initialising" (LOADING), or "no
+        # data" (blank when ERROR/DISABLED, but the status column makes
+        # the reason explicit). Yuxin's #1 pipeline reads this to
+        # partition rows appropriately.
+        "classifier_status",
         "note", "frame_path",
     ]
     AUTO_CAPTURE_FIELDS = [

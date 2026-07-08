@@ -421,6 +421,8 @@ class CommitTests(unittest.TestCase):
                 f"mismatch on {name}",
             )
         self.assertEqual(entry["grower_corrected"], "False")
+        # Fully-ready classifier → OK.
+        self.assertEqual(entry["classifier_status"], "OK")
 
     def test_commit_correction_on_captures_both(self):
         # Classifier says Twinned; grower disagrees and says 1x1.
@@ -450,6 +452,8 @@ class CommitTests(unittest.TestCase):
             self.assertEqual(int(entry[f"classifier_recon_{name}"]), v)
 
         self.assertEqual(entry["grower_corrected"], "True")
+        # Classifier still OK — correction mode doesn't change lifecycle.
+        self.assertEqual(entry["classifier_status"], "OK")
 
     def test_commit_without_classifier_state_leaves_columns_empty(self):
         # No classifier state ever received (classifier disabled for
@@ -459,6 +463,57 @@ class CommitTests(unittest.TestCase):
         for name in RECON_LABELS:
             self.assertEqual(entry[f"classifier_recon_{name}"], "")
         self.assertEqual(entry["grower_corrected"], "")
+        # DISABLED because _latest_classifier is None.
+        self.assertEqual(entry["classifier_status"], "DISABLED")
+
+    def test_commit_classifier_status_error(self):
+        # Worker emits an error state (e.g. missing best_model.pth).
+        state = _make_classifier_state(
+            loading=False,
+            ready=False,
+            error="Failed to load classifier: model file missing",
+        )
+        self.monitor.update_classifier_state(state)
+
+        self.monitor._on_commit()
+        entry = self.captured[-1]
+
+        self.assertEqual(entry["classifier_status"], "ERROR")
+        # classifier_recon_* still populated (from smoothed_percent which
+        # is uniform placeholder or empty when errored) — status column
+        # is the source of truth for "was the classifier trustworthy".
+        for name in RECON_LABELS:
+            self.assertIn(f"classifier_recon_{name}", entry)
+
+    def test_commit_classifier_status_loading(self):
+        # Worker just started; hasn't loaded model or emitted a classify yet.
+        state = _make_classifier_state(
+            loading=True,
+            ready=False,
+            error="",
+            has_confident_data=False,
+        )
+        self.monitor.update_classifier_state(state)
+
+        self.monitor._on_commit()
+        entry = self.captured[-1]
+
+        self.assertEqual(entry["classifier_status"], "LOADING")
+
+    def test_commit_classifier_status_error_takes_precedence_over_loading(self):
+        # Edge case: state has loading=True AND error set — error wins so
+        # downstream analysis doesn't misclassify a broken load as transient.
+        state = _make_classifier_state(
+            loading=True,
+            ready=False,
+            error="Some transient failure during load",
+        )
+        self.monitor.update_classifier_state(state)
+
+        self.monitor._on_commit()
+        entry = self.captured[-1]
+
+        self.assertEqual(entry["classifier_status"], "ERROR")
 
     def test_commit_auto_locks_correction(self):
         state = _make_classifier_state()
