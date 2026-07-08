@@ -1378,14 +1378,30 @@ class GrowthMonitor(QWidget):
             f"{self._latest_pyro.temperature:.1f}"
             if self._latest_pyro and self._latest_pyro.connected else ""
         )
-        voltage_str = (
-            f"{self._latest_psu.voltage_measured:.3f}"
-            if self._latest_psu and self._latest_psu.connected else ""
-        )
-        current_str = (
-            f"{self._latest_psu.current_measured:.3f}"
-            if self._latest_psu and self._latest_psu.connected else ""
-        )
+
+        # PSU value snapshot — prefer MISTRAL screengrab OCR since that's
+        # the current O-MBE path (TDK-Lambda hardware → MISTRAL → OCR),
+        # fall back to direct-read PSU when we eventually wire one up.
+        # psu_source tells downstream which path produced the number so
+        # they can weight OCR-derived values differently from direct-read.
+        # See growth_logger.py COMMIT_FIELDS comment for the full taxonomy.
+        voltage_str = ""
+        current_str = ""
+        psu_source = "none"
+        if self._latest_mistral and self._latest_mistral.connected:
+            if self._latest_mistral.v_actual is not None:
+                voltage_str = f"{self._latest_mistral.v_actual:.3f}"
+            if self._latest_mistral.i_actual is not None:
+                current_str = f"{self._latest_mistral.i_actual:.3f}"
+            # Source is "mistral" whenever the MISTRAL worker is connected,
+            # even if a specific field happens to be None — captures the
+            # topology ("mistral was the intended source") more accurately
+            # than treating a partial reading as "no source at all".
+            psu_source = "mistral"
+        elif self._latest_psu and self._latest_psu.connected:
+            voltage_str = f"{self._latest_psu.voltage_measured:.3f}"
+            current_str = f"{self._latest_psu.current_measured:.3f}"
+            psu_source = "direct"
 
         entry = {
             "timestamp": now.isoformat(),
@@ -1396,6 +1412,7 @@ class GrowthMonitor(QWidget):
             "pyrometer_temp_C": temp_str,
             "voltage_V": voltage_str,
             "current_A": current_str,
+            "psu_source": psu_source,
             "note": self.log_note_input.toPlainText().strip(),
         }
 

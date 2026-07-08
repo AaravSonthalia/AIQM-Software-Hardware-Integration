@@ -50,6 +50,21 @@ class GrowthLogger:
     COMMIT_FIELDS = [
         "timestamp", "time_display", "elapsed_s", "sample_id", "grower",
         "pyrometer_temp_C", "voltage_V", "current_A",
+        # Source path that populated voltage_V/current_A. Named for the
+        # method, not the vendor, so it stays correct through hardware
+        # swaps. Three values:
+        #   mistral — via MISTRAL's screengrab OCR (current O-MBE path;
+        #             TDK-Lambda hardware → MISTRAL software → GUI OCR)
+        #   direct  — via a direct-read PSU worker (currently unwired;
+        #             future TDK/OWON/etc. when we get a serial or
+        #             network path to the PSU without going through
+        #             MISTRAL)
+        #   none    — no PSU state cached at LOG time (voltage_V and
+        #             current_A will be blank)
+        # Downstream analysis (Yuxin's #1) reads this to know whether
+        # a voltage_V value came from screengrab OCR (~1 Hz, subject to
+        # OCR noise) or a direct instrument read (higher precision).
+        "psu_source",
         # Slider values at LOG time. When ``grower_corrected == False`` these
         # equal the classifier's smoothed_percent (sliders are read-only and
         # mirror the classifier). When ``grower_corrected == True`` these

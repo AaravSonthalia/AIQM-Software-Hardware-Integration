@@ -33,7 +33,7 @@ _app = QApplication.instance() or QApplication(sys.argv)
 
 from gui.growth_monitor import GrowthMonitor  # noqa: E402
 from gui.recon_labels import RECON_LABELS  # noqa: E402
-from gui.state import ClassifierState  # noqa: E402
+from gui.state import ClassifierState, MistralState, PowerSupplyState  # noqa: E402
 
 
 def _make_classifier_state(
@@ -80,6 +80,43 @@ def _make_classifier_state(
 
 def _slider_values(monitor: GrowthMonitor) -> dict[str, int]:
     return {n: s.value() for n, s in monitor._recon_sliders.items()}
+
+
+def _make_mistral_state(
+    v_actual: float | None = 10.043,
+    i_actual: float | None = 2.051,
+    connected: bool = True,
+) -> MistralState:
+    """Build a MistralState for tests. Defaults match yesterday's dummy-mode
+    readings (~10 V, ~2 A) so the numeric assertions look realistic."""
+    return MistralState(
+        v_set=10.0,
+        v_actual=v_actual,
+        i_set=2.0,
+        i_actual=i_actual,
+        connected=connected,
+        error="",
+        mode="dummy",
+    )
+
+
+def _make_psu_state(
+    voltage_measured: float = 5.5,
+    current_measured: float = 1.2,
+    connected: bool = True,
+) -> PowerSupplyState:
+    """Build a PowerSupplyState for tests. Values distinct from MistralState
+    defaults so tests can tell which source populated a row."""
+    return PowerSupplyState(
+        voltage_setpoint=5.5,
+        current_setpoint=1.5,
+        voltage_measured=voltage_measured,
+        current_measured=current_measured,
+        power_measured=voltage_measured * current_measured,
+        output_enabled=True,
+        connected=connected,
+        error="",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +604,101 @@ class ResetPathTests(unittest.TestCase):
         # Button disabled — correcting a disabled classifier makes no
         # sense (no classifier state to pair with).
         self.assertFalse(self.monitor.correction_btn.isEnabled())
+
+
+# ---------------------------------------------------------------------------
+# psu_source column + voltage_V/current_A snapshot fallthrough
+# ---------------------------------------------------------------------------
+
+class PsuSourceTests(unittest.TestCase):
+    """Regression tests for the Jul 8 fix — commit_log's voltage_V/current_A
+    columns now read from _latest_mistral first, then _latest_psu, with a
+    psu_source column indicating which path produced the values.
+
+    Baseline before the fix: voltage_V/current_A were blank whenever
+    MISTRAL was the active PSU (which is always, on the O-MBE right now
+    since TDK-Lambda hardware feeds through MISTRAL). See Jul 7 Bulbasaur
+    session for the diagnostic evidence."""
+
+    def setUp(self):
+        self.monitor = GrowthMonitor()
+        self.captured: list[dict] = []
+        self.monitor.commit_requested.connect(self.captured.append)
+        self.monitor.commit_btn.setEnabled(True)
+
+    def tearDown(self):
+        self.monitor.deleteLater()
+
+    def test_mistral_connected_populates_voltage_current(self):
+        # MISTRAL is the current O-MBE path.
+        self.monitor.update_mistral_state(_make_mistral_state(
+            v_actual=10.043, i_actual=2.051,
+        ))
+        self.monitor._on_commit()
+        entry = self.captured[-1]
+        self.assertEqual(entry["voltage_V"], "10.043")
+        self.assertEqual(entry["current_A"], "2.051")
+        self.assertEqual(entry["psu_source"], "mistral")
+
+    def test_no_state_writes_blanks_and_none_source(self):
+        # No PSU state at all — voltage/current blank, source "none".
+        self.monitor._on_commit()
+        entry = self.captured[-1]
+        self.assertEqual(entry["voltage_V"], "")
+        self.assertEqual(entry["current_A"], "")
+        self.assertEqual(entry["psu_source"], "none")
+
+    def test_direct_psu_only_falls_through_when_no_mistral(self):
+        # No MISTRAL, but direct PSU wired up (future state).
+        self.monitor.update_psu_state(_make_psu_state(
+            voltage_measured=5.5, current_measured=1.2,
+        ))
+        self.monitor._on_commit()
+        entry = self.captured[-1]
+        self.assertEqual(entry["voltage_V"], "5.500")
+        self.assertEqual(entry["current_A"], "1.200")
+        self.assertEqual(entry["psu_source"], "direct")
+
+    def test_mistral_takes_precedence_over_direct(self):
+        # Both connected — MISTRAL wins (matches display-widget behavior
+        # where MISTRAL updates the same voltage_display).
+        self.monitor.update_psu_state(_make_psu_state(
+            voltage_measured=5.5, current_measured=1.2,
+        ))
+        self.monitor.update_mistral_state(_make_mistral_state(
+            v_actual=10.043, i_actual=2.051,
+        ))
+        self.monitor._on_commit()
+        entry = self.captured[-1]
+        self.assertEqual(entry["voltage_V"], "10.043")
+        self.assertEqual(entry["current_A"], "2.051")
+        self.assertEqual(entry["psu_source"], "mistral")
+
+    def test_mistral_disconnected_falls_through_to_direct(self):
+        # MISTRAL is present but marked disconnected — treated same as
+        # None; direct-read wins.
+        self.monitor.update_mistral_state(_make_mistral_state(
+            connected=False,
+        ))
+        self.monitor.update_psu_state(_make_psu_state())
+        self.monitor._on_commit()
+        entry = self.captured[-1]
+        self.assertEqual(entry["voltage_V"], "5.500")
+        self.assertEqual(entry["psu_source"], "direct")
+
+    def test_mistral_connected_but_v_actual_none_still_mistral_source(self):
+        # Edge case: MISTRAL worker connected but no numeric reading
+        # (OCR frame lookup returned None for that field). We record
+        # source=mistral because the intended path is still MISTRAL —
+        # the reading is blank, but the topology is unambiguous.
+        self.monitor.update_mistral_state(_make_mistral_state(
+            v_actual=None, i_actual=None, connected=True,
+        ))
+        self.monitor._on_commit()
+        entry = self.captured[-1]
+        self.assertEqual(entry["voltage_V"], "")
+        self.assertEqual(entry["current_A"], "")
+        self.assertEqual(entry["psu_source"], "mistral")
 
 
 # ---------------------------------------------------------------------------
