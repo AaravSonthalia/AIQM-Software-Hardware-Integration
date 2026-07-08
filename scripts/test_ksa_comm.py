@@ -157,10 +157,16 @@ def cmd_get_status(sock: socket.socket) -> dict | None:
 def cmd_text(sock: socket.socket, text: str, encoding: str = "raw") -> tuple[int, str]:
     """Send a TEXT_CMD (1011) and return (err_code, reply_text).
 
-    encoding:
+    Request encoding:
         "raw"    — CmdData = text bytes only (outer CmdLength has the size)
         "short"  — CmdData = [len:1][chars:len-1][null] (handshake convention)
         "u16"    — CmdData = [len:2 LE][chars]
+        "u32"    — CmdData = [len:4 LE][chars][null]  ← working encoding on v6
+
+    Reply format is always [len:4 LE][chars][null] regardless of request
+    encoding (per May 20 breakthrough, re-confirmed Jul 7). Length includes
+    the trailing null. Error replies with server-side text messages (err=-1,
+    err=-2) follow the same u32-prefixed shape.
     """
     if encoding == "raw":
         body = text.encode("ascii")
@@ -170,25 +176,31 @@ def cmd_text(sock: socket.socket, text: str, encoding: str = "raw") -> tuple[int
     elif encoding == "u16":
         chars = text.encode("ascii")
         body = struct.pack("<H", len(chars)) + chars
+    elif encoding == "u32":
+        payload = text.encode("ascii") + b"\x00"
+        body = struct.pack("<I", len(payload)) + payload
     else:
         raise ValueError(f"unknown encoding {encoding!r}")
     send_command(sock, CMD_TEXT_CMD, body)
     cmd, err, data = recv_reply(sock)
-    if err != 0:
-        return err, ""
-    # Try interpretations of the reply: raw, then u16-prefixed, then short.
-    text_out = data.decode("ascii", errors="replace").rstrip("\x00")
+    # Reply strip: skip the 4-byte u32 length prefix, decode the rest,
+    # rstrip trailing nulls. Applies uniformly to err=0 and err<0 replies.
+    if len(data) >= 4:
+        text_out = data[4:].decode("ascii", errors="replace").rstrip("\x00")
+    else:
+        text_out = ""
     return err, text_out
 
 
 def probe_text_commands(sock: socket.socket, commands: list[str]) -> None:
     """Send a series of TEXT_CMD probes; print request/reply/error for each.
 
-    Tries "raw" encoding first; if every probe returns -2 (Unknown command)
-    OR -3 (Invalid parameter), retries the same probes with "short" and "u16"
-    encodings to rule out an encoding mismatch.
+    Iterates through candidate encodings. On v6, "u32" is the known working
+    encoding (per May 20 breakthrough, re-confirmed Jul 7). The other three
+    are retained as diagnostic negatives — they should return -2 on kSA v6,
+    which itself is informative if we ever debug encoding drift.
     """
-    for enc in ("raw", "short", "u16"):
+    for enc in ("raw", "short", "u16", "u32"):
         print(f"\n--- TEXT_CMD probe (encoding={enc}) ---")
         any_success = False
         for cmd_text_str in commands:
@@ -200,10 +212,11 @@ def probe_text_commands(sock: socket.socket, commands: list[str]) -> None:
                 any_success = True
         if any_success:
             return  # Found a working encoding; no need to retry
-    print("\n(All three encodings failed for every probe — TEXT_CMD may not be")
-    print(" wired up at all in this kSA 400 build, OR the command vocabulary")
-    print(" is different. Next step: check Options dialog for a TEXT_CMD enable")
-    print(" switch, or contact k-Space for the kSA 400 text command list.)")
+    print("\n(All four encodings failed — including u32 which is known to work")
+    print(" on kSA v6. Either the kSA state is unusual (e.g. no acquisition")
+    print(" controller for measurement.* commands) or the command vocabulary")
+    print(" is different in this build. Try scripts/test_ksa_single.py --enc u32")
+    print(" with a single probe to isolate.)")
 
 
 def cmd_get_ksa400_intensities(sock: socket.socket) -> dict | None:
