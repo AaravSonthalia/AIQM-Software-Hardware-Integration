@@ -422,13 +422,30 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_commit(self, entry: dict):
-        """Save a timestamped log entry with optional RHEED frame."""
+        """Save a timestamped log entry with optional RHEED frame.
+
+        LOG ENTRY frame contract (Jul 8 2026): the frame is saved
+        unconditionally when available — the grower's explicit click is
+        stronger evidence of intent than the automated quality gate.
+        The gate's verdict is recorded as ``frame_quality_pass`` metadata
+        so downstream consumers can still filter to high-quality frames.
+        """
         # Save frame if available
         frame = self.monitor.get_current_frame()
         if frame is not None:
             ts = entry.get("timestamp", "").replace(":", "").split(".")[0][-6:]
-            path = self.growth_log.save_frame(frame, ts)
+            path, quality_pass = self.growth_log.save_frame(frame, ts)
             entry["frame_path"] = path
+            # quality_pass may be None if the quality-gate module isn't
+            # importable; propagate that as blank so the CSV column stays
+            # unambiguous ("" ≠ True ≠ False).
+            if quality_pass is None:
+                entry["frame_quality_pass"] = ""
+            else:
+                entry["frame_quality_pass"] = "True" if quality_pass else "False"
+        # If no frame was available (camera not connected / no state
+        # emitted yet), leave both fields as their default "" from the
+        # log_commit dict comprehension — captures "no frame" cleanly.
 
         self.growth_log.log_commit(entry)
         self.statusBar().showMessage("Entry logged", 3000)

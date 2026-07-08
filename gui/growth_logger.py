@@ -99,6 +99,16 @@ class GrowthLogger:
         # partition rows appropriately.
         "classifier_status",
         "note", "frame_path",
+        # Boolean-ish (str "True"/"False"/""). "True" when the saved
+        # frame passed the frame_quality gate at LOG time; "False" when
+        # the gate flagged it (too dark, uniform, saturated) but LOG
+        # ENTRY saved it anyway because the grower explicitly requested
+        # the entry. Empty when no frame was available at all (camera
+        # not connected / no state emitted yet). Downstream can filter
+        # or weight rows by this — training data curators may want
+        # only frame_quality_pass=True rows, while UX audits may want
+        # every entry.
+        "frame_quality_pass",
     ]
     AUTO_CAPTURE_FIELDS = [
         "timestamp", "elapsed_s", "event_idx",
@@ -647,30 +657,51 @@ class GrowthLogger:
         rel_dir = str(event_dir.relative_to(self._session_dir))
         return saved, rel_dir
 
-    def save_frame(self, frame: np.ndarray, timestamp: str = "") -> str:
-        """Save frame as PNG to session frames/ subdir, return path.
+    def save_frame(
+        self, frame: np.ndarray, timestamp: str = "",
+    ) -> tuple[str, Optional[bool]]:
+        """Save frame as PNG to session frames/ subdir. Returns (path, quality_pass).
 
-        Runs the frame quality gate first — black/saturated/uniform/
-        undersized frames are rejected with a stderr warning and an
-        empty path returned. Callers should treat "" as "no frame saved"
-        (current convention).
+        Manual LOG ENTRY intent takes precedence over the frame quality
+        gate — if the grower explicitly clicked LOG ENTRY, the frame is
+        saved regardless of quality. The gate result is captured as
+        metadata (quality_pass) so downstream training-data consumers
+        can filter to high-quality frames while the grower's original
+        intent is preserved in the archive.
+
+        This is a deliberate contract difference from save_heartbeat_frame
+        and save_auto_capture_buffer (both periodic + implicit — quality
+        gate rejects there because no grower is asking for that frame).
+
+        Returns:
+            (path, quality_pass) tuple.
+              path: str filesystem path if the frame was saved successfully,
+                    "" if no session dir or PIL/cv2 both missing.
+              quality_pass: True if the quality gate passed, False if it
+                    flagged the frame (still saved), None if the gate
+                    couldn't be evaluated (frame_quality module missing).
         """
         if self._session_dir is None:
-            return ""
+            return "", None
 
+        # Capture the quality gate result but don't gate saving on it.
+        # LOG ENTRY = grower's explicit intent (see Jul 8 2026 decision
+        # in bulbasaur_lab_day_jul07.md follow-up 2).
+        quality_pass: Optional[bool] = None
         try:
             from drivers.frame_quality import check_frame_quality
             qa = check_frame_quality(frame)
+            quality_pass = bool(qa.passed)
             if not qa.passed:
                 import sys
                 print(
-                    f"[GrowthLogger] frame rejected by quality gate: {qa.reason}",
+                    f"[GrowthLogger] LOG ENTRY frame quality flagged "
+                    f"(saved anyway per grower intent): {qa.reason}",
                     file=sys.stderr,
                     flush=True,
                 )
-                return ""
         except ImportError:
-            pass  # Quality gate optional; degrade to old always-save behavior.
+            pass  # Quality gate optional; leave quality_pass=None.
 
         self._commit_counter += 1
         ts = timestamp or datetime.now().strftime("%H%M%S")
@@ -686,9 +717,9 @@ class GrowthLogger:
                 import cv2
                 cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             except ImportError:
-                return ""
+                return "", quality_pass
 
-        return str(path)
+        return str(path), quality_pass
 
     def save_session_metadata(self, metadata: dict):
         """Save session metadata to a JSON file."""
