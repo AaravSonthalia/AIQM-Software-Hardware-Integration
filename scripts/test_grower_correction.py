@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 # Must set BEFORE any Qt import — headless CI/local runs on Mac + Linux.
@@ -702,6 +703,81 @@ class ConfigLockTests(unittest.TestCase):
             original_heartbeat,
             self.monitor.config_heartbeat_interval_spin.toolTip(),
             "unlock should restore original tooltip",
+        )
+
+
+class DefaultSavePathTests(unittest.TestCase):
+    """Tests _default_save_path's three-way branching for T9 SSD /
+    Windows fallback / non-Windows fallback. Path.exists() is patched
+    per test to simulate the environments."""
+
+    def test_windows_with_t9_returns_ssd_path(self):
+        # Simulate Bulbasaur with T9 mounted.
+        import gui.growth_monitor as gm
+        with unittest.mock.patch.object(gm, "sys") as mock_sys:
+            mock_sys.platform = "win32"
+            with unittest.mock.patch.object(
+                gm.Path, "exists", return_value=True,
+            ):
+                result = gm._default_save_path()
+        self.assertEqual(result, r"E:\OMBE\GrowthMonitor")
+
+    def test_windows_without_t9_falls_back_to_documents(self):
+        # Simulate a Windows box without the T9 SSD.
+        import gui.growth_monitor as gm
+        with unittest.mock.patch.object(gm, "sys") as mock_sys:
+            mock_sys.platform = "win32"
+            with unittest.mock.patch.object(
+                gm.Path, "exists", return_value=False,
+            ):
+                result = gm._default_save_path()
+        # Should end in Documents/OMBE — cross-platform-safe suffix check
+        # avoids hardcoding the user's home path.
+        self.assertTrue(
+            result.endswith("Documents/OMBE")
+            or result.endswith("Documents\\OMBE"),
+            f"expected Documents/OMBE fallback, got {result}",
+        )
+
+    def test_non_windows_returns_repo_relative(self):
+        # Simulate Mac dev environment.
+        import gui.growth_monitor as gm
+        with unittest.mock.patch.object(gm, "sys") as mock_sys:
+            mock_sys.platform = "darwin"
+            result = gm._default_save_path()
+        self.assertEqual(result, "logs/growths")
+
+    def test_t9_check_uses_drive_not_folder(self):
+        # Regression: the old code required E:\OMBE to already exist,
+        # which fell back to the repo when a fresh Bulbasaur launch
+        # hadn't yet materialized the folder. The new code should only
+        # need the drive itself. Verify by patching exists() to return
+        # True only for E:\ — if the implementation asked about
+        # E:\OMBE, the mock would still return True, but a subtler
+        # regression would be: implementation asks about the wrong
+        # path and gets False. So we assert the SSD path is returned,
+        # implying the drive check succeeded.
+        import gui.growth_monitor as gm
+        calls = []
+
+        def track_exists(self):
+            calls.append(str(self))
+            # Only "E:\\" should be checked in the happy Windows path.
+            return str(self) in (r"E:\\", "E:\\")
+
+        with unittest.mock.patch.object(gm, "sys") as mock_sys:
+            mock_sys.platform = "win32"
+            with unittest.mock.patch.object(
+                gm.Path, "exists", track_exists,
+            ):
+                result = gm._default_save_path()
+
+        self.assertEqual(result, r"E:\OMBE\GrowthMonitor")
+        # Should NOT have checked E:\OMBE — that's the old buggy behavior.
+        self.assertNotIn(
+            r"E:\OMBE",
+            calls,
+            "should only check drive, not OMBE folder (Jul 8 regression)",
         )
 
 

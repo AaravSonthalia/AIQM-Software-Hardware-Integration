@@ -30,16 +30,31 @@ from PyQt6.QtGui import QImage, QPixmap, QFont, QShortcut, QKeySequence
 def _default_save_path() -> str:
     """Pick the default growth-log save path.
 
-    On Bulbasaur (Windows with the OMBE SSD mounted at E:), prefer
-    ``E:\\OMBE\\GrowthMonitor`` per PI directive that all growth data
-    written by this GUI should go to the SSD. Falls back to the original
-    ``logs/growths`` (relative to the repo) when the SSD isn't present —
-    keeps the default sane on Mac, on Windows boxes without the SSD
-    attached, and on any other deployment.
+    On Bulbasaur (Windows with the T9 SSD mounted at E:), prefer
+    ``E:\\OMBE\\GrowthMonitor`` per PI directive that growth data goes
+    on the SSD, not C:'s bloat. Checks the DRIVE (``E:\\``), not the
+    ``OMBE`` folder — the folder is created on first save. Historically
+    the check required ``E:\\OMBE`` to already exist, which fell back to
+    the repo when a fresh Bulbasaur launch hadn't yet materialized the
+    folder — bug found Jul 8 2026.
+
+    Fallbacks:
+      - Windows without the T9 mounted → ``%USERPROFILE%\\Documents\\OMBE``.
+        Better than the repo path because it's still off C:'s bloat
+        (whichever partition Documents lives on, typically not the
+        overflowing one).
+      - Non-Windows (Mac dev) → ``logs/growths`` relative to the repo.
+        Backwards-compatible for local dev / CI test paths.
     """
-    ssd_root = Path(r"E:\OMBE")
-    if sys.platform == "win32" and ssd_root.exists():
-        return str(ssd_root / "GrowthMonitor")
+    if sys.platform == "win32":
+        # Check the drive itself, not the OMBE folder — folder gets
+        # created on first save if missing.
+        if Path("E:\\").exists():
+            return r"E:\OMBE\GrowthMonitor"
+        # Windows without T9: prefer Documents over C: root; keeps growth
+        # sessions per-user and off any C:-bloat path.
+        return str(Path.home() / "Documents" / "OMBE")
+    # Non-Windows dev: repo-relative default preserves test / CI paths.
     return "logs/growths"
 
 from gui.state import (
