@@ -605,6 +605,105 @@ class ResetPathTests(unittest.TestCase):
         # sense (no classifier state to pair with).
         self.assertFalse(self.monitor.correction_btn.isEnabled())
 
+    def test_set_classifier_disabled_clears_latest_classifier(self):
+        # Jul 8 Path Y regression: even if the caller doesn't disarm
+        # first, set_classifier_disabled must wipe the stale cache so
+        # the next LOG ENTRY writes DISABLED rows, not stale OK rows.
+        state = _make_classifier_state(smoothed={
+            "1x1": 2, "Twinned (2x1)": 32, "c(6x2)": 6,
+            "rt13xrt13": 12, "HTR": 47,
+        })
+        self.monitor.update_classifier_state(state)
+        self.assertIsNotNone(self.monitor._latest_classifier)
+
+        # Grower unchecks "Live classifier" mid-session; rearm calls
+        # set_classifier_disabled without disarm.
+        self.monitor.set_classifier_disabled()
+
+        self.assertIsNone(
+            self.monitor._latest_classifier,
+            "set_classifier_disabled must wipe stale classifier state",
+        )
+
+
+class ConfigLockTests(unittest.TestCase):
+    """Fix A for the Jul 8 Path Y bug: config panel widgets lock during
+    a session so the "checkbox says off but worker's still running"
+    silent divergence can't happen."""
+
+    def setUp(self):
+        self.monitor = GrowthMonitor()
+
+    def tearDown(self):
+        self.monitor.deleteLater()
+
+    def _config_widgets(self):
+        return [
+            self.monitor.config_interval_spin,
+            self.monitor.config_heartbeat_interval_spin,
+            self.monitor.config_save_path,
+            self.monitor.config_browse_btn,
+            self.monitor.config_prefix,
+            self.monitor.config_camera_mode,
+            self.monitor.config_pyrometer_mode,
+            self.monitor.config_exactus_port,
+            self.monitor.config_exactus_baud,
+            self.monitor.config_mistral_mode,
+            self.monitor.config_evap_mode,
+            self.monitor.config_classifier_enabled,
+        ]
+
+    def test_idle_state_unlocks_all_config_widgets(self):
+        # Idle is the initial state and the setUp already applied it.
+        for w in self._config_widgets():
+            self.assertTrue(w.isEnabled(), f"{w} should be enabled in idle")
+
+    def test_armed_state_locks_all_config_widgets(self):
+        self.monitor.set_state("armed")
+        for w in self._config_widgets():
+            self.assertFalse(w.isEnabled(), f"{w} should be disabled in armed")
+
+    def test_running_state_locks_all_config_widgets(self):
+        self.monitor.set_state("running")
+        for w in self._config_widgets():
+            self.assertFalse(w.isEnabled(), f"{w} should be disabled in running")
+
+    def test_disarm_reverts_to_idle_and_unlocks(self):
+        # Go idle → armed → back to idle. Widgets should unlock again.
+        self.monitor.set_state("armed")
+        self.assertFalse(self.monitor.config_classifier_enabled.isEnabled())
+        self.monitor.set_state("idle")
+        for w in self._config_widgets():
+            self.assertTrue(w.isEnabled(), f"{w} should be enabled after disarm")
+
+    def test_locked_tooltip_reason_visible(self):
+        # Locked tooltip should communicate WHY, not just "disabled".
+        self.monitor.set_state("armed")
+        for w in self._config_widgets():
+            self.assertIn(
+                "Disarm",
+                w.toolTip(),
+                f"{w} locked tooltip should mention 'Disarm'",
+            )
+
+    def test_unlocked_tooltip_restored(self):
+        # After unlock, tooltips should be back to their originals — the
+        # long explanatory ones on e.g. config_heartbeat_interval_spin
+        # shouldn't be permanently overwritten by the lock reminder.
+        original_heartbeat = self.monitor.config_heartbeat_interval_spin.toolTip()
+        self.monitor.set_state("armed")
+        self.assertNotEqual(
+            original_heartbeat,
+            self.monitor.config_heartbeat_interval_spin.toolTip(),
+            "sanity: locked tooltip should differ from original",
+        )
+        self.monitor.set_state("idle")
+        self.assertEqual(
+            original_heartbeat,
+            self.monitor.config_heartbeat_interval_spin.toolTip(),
+            "unlock should restore original tooltip",
+        )
+
 
 # ---------------------------------------------------------------------------
 # psu_source column + voltage_V/current_A snapshot fallthrough

@@ -675,13 +675,17 @@ class GrowthMonitor(QWidget):
         self.config_save_path.setPlaceholderText(default_save)
         self.config_save_path.setText(default_save)
         save_row.addWidget(self.config_save_path)
-        browse_btn = QPushButton("Browse")
-        browse_btn.setFixedWidth(70)
-        browse_btn.setStyleSheet(
+        # Kept as an attribute so _set_config_widgets_enabled can lock it
+        # during a running session — otherwise the grower could re-browse
+        # to a different directory mid-session and silently split their
+        # log into two locations.
+        self.config_browse_btn = QPushButton("Browse")
+        self.config_browse_btn.setFixedWidth(70)
+        self.config_browse_btn.setStyleSheet(
             "QPushButton { font-size: 11px; padding: 4px 8px; }"
         )
-        browse_btn.clicked.connect(self._on_config_browse)
-        save_row.addWidget(browse_btn)
+        self.config_browse_btn.clicked.connect(self._on_config_browse)
+        save_row.addWidget(self.config_browse_btn)
         config_form.addRow("Save folder:", save_row)
 
         self.config_prefix = QLineEdit("growth")
@@ -734,6 +738,30 @@ class GrowthMonitor(QWidget):
         self.config_classifier_enabled = QCheckBox()
         self.config_classifier_enabled.setChecked(True)
         config_form.addRow("Live classifier:", self.config_classifier_enabled)
+
+        # Snapshot of the tooltips each config widget carries in its
+        # "unlocked" (idle) state. When the session transitions to armed
+        # or running, _set_config_widgets_enabled overwrites the tooltip
+        # with a "🔒 Disarm to change" reminder; on disarm it restores
+        # from this dict. Prevents the Jul 8 Path Y bug where unchecking
+        # "Live classifier" mid-session silently diverged the checkbox
+        # from the running worker (see bulbasaur_lab_day_jul07 → follow-ups).
+        self._config_widget_original_tooltips: dict = {
+            w: w.toolTip() for w in (
+                self.config_interval_spin,
+                self.config_heartbeat_interval_spin,
+                self.config_save_path,
+                self.config_browse_btn,
+                self.config_prefix,
+                self.config_camera_mode,
+                self.config_pyrometer_mode,
+                self.config_exactus_port,
+                self.config_exactus_baud,
+                self.config_mistral_mode,
+                self.config_evap_mode,
+                self.config_classifier_enabled,
+            )
+        }
 
         top_half.addWidget(config_group)
 
@@ -806,6 +834,34 @@ class GrowthMonitor(QWidget):
 
     # ----- State machine ---------------------------------------------------
 
+    _CONFIG_LOCKED_TOOLTIP = (
+        "🔒 Disarm to change hardware config — arming reads these once "
+        "and commits to them for the session. See Jul 8 2026 lab findings "
+        "for context (unchecking mid-session used to silently diverge "
+        "from the running worker)."
+    )
+
+    def _set_config_widgets_enabled(self, enabled: bool) -> None:
+        """Lock/unlock the config panel widgets in bulk.
+
+        When ``enabled`` is False, every config widget is disabled AND its
+        tooltip is replaced with a "🔒 Disarm to change" reminder so the
+        grower has an obvious explanation for why they can't click. When
+        ``enabled`` is True, the original tooltips are restored from the
+        snapshot dict built in ``_build_ui``.
+
+        Called from ``_apply_state`` on every state transition. Idle →
+        unlocked; armed/running → locked. Prevents the Path Y bug where
+        unchecking "Live classifier" during a session had no effect on
+        the running worker but silently corrupted paired data.
+        """
+        for widget, orig_tooltip in self._config_widget_original_tooltips.items():
+            widget.setEnabled(enabled)
+            if enabled:
+                widget.setToolTip(orig_tooltip)
+            else:
+                widget.setToolTip(self._CONFIG_LOCKED_TOOLTIP)
+
     def _apply_state(self):
         s = self._state
         if s == "idle":
@@ -817,6 +873,8 @@ class GrowthMonitor(QWidget):
             self.commit_btn.setEnabled(False)
             self.sample_id_input.setEnabled(True)
             self.grower_input.setEnabled(True)
+            # Config panel: fully editable in idle.
+            self._set_config_widgets_enabled(True)
         elif s == "armed":
             self.arm_btn.setText("DISARM")
             self.arm_btn.setStyleSheet(BTN_DISARM)
@@ -827,6 +885,9 @@ class GrowthMonitor(QWidget):
             self.commit_btn.setEnabled(False)
             self.sample_id_input.setEnabled(True)
             self.grower_input.setEnabled(True)
+            # Config panel: locked — worker states already committed to
+            # the values that were current at arm time.
+            self._set_config_widgets_enabled(False)
         elif s == "running":
             self.arm_btn.setEnabled(False)
             self.start_btn.setEnabled(False)
@@ -835,6 +896,8 @@ class GrowthMonitor(QWidget):
             self.commit_btn.setEnabled(True)
             self.sample_id_input.setEnabled(False)
             self.grower_input.setEnabled(False)
+            # Config panel: stays locked — session in progress.
+            self._set_config_widgets_enabled(False)
 
     def set_state(self, new_state: str):
         self._state = new_state
@@ -1127,6 +1190,12 @@ class GrowthMonitor(QWidget):
         isn't running would produce a "grower belief with no classifier
         pair" log entry, which pollutes Yuxin's #1 active-comparisons
         signal (the whole point of the pair is having both sides).
+
+        Defensive: clears ``_latest_classifier`` to None so ``_on_commit``
+        writes ``classifier_status = DISABLED`` on the next LOG ENTRY
+        instead of stale values from before the disable. Belt-and-
+        suspenders against any code path that reaches here with a
+        lingering state cache — see Jul 8 2026 Path Y investigation.
         """
         # Force correction off first — otherwise the setEnabled(False)
         # loop below re-locks sliders that the correction toggle would
@@ -1135,6 +1204,9 @@ class GrowthMonitor(QWidget):
             self.correction_btn.setChecked(False)
             self._on_correction_toggled(False)
         self.correction_btn.setEnabled(False)
+        # Wipe the stale classifier state cache so LOG ENTRY produces
+        # correct DISABLED rows even if the caller didn't disarm first.
+        self._latest_classifier = None
         for name, slider in self._recon_sliders.items():
             slider.blockSignals(True)
             slider.setValue(0)
