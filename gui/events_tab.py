@@ -688,7 +688,12 @@ class EventsTab(QWidget):
             )
             return
 
-        frame_paths = sorted(full_dir.glob("*.png"))
+        # Match both .png (legacy sessions before Jul 9 2026) and .bmp
+        # (post-switch to match Justin's training data format). Sorted
+        # together so within-session interleave is stable.
+        frame_paths = sorted(
+            list(full_dir.glob("*.png")) + list(full_dir.glob("*.bmp"))
+        )
         if not frame_paths:
             self._set_placeholder(
                 f"Event #{event_idx} — buffer directory is empty."

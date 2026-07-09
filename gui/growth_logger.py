@@ -301,10 +301,11 @@ class GrowthLogger:
     def save_heartbeat_frame(
         self, frame: np.ndarray, timestamp: str = ""
     ) -> str:
-        """Save a heartbeat anchor frame as ``heartbeat_NNN_HHMMSS.png``.
+        """Save a heartbeat anchor frame as ``heartbeat_NNN_HHMMSS.bmp``.
 
-        Same quality gate as ``save_frame``; failed frames return "" and
-        are not counted toward the heartbeat counter.
+        BMP matches Justin's training-data format (Jul 9 2026 switch;
+        was .png before). Same quality gate as ``save_frame``; failed
+        frames return "" and are not counted toward the heartbeat counter.
         """
         if self._session_dir is None:
             return ""
@@ -325,7 +326,10 @@ class GrowthLogger:
 
         self._heartbeat_counter += 1
         ts = timestamp or datetime.now().strftime("%H%M%S")
-        fname = f"heartbeat_{self._heartbeat_counter:03d}_{ts}.png"
+        # .bmp per Jul 9 2026 switch — matches Justin's training data
+        # format. PIL / cv2 infer format from the extension; no other
+        # code change needed.
+        fname = f"heartbeat_{self._heartbeat_counter:03d}_{ts}.bmp"
         path = self._session_dir / "frames" / fname
 
         try:
@@ -640,7 +644,8 @@ class GrowthLogger:
                 qa = check_frame_quality(frame)
                 if not qa.passed:
                     continue
-            fname = f"buf_{pos:02d}_{ts_tag}.png"
+            # .bmp per Jul 9 2026 switch — training-data-format-match.
+            fname = f"buf_{pos:02d}_{ts_tag}.bmp"
             path = event_dir / fname
             try:
                 from PIL import Image
@@ -705,7 +710,10 @@ class GrowthLogger:
 
         self._commit_counter += 1
         ts = timestamp or datetime.now().strftime("%H%M%S")
-        fname = f"entry_{self._commit_counter:03d}_{ts}.png"
+        # .bmp per Jul 9 2026 switch — matches Justin's training data
+        # format. Files ~10x larger than PNG (~300 KB vs ~30 KB for a
+        # 656x492x3 uint8 frame), still trivial vs the T9 SSD's capacity.
+        fname = f"entry_{self._commit_counter:03d}_{ts}.bmp"
         path = self._session_dir / "frames" / fname
 
         try:

@@ -53,6 +53,11 @@ class SaveFrameTests(unittest.TestCase):
         self.assertNotEqual(path, "")
         self.assertTrue(Path(path).exists())
         self.assertEqual(quality_pass, True)
+        # Jul 9 switch: entry frames are .bmp, not .png.
+        self.assertTrue(
+            path.endswith(".bmp"),
+            f"expected .bmp extension, got {path}",
+        )
 
     def test_dark_frame_still_saves_and_reports_quality_pass_false(self):
         # Critical contract test: grower explicit intent > automated
@@ -61,6 +66,17 @@ class SaveFrameTests(unittest.TestCase):
         self.assertNotEqual(path, "", "dark frame should still be saved")
         self.assertTrue(Path(path).exists())
         self.assertEqual(quality_pass, False)
+        self.assertTrue(path.endswith(".bmp"))
+
+    def test_saved_bmp_is_valid_bmp_format(self):
+        # PIL should be able to read the file back as a BMP.
+        path, _ = self.logger.save_frame(_good_frame(), "160955")
+        from PIL import Image
+        with Image.open(path) as img:
+            self.assertEqual(
+                img.format, "BMP",
+                f"expected BMP format, PIL reports {img.format}",
+            )
 
     def test_no_session_returns_empty_path_and_none_quality(self):
         logger = GrowthLogger(base_dir=self.tmp.name)
