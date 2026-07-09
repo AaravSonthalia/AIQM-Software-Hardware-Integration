@@ -390,6 +390,7 @@ class GrowthMonitor(QWidget):
         # === Tab widget ===
         self._tabs = QTabWidget()
         self._build_monitor_tab()
+        self._build_direct_read_tab()
         self._build_events_tab()
         self._build_session_tab()
         root.addWidget(self._tabs, 1)
@@ -605,6 +606,111 @@ class GrowthMonitor(QWidget):
         layout.addLayout(footer)
 
         self._tabs.addTab(tab, "Monitor")
+
+    # ----- Direct-read Tab -------------------------------------------------
+
+    def _build_direct_read_tab(self):
+        """Mount the Direct-read tab — live growth-state fields sourced
+        from EvapControl's own ``.elo`` binary log via
+        ``drivers.evap_control.ElogReader``.
+
+        Populated by ``EvapControlWorker`` when configured with
+        ``mode="elog"`` in the Config tab. In "screengrab" or "dummy"
+        mode the fields stay at their default ``"---"`` (the worker
+        can't source them). Growers seeing all-dashes here should
+        check the Evap Control mode selector in the Config tab.
+
+        Layout (Design C, locked 2026-07-09): three ``QGroupBox``
+        sections — Substrate (2 fields), Effusion cells (5), Plasma
+        (3). The Plasma section is hidden by default and revealed
+        only when at least one plasma field carries a value —
+        ``ElogReader`` filters NaN → None, so an off plasma source
+        presents as all-None from our side, matching the "hide when
+        unused" affordance from the design mockup.
+
+        See ``ElogReader.DEFAULT_VAR_MAP`` in
+        ``drivers/evap_control.py`` for the elog-variable →
+        EvapControlState field mapping. Adding a new cell requires:
+        extend that map + the ``EvapControlState`` dataclass + the
+        ``log_sensors`` schema in ``gui/growth_logger.py`` + this
+        tab.
+        """
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        # Header names the source so all-dashes isn't mysterious.
+        header = QLabel(
+            "Live growth state from EvapControl's <b>.elo</b> log. "
+            "Requires EvapControl mode = <b>elog</b> in the Config "
+            "tab; otherwise fields stay at ---."
+        )
+        header.setStyleSheet("font-size: 11px; color: #888;")
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        _field_style = (
+            "QFrame { border: 1px solid #555; } "
+            "QLabel { background: transparent; }"
+        )
+
+        # --- Substrate section: Manipulator PV + setpoint ---
+        # Pair rationale: the pyrometer on Monitor tab gives an
+        # emissivity-corrected substrate temperature; Mani PV here is
+        # a thermocouple reading from the manipulator stage. Both
+        # visible = cross-check for thermocouple drift or pyrometer
+        # emissivity errors.
+        substrate_group = QGroupBox("Substrate (Manipulator)")
+        substrate_layout = QHBoxLayout(substrate_group)
+        self.substrate_pv_display = ValueDisplay(
+            "Mani PV", "°C", 1,
+        )
+        self.substrate_sp_display = ValueDisplay(
+            "Mani setpoint", "°C", 1,
+        )
+        for d in (self.substrate_pv_display, self.substrate_sp_display):
+            d.setStyleSheet(_field_style)
+            substrate_layout.addWidget(d)
+        layout.addWidget(substrate_group)
+
+        # --- Effusion cells section (5 cells; see DEFAULT_VAR_MAP) ---
+        cells_group = QGroupBox("Effusion cells")
+        cells_layout = QHBoxLayout(cells_group)
+        self.cell_HTEC2_display = ValueDisplay("HTEC2", "°C", 1)
+        self.cell_Y_display = ValueDisplay("Y (Yttrium)", "°C", 1)
+        self.cell_Sr_display = ValueDisplay("Sr", "°C", 1)
+        self.cell_Eu_display = ValueDisplay("Eu", "°C", 1)
+        self.cell_Er_display = ValueDisplay("Er", "°C", 1)
+        for d in (
+            self.cell_HTEC2_display, self.cell_Y_display,
+            self.cell_Sr_display, self.cell_Eu_display,
+            self.cell_Er_display,
+        ):
+            d.setStyleSheet(_field_style)
+            cells_layout.addWidget(d)
+        layout.addWidget(cells_group)
+
+        # --- Plasma section: hidden by default; revealed when any
+        #     plasma field is populated. ElogReader treats NaN as
+        #     "unavailable" (returns None), so all-None ⇒ plasma off.
+        self.plasma_group = QGroupBox("Plasma source")
+        plasma_layout = QHBoxLayout(self.plasma_group)
+        self.plasma_dc_display = ValueDisplay("DC bias", "V", 1)
+        self.plasma_fwd_display = ValueDisplay("Forward", "W", 1)
+        self.plasma_rfl_display = ValueDisplay("Reflected", "W", 1)
+        for d in (
+            self.plasma_dc_display, self.plasma_fwd_display,
+            self.plasma_rfl_display,
+        ):
+            d.setStyleSheet(_field_style)
+            plasma_layout.addWidget(d)
+        self.plasma_group.setVisible(False)
+        layout.addWidget(self.plasma_group)
+
+        layout.addStretch(1)  # push sections to top
+
+        self._tabs.addTab(tab, "Direct-read")
 
     # ----- Events Tab ------------------------------------------------------
 
@@ -983,11 +1089,63 @@ class GrowthMonitor(QWidget):
 
     def update_evap_state(self, state: EvapControlState):
         self._latest_evap = state
+        # Monitor-tab pressure display (kept as-is; both screengrab
+        # and elog modes source it).
         p = state.chamber_pressure_mbar
         if state.connected and p is not None:
             self.pressure_display.value.setText(f"{p:.2e} mbar")
         else:
             self.pressure_display.value.setText("---")
+
+        # Direct-read tab: substrate + cells + plasma. When the worker
+        # is disconnected (never armed, or ElogReader.connect() raised
+        # because no live .elo file exists), every field returns to
+        # "---" regardless of last populated value — matches the
+        # pressure display's connection-conditional behavior above.
+        # When the worker is connected but the field is None (e.g.
+        # "screengrab" mode which only sources pressure, or "elog"
+        # mode with the variable absent from the elog schema), same
+        # "---".
+        connected = state.connected
+        for display, value in (
+            (self.substrate_pv_display,
+             state.substrate_temp_pv_C if connected else None),
+            (self.substrate_sp_display,
+             state.substrate_temp_setpoint_C if connected else None),
+            (self.cell_HTEC2_display,
+             state.cell_HTEC2_pv_C if connected else None),
+            (self.cell_Y_display,
+             state.cell_Y_pv_C if connected else None),
+            (self.cell_Sr_display,
+             state.cell_Sr_pv_C if connected else None),
+            (self.cell_Eu_display,
+             state.cell_Eu_pv_C if connected else None),
+            (self.cell_Er_display,
+             state.cell_Er_pv_C if connected else None),
+            (self.plasma_dc_display,
+             state.plasma_dc_bias_V if connected else None),
+            (self.plasma_fwd_display,
+             state.plasma_forward_W if connected else None),
+            (self.plasma_rfl_display,
+             state.plasma_reflected_W if connected else None),
+        ):
+            if value is None:
+                display.value.setText("---")
+            else:
+                display.set_value(value)
+
+        # Plasma section visibility. Only when at least one plasma
+        # field carries a value — ElogReader NaN-filters unavailable
+        # variables to None, so a shut-off plasma source presents as
+        # all-None here and the section stays hidden.
+        plasma_on = connected and any(
+            v is not None for v in (
+                state.plasma_dc_bias_V,
+                state.plasma_forward_W,
+                state.plasma_reflected_W,
+            )
+        )
+        self.plasma_group.setVisible(plasma_on)
 
     def update_camera_state(self, state: CameraState):
         self._latest_camera = state
@@ -1713,6 +1871,17 @@ class GrowthMonitor(QWidget):
         self.voltage_display.value.setText("---")
         self.current_display.value.setText("---")
         self.pressure_display.value.setText("---")
+        # Direct-read tab: all fields back to "---", plasma section hidden.
+        for d in (
+            self.substrate_pv_display, self.substrate_sp_display,
+            self.cell_HTEC2_display, self.cell_Y_display,
+            self.cell_Sr_display, self.cell_Eu_display,
+            self.cell_Er_display,
+            self.plasma_dc_display, self.plasma_fwd_display,
+            self.plasma_rfl_display,
+        ):
+            d.value.setText("---")
+        self.plasma_group.setVisible(False)
         self.rheed_image_label.clear()
         self.auto_capture_label.setText("Auto-capture: idle")
         # Force grower correction off before wiping slider state so the
