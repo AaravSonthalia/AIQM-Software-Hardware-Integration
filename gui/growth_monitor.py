@@ -845,10 +845,23 @@ class GrowthMonitor(QWidget):
         self.config_evap_mode = QComboBox()
         # "elog" — direct-read of EvapControl's own .elo binary log
         # (drivers/elog.py). No OCR, no window positioning. See
-        # drivers/evap_control.py:ElogReader. Default stays "screengrab"
-        # for backward compatibility until elog has live-lab validation.
+        # drivers/evap_control.py:ElogReader.
+        #
+        # Default flipped from "screengrab" to "elog" 2026-07-09
+        # (per P3 decision): direct-read is strictly better when
+        # EvapControl is running. Bulbasaur end-to-end validation
+        # pending — session must arm cleanly with the new default,
+        # all 10 Direct-read fields must populate with live values,
+        # values must cross-check against the EvapControl window's
+        # own readouts. See elog_direct_read_may15.md Jul 9 update.
+        #
+        # Failure mode: if EvapControl isn't running, ElogReader
+        # .connect() raises → worker emits connected=False + error
+        # → Direct-read shows "---" everywhere. Grower flips the
+        # dropdown back to "screengrab" for OCR fallback. Auto-
+        # fallback deferred (memory Jul 9 open question #1).
         self.config_evap_mode.addItems(["dummy", "elog", "screengrab"])
-        self.config_evap_mode.setCurrentText("screengrab")
+        self.config_evap_mode.setCurrentText("elog")
         config_form.addRow("Evap Control mode:", self.config_evap_mode)
 
         # Enable/disable the live classifier. Off = classifier worker

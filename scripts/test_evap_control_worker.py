@@ -160,13 +160,17 @@ class ConfigModeOptionsTests(unittest.TestCase):
         }
         self.assertEqual(options, {"dummy", "elog", "screengrab"})
 
-    def test_config_evap_mode_default_is_screengrab(self):
-        # Current default as of Jul 9 2026 — grower has to opt into
-        # elog. If the P3 default-mode discussion decides to flip
-        # this, update this test alongside growth_monitor.py:745.
+    def test_config_evap_mode_default_is_elog(self):
+        # Default flipped from "screengrab" to "elog" 2026-07-09 per
+        # the P3 decision — direct-read is strictly better when
+        # EvapControl is running. Bulbasaur end-to-end validation is
+        # pending (see elog_direct_read_may15.md Jul 9 checklist). If
+        # the failure mode turns out too noisy for growers and we add
+        # auto-fallback or revert the default, update this test and
+        # the corresponding setCurrentText call in growth_monitor.py.
         self.assertEqual(
             self.monitor.config_evap_mode.currentText(),
-            "screengrab",
+            "elog",
         )
 
 
