@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt6.QtWidgets import QMainWindow
+from PyQt6.QtWidgets import QFileDialog, QMainWindow
 from PyQt6.QtCore import pyqtSlot, Qt, QTimer
 
 log = logging.getLogger(__name__)
@@ -33,6 +33,11 @@ from gui.workers import (
 )
 from gui.growth_monitor import GrowthMonitor
 from gui.growth_logger import GrowthLogger
+from gui.movie_export import (
+    DEFAULT_MOVIE_NAME,
+    MovieExporter,
+    MovieExportWorker,
+)
 
 
 # Tuned against Rahim's 2022_02_04 STO trajectory.
@@ -162,6 +167,13 @@ class GrowthApp(QMainWindow):
         )
         self._auto_capture_event_count = 0
 
+        # Movie export worker (Jul 10 2026). QThread that runs
+        # MovieExporter.export_movie off the GUI thread. Held on the
+        # instance so it doesn't get garbage-collected mid-encode.
+        # Single-worker policy: a second click while one is running is
+        # ignored — the button gets disabled during encode.
+        self._movie_worker: Optional[MovieExportWorker] = None
+
         # Tracking for MISTRAL set V/I change detection. Initialised to None
         # at construction; reset to None in _on_start so each session detects
         # changes relative to its own first reading, not the previous session.
@@ -186,6 +198,10 @@ class GrowthApp(QMainWindow):
         # file lifecycle.
         self.monitor.manual_event_requested.connect(self._on_manual_event)
         self.monitor.export_requested.connect(self._on_export)
+        # Movie export (Jul 10 2026 workstream #5) — file dialog + QThread
+        # encode. Handler owns the worker lifetime so cross-session
+        # exports don't leak workers into the background.
+        self.monitor.movie_export_requested.connect(self._on_movie_export)
         self.monitor.auto_capture_pause_toggled.connect(
             self._on_auto_capture_pause_toggled,
         )
@@ -507,6 +523,95 @@ class GrowthApp(QMainWindow):
             self.statusBar().showMessage(f"Growth log exported: {path}", 5000)
         else:
             self.statusBar().showMessage("Export failed \u2014 no session data", 5000)
+
+    # --- Movie export (Jul 10 2026 workstream #5) --------------------------
+
+    @pyqtSlot()
+    def _on_movie_export(self):
+        """Prompt for a save path and encode a heartbeat time-lapse mp4.
+
+        Blocks a second click while one export is running (single-worker
+        policy) \u2014 the button gets disabled up front and re-enabled by
+        the worker's finished_ok / failed slot. Session need not be
+        stopped: a mid-session export encodes everything captured so
+        far, which is legit ("show me the movie of the growth up to
+        this point").
+        """
+        # If a previous worker is still running, ignore the click.
+        # Should be visually impossible (button is disabled) but guard
+        # in case the user somehow triggered via keyboard.
+        if self._movie_worker is not None and self._movie_worker.isRunning():
+            self.statusBar().showMessage(
+                "Movie export already running; please wait.", 3000,
+            )
+            return
+
+        session_dir = self.growth_log.session_dir
+        if session_dir is None:
+            self.statusBar().showMessage(
+                "No session data \u2014 arm + start a session first.", 4000,
+            )
+            return
+
+        exporter = MovieExporter(session_dir)
+        n = exporter.frame_count()
+        if n == 0:
+            self.statusBar().showMessage(
+                "No continuous-capture frames to export yet.", 4000,
+            )
+            return
+
+        default_path = session_dir / DEFAULT_MOVIE_NAME
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Movie",
+            str(default_path),
+            "MP4 Video (*.mp4)",
+        )
+        if not path_str:
+            return  # Grower cancelled the dialog
+
+        # Force .mp4 extension since the codec is mp4v \u2014 silently
+        # correcting is better than surfacing a codec / extension
+        # mismatch after a 60 s encode.
+        output_path = Path(path_str)
+        if output_path.suffix.lower() != ".mp4":
+            output_path = output_path.with_suffix(".mp4")
+
+        self._movie_worker = MovieExportWorker(exporter, output_path)
+        self._movie_worker.progress.connect(self._on_movie_export_progress)
+        self._movie_worker.finished_ok.connect(self._on_movie_export_ok)
+        self._movie_worker.failed.connect(self._on_movie_export_failed)
+        # Disable the button during encode; re-enabled in the slots.
+        self.monitor.export_movie_btn.setEnabled(False)
+        self.statusBar().showMessage(
+            f"Encoding movie \u2014 {n} frames total\u2026", 0,
+        )
+        self._movie_worker.start()
+
+    @pyqtSlot(int, int)
+    def _on_movie_export_progress(self, current: int, total: int):
+        # Rate-limit the status-bar update \u2014 every 20 frames is
+        # smooth-looking without spamming the event loop mid-encode.
+        # (progress signal fires from the worker thread; Qt queues it
+        # onto the main thread automatically, but very high signal
+        # rates still cost.)
+        if current == total or current % 20 == 0:
+            self.statusBar().showMessage(
+                f"Encoding movie \u2014 {current} / {total} frames", 0,
+            )
+
+    @pyqtSlot(str)
+    def _on_movie_export_ok(self, path: str):
+        self.statusBar().showMessage(f"Movie exported: {path}", 8000)
+        self.monitor.export_movie_btn.setEnabled(True)
+        self._movie_worker = None
+
+    @pyqtSlot(str)
+    def _on_movie_export_failed(self, message: str):
+        self.statusBar().showMessage(f"Movie export failed: {message}", 8000)
+        self.monitor.export_movie_btn.setEnabled(True)
+        self._movie_worker = None
 
     # --- Periodic sensor logging -------------------------------------------
 

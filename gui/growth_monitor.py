@@ -319,6 +319,11 @@ class GrowthMonitor(QWidget):
     # sits inside.
     manual_event_requested = pyqtSignal(dict)
     export_requested = pyqtSignal()
+    # Grower asks for an mp4 time-lapse of the session's heartbeat frames
+    # (Jul 10 2026 workstream #5). GrowthApp handles the file dialog +
+    # threading; the widget just signals intent. Emitted without args —
+    # the app-side handler picks the output path via QFileDialog.
+    movie_export_requested = pyqtSignal()
     # True = user wants auto-capture paused; False = wants it resumed.
     auto_capture_pause_toggled = pyqtSignal(bool)
     # Forwarded from the banner — emits (event_idx, buffer_dir, state).
@@ -1068,9 +1073,32 @@ class GrowthMonitor(QWidget):
         self.growth_notes_table.verticalHeader().setVisible(False)
         layout.addWidget(self.growth_notes_table, 1)
 
-        # Export button row
+        # Export button row — CSV growth log + optional mp4 time-lapse.
         btn_row = QHBoxLayout()
         btn_row.addStretch()
+
+        # Export Movie — Jul 10 2026 addition. Stitches heartbeat_log.csv's
+        # BMP frames into a growth_movie.mp4 at 15 fps default (75× speedup
+        # at 5-second capture; 4-hour growth plays in ~3.2 min). Runs on a
+        # QThread so the GUI stays responsive during the 30-90s encode.
+        # Positioned LEFT of the Growth Log export so the eye reads
+        # "movie → log" in scan order; both blue but movie has a lighter
+        # shade to signal secondary export.
+        self.export_movie_btn = QPushButton("Export Movie")
+        self.export_movie_btn.setStyleSheet(
+            "QPushButton { background-color: #0284c7; color: white; "
+            "font-size: 14px; padding: 10px 20px; }"
+        )
+        self.export_movie_btn.setToolTip(
+            "Encode this session's continuous-capture frames into an mp4 "
+            "time-lapse at 15 fps (75× speedup at 5-second capture). "
+            "Runs in the background; status bar shows progress."
+        )
+        self.export_movie_btn.clicked.connect(
+            lambda: self.movie_export_requested.emit()
+        )
+        btn_row.addWidget(self.export_movie_btn)
+
         self.export_btn = QPushButton("Export Growth Log")
         self.export_btn.setStyleSheet(
             "QPushButton { background-color: #2563eb; color: white; "
