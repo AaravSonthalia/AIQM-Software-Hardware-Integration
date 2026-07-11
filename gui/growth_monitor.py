@@ -68,6 +68,7 @@ from gui.growth_logger import (
     EVENT_STATE_KEPT_EXPLICIT,
 )
 from gui.events_tab import EventsTab
+from gui.scrubber_tab import ScrubberTab
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +417,7 @@ class GrowthMonitor(QWidget):
         self._build_monitor_tab()
         self._build_direct_read_tab()
         self._build_events_tab()
+        self._build_scrubber_tab()
         self._build_session_tab()
         root.addWidget(self._tabs, 1)
 
@@ -824,6 +826,25 @@ class GrowthMonitor(QWidget):
         """
         label = "Events" if count == 0 else f"Events ({count})"
         self._tabs.setTabText(self._events_tab_index, label)
+
+    # ----- Scrubber Tab ----------------------------------------------------
+
+    def _build_scrubber_tab(self):
+        """Mount the ScrubberTab — retrospective timeline playback.
+
+        Ships workstream #3 from the Jul 10 2026 group-meeting design
+        shift. The scrubber pairs with MARK EVENT (Monitor tab) and
+        continuous capture (heartbeat system) to complete the three-
+        concern architecture (capture / mark / label). Its one job is
+        letting the grower flip through the growth 'movie' after the
+        fact; labeling stays on Events tab + Equalizer tab.
+
+        Placed after Events in the tab order so the retrospective
+        surfaces sit together — grower's mental model is now → auto-
+        events → scrub-through-everything → session admin.
+        """
+        self.scrubber_tab = ScrubberTab()
+        self._tabs.addTab(self.scrubber_tab, "Scrubber")
 
     # ----- Session Tab -----------------------------------------------------
 

@@ -333,6 +333,13 @@ class GrowthApp(QMainWindow):
         # (handles GUI-restart-mid-session), the live append-on-signal,
         # and labeling reads/writes all flow through the same source.
         self.monitor.events_tab.attach_session(self.growth_log)
+        # Point the scrubber tab at the session dir so its ↻ Reload
+        # button can build the frame index against the correct session.
+        # Reads three CSVs (heartbeat / manual / auto-capture); missing
+        # or empty CSVs are handled gracefully so attach right at session
+        # start (before any heartbeat has fired) just shows the "No
+        # frames captured yet" placeholder until the grower hits Reload.
+        self.monitor.scrubber_tab.attach_session(self.growth_log.session_dir)
         # Reset the other two session-scoped tables (Sensor Log + Growth
         # Notes). Events tab handles its own reset inside attach_session.
         self.monitor.clear_session_tables()
