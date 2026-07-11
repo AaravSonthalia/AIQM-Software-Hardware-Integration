@@ -68,6 +68,7 @@ from gui.growth_logger import (
     EVENT_STATE_KEPT_EXPLICIT,
 )
 from gui.events_tab import EventsTab
+from gui.live_equalizer_tab import LiveEqualizerTab
 from gui.scrubber_tab import ScrubberTab
 
 
@@ -423,6 +424,7 @@ class GrowthMonitor(QWidget):
         self._build_direct_read_tab()
         self._build_events_tab()
         self._build_scrubber_tab()
+        self._build_live_equalizer_tab()
         self._build_session_tab()
         root.addWidget(self._tabs, 1)
 
@@ -832,6 +834,24 @@ class GrowthMonitor(QWidget):
         label = "Events" if count == 0 else f"Events ({count})"
         self._tabs.setTabText(self._events_tab_index, label)
 
+    # ----- Live Equalizer Tab ----------------------------------------------
+
+    def _build_live_equalizer_tab(self):
+        """Mount the LiveEqualizerTab — real-time RHEED labeling surface.
+
+        Ships workstream #4 from the Jul 10 2026 group meeting per PI
+        direction (same-day pivot from popup to tab): first-class tab
+        alongside the retrospective surfaces. Placed AFTER Scrubber and
+        BEFORE Session so the tab order reads:
+
+          Monitor → Direct-read → Events → Scrubber → Live Equalizer → Session
+
+        Live surfaces (Monitor, Live Equalizer) bracket the retrospective
+        surfaces (Events, Scrubber) with admin (Session) at the end.
+        """
+        self.live_equalizer_tab = LiveEqualizerTab()
+        self._tabs.addTab(self.live_equalizer_tab, "Live Equalizer")
+
     # ----- Scrubber Tab ----------------------------------------------------
 
     def _build_scrubber_tab(self):
@@ -1142,6 +1162,10 @@ class GrowthMonitor(QWidget):
 
     def _apply_state(self):
         s = self._state
+        # Live Equalizer tab may not exist yet during the first _apply_state
+        # from __init__ (setState fires before _build_ui completes for that
+        # tab). Guard so early state application doesn't AttributeError.
+        _le_tab = getattr(self, "live_equalizer_tab", None)
         if s == "idle":
             self.arm_btn.setText("ARM")
             self.arm_btn.setStyleSheet(BTN_ARM)
@@ -1150,6 +1174,8 @@ class GrowthMonitor(QWidget):
             self.stop_btn.setEnabled(False)
             self.commit_btn.setEnabled(False)
             self.mark_event_btn.setEnabled(False)
+            if _le_tab is not None:
+                _le_tab.set_save_enabled(False)
             self.sample_id_input.setEnabled(True)
             self.grower_input.setEnabled(True)
             # Config panel: fully editable in idle.
@@ -1163,6 +1189,8 @@ class GrowthMonitor(QWidget):
             self.stop_btn.setEnabled(False)
             self.commit_btn.setEnabled(False)
             self.mark_event_btn.setEnabled(False)
+            if _le_tab is not None:
+                _le_tab.set_save_enabled(False)
             self.sample_id_input.setEnabled(True)
             self.grower_input.setEnabled(True)
             # Config panel: locked — worker states already committed to
@@ -1179,6 +1207,10 @@ class GrowthMonitor(QWidget):
             # session dir. Idle/armed clicks would go nowhere since the
             # logger hasn't opened manual_events.csv yet.
             self.mark_event_btn.setEnabled(True)
+            # Live Equalizer Save has the same gating logic — writes need
+            # an active session so live_labels.csv is open.
+            if _le_tab is not None:
+                _le_tab.set_save_enabled(True)
             self.sample_id_input.setEnabled(False)
             self.grower_input.setEnabled(False)
             # Config panel: stays locked — session in progress.
@@ -1316,6 +1348,12 @@ class GrowthMonitor(QWidget):
         if state.frame is not None:
             self._current_frame = state.frame
             self._display_frame(state.frame)
+            # Feed the Live Equalizer tab too — attribute-guarded because
+            # this method is called from __init__ paths where the tab may
+            # not yet be constructed (early camera state emit races GUI
+            # build).
+            if hasattr(self, "live_equalizer_tab"):
+                self.live_equalizer_tab.update_camera_frame(state.frame)
 
     # Value-label style presets. Kept as constants so update_classifier_state
     # doesn't allocate style strings per emission (5-slider hot path at 2 Hz).
@@ -1508,6 +1546,13 @@ class GrowthMonitor(QWidget):
                 "Quality: the model's confidence in this specific frame.\n"
                 "Ms: time to classify this frame."
             )
+
+        # Route the same state to the Live Equalizer tab so its Classifier
+        # % breakdown mirrors what the Monitor tab shows. Attribute-guarded
+        # in case update_classifier_state fires before _build_ui completes
+        # (early classifier bridge init races GUI construction).
+        if hasattr(self, "live_equalizer_tab"):
+            self.live_equalizer_tab.update_classifier_state(state)
 
     # Documented for the tooltip messages so they stay in sync with
     # ClassifierWorker.OOD_QUALITY_THRESHOLD; hard-coded because the
@@ -2210,3 +2255,9 @@ class GrowthMonitor(QWidget):
         self._continuous_capture_interval_s = None
         self._continuous_capture_count = 0
         self._update_continuous_capture_label()
+        # Live Equalizer tab wipes its transient state (last camera frame,
+        # classifier %). Basis + slider defaults preserved. Attribute-
+        # guarded because reset_displays can be called during teardown
+        # after the tab was deleted.
+        if hasattr(self, "live_equalizer_tab"):
+            self.live_equalizer_tab.reset_for_new_session()

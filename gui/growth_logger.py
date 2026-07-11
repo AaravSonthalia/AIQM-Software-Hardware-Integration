@@ -144,6 +144,21 @@ class GrowthLogger:
         # the primary path).
         "note",
     ]
+    # Live-Equalizer labels (Jul 10 2026 group-meeting workstream #4).
+    # One row per Save click in the Live Equalizer window. The 5 recon_*
+    # columns are the sliders' current mixture (Pattern A normalization
+    # NOT applied here; grower chooses whether to hit Normalize before
+    # Save). Coexists with commit_log.csv:recon_* (which are the Monitor-
+    # tab sliders on a LOG ENTRY) — same class labels, different capture
+    # surface + rate. Downstream analyses can join on timestamp.
+    LIVE_LABEL_FIELDS = [
+        "timestamp", "elapsed_s", "label_idx",
+        "recon_1x1", "recon_tw", "recon_c6x2",
+        "recon_rt13", "recon_HTR",
+        "pyrometer_temp_C",
+        "voltage_V", "current_A", "psu_source",
+        "frame_path",
+    ]
     # Event labels written by the Events tab labeling form. The from/to
     # columns are reserved for the deferred reconstruction-transition
     # dropdowns — they exist now so future UI additions don't require a
@@ -182,10 +197,13 @@ class GrowthLogger:
         self._set_change_writer = None
         self._manual_event_file = None
         self._manual_event_writer = None
+        self._live_label_file = None
+        self._live_label_writer = None
         self._commit_counter = 0
         self._heartbeat_counter = 0
         self._set_change_counter = 0
         self._manual_event_counter = 0
+        self._live_label_counter = 0
         self._entries: list[dict] = []  # Accumulated entries for export
 
     @property
@@ -256,10 +274,19 @@ class GrowthLogger:
         # header line, one flush, per session).
         self._manual_event_file.flush()
 
+        live_label_path = self._session_dir / "live_labels.csv"
+        self._live_label_file = open(live_label_path, "w", newline="")
+        self._live_label_writer = csv.DictWriter(
+            self._live_label_file, fieldnames=self.LIVE_LABEL_FIELDS,
+        )
+        self._live_label_writer.writeheader()
+        self._live_label_file.flush()
+
         self._commit_counter = 0
         self._heartbeat_counter = 0
         self._set_change_counter = 0
         self._manual_event_counter = 0
+        self._live_label_counter = 0
         self._entries = []
 
     def log_sensors(
@@ -486,6 +513,97 @@ class GrowthLogger:
             "note": note,
         })
         self._manual_event_file.flush()
+        return idx
+
+    def record_live_label(
+        self,
+        elapsed_s: float,
+        weights: dict,
+        frame: Optional[np.ndarray] = None,
+        pyro_temp: Optional[float] = None,
+        voltage_V: Optional[float] = None,
+        current_A: Optional[float] = None,
+        psu_source: str = "none",
+    ) -> int:
+        """Append a Live Equalizer label to live_labels.csv.
+
+        Ships workstream #4 from the Jul 10 2026 group meeting. The
+        Live Equalizer window subscribes to the camera stream and lets
+        the grower drive slider weights against the evolving frame;
+        Save triggers this method with the current mixture + a snapshot
+        of whatever the window was displaying at click time.
+
+        ``weights`` keys follow the 5 equalizer-class labels: ``"1x1"``,
+        ``"Tw(2x1)"``, ``"c(6x2)"``, ``"RT13"``, ``"HTR"``. Missing keys
+        default to 0.0 (grower may have moved only a subset of sliders).
+        Row schema is intentionally distinct from commit_log.csv so
+        downstream analysis can tell "monitor-slider label" from "live-
+        equalizer label" without a source column — they live in
+        different files.
+
+        Frame save follows the same best-effort pattern as
+        record_manual_event: PIL first, cv2 fallback, blank frame_path
+        if both fail. Returns 1-indexed label_idx or 0 for no-session.
+        """
+        if not self._live_label_writer:
+            return 0
+
+        self._live_label_counter += 1
+        idx = self._live_label_counter
+
+        # Save the frame as a BMP under frames/ — separate name-space
+        # from entry_ / heartbeat_ / manual_event_ so the scrubber and
+        # any post-hoc classifier training pipeline can distinguish
+        # sources by filename glob alone.
+        frame_path = ""
+        if frame is not None and self._session_dir is not None:
+            ts = datetime.now().strftime("%H%M%S")
+            fname = f"live_label_{idx:03d}_{ts}.bmp"
+            path = self._session_dir / "frames" / fname
+            try:
+                from PIL import Image
+                Image.fromarray(frame).save(str(path))
+                frame_path = str(path)
+            except ImportError:
+                try:
+                    import cv2
+                    cv2.imwrite(
+                        str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                    )
+                    frame_path = str(path)
+                except ImportError:
+                    pass
+
+        # Weight keys — mirror the EqualizerWindow's slider labels
+        # (see scripts/equalizer_ui.py::CLASS_DIRS) and the events_labels
+        # kwarg mapping in events_tab._make_equalizer_save_callback.
+        # Any missing entry defaults to 0.0 so partial-slider-move Saves
+        # still land a valid row.
+        def _w(key: str) -> str:
+            return f"{float(weights.get(key, 0.0)):.4f}"
+
+        self._live_label_writer.writerow({
+            "timestamp": datetime.now().isoformat(),
+            "elapsed_s": f"{elapsed_s:.2f}",
+            "label_idx": idx,
+            "recon_1x1":   _w("1x1"),
+            "recon_tw":    _w("Tw(2x1)"),
+            "recon_c6x2":  _w("c(6x2)"),
+            "recon_rt13":  _w("RT13"),
+            "recon_HTR":   _w("HTR"),
+            "pyrometer_temp_C": (
+                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
+            ),
+            "voltage_V": (
+                f"{voltage_V:.3f}" if voltage_V is not None else ""
+            ),
+            "current_A": (
+                f"{current_A:.3f}" if current_A is not None else ""
+            ),
+            "psu_source": psu_source,
+            "frame_path": frame_path,
+        })
+        self._live_label_file.flush()
         return idx
 
     def log_heartbeat(
@@ -981,6 +1099,7 @@ class GrowthLogger:
             self._sensor_file, self._commit_file,
             self._auto_capture_file, self._heartbeat_file,
             self._set_change_file, self._manual_event_file,
+            self._live_label_file,
         ):
             if f and not f.closed:
                 f.close()
@@ -996,6 +1115,8 @@ class GrowthLogger:
         self._set_change_writer = None
         self._manual_event_file = None
         self._manual_event_writer = None
+        self._live_label_file = None
+        self._live_label_writer = None
         # NOTE: _session_dir and _entries intentionally preserved
         # so Export Growth Log works after STOP.
 

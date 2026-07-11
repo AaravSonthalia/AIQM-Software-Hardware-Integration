@@ -202,6 +202,15 @@ class GrowthApp(QMainWindow):
         # encode. Handler owns the worker lifetime so cross-session
         # exports don't leak workers into the background.
         self.monitor.movie_export_requested.connect(self._on_movie_export)
+        # Live Equalizer save (Jul 10 2026 workstream #4) — the tab emits
+        # the current slider weights on Save; app-side handler snapshots
+        # the sensor state + calls logger.record_live_label. Frame comes
+        # from the tab's own get_current_full_frame() so it's the frame
+        # the grower was actually looking at, not a race-lagged monitor
+        # cache.
+        self.monitor.live_equalizer_tab.live_label_save_requested.connect(
+            self._on_live_label_save,
+        )
         self.monitor.auto_capture_pause_toggled.connect(
             self._on_auto_capture_pause_toggled,
         )
@@ -511,6 +520,71 @@ class GrowthApp(QMainWindow):
             note=payload.get("note", ""),
         )
         self.statusBar().showMessage("Event marked", 2000)
+
+    # --- LIVE EQUALIZER save (Jul 10 2026 workstream #4) -------------------
+
+    @pyqtSlot(dict)
+    def _on_live_label_save(self, weights: dict):
+        """Snapshot current sensor state + write a live_labels.csv row.
+
+        Frame comes from the LiveEqualizerTab's own cache
+        (``get_current_full_frame``) rather than ``monitor.get_current_frame``
+        — the tab-cached frame is what the grower was actually looking at
+        while balancing sliders, which is the training-signal ground
+        truth. Difference is usually one frame either way (~30-500 ms).
+
+        No-ops when there's no live frame (grower opened the tab pre-
+        session and hit Save). PSU + pyro snapshot pattern mirrors
+        ``_on_manual_event`` for consistency across the three label
+        surfaces (LOG ENTRY / MARK EVENT / Live Equalizer).
+        """
+        if not self.growth_log.active:
+            self.statusBar().showMessage(
+                "Start a session before saving live labels.", 3000,
+            )
+            return
+
+        frame = self.monitor.live_equalizer_tab.get_current_full_frame()
+
+        # PSU snapshot — identical priority to _on_manual_event: mistral
+        # first (current O-MBE topology), direct-read next.
+        voltage_v: Optional[float] = None
+        current_a: Optional[float] = None
+        psu_source = "none"
+        m = self.monitor._latest_mistral
+        if m is not None and m.connected:
+            voltage_v = m.v_actual
+            current_a = m.i_actual
+            psu_source = "mistral"
+        else:
+            p = self.monitor._latest_psu
+            if p is not None and p.connected:
+                voltage_v = p.voltage_measured
+                current_a = p.current_measured
+                psu_source = "direct"
+
+        pyro_temp: Optional[float] = None
+        pyro = self.monitor._latest_pyro
+        if pyro is not None and pyro.connected:
+            pyro_temp = pyro.temperature
+
+        idx = self.growth_log.record_live_label(
+            elapsed_s=self.monitor.get_elapsed_seconds(),
+            weights=weights,
+            frame=frame,
+            pyro_temp=pyro_temp,
+            voltage_V=voltage_v,
+            current_A=current_a,
+            psu_source=psu_source,
+        )
+        if idx > 0:
+            self.statusBar().showMessage(
+                f"Live label #{idx} saved", 3000,
+            )
+        else:
+            self.statusBar().showMessage(
+                "Live label save failed — no session data.", 3000,
+            )
 
     # --- Export ------------------------------------------------------------
 
