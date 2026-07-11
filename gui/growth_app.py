@@ -376,6 +376,11 @@ class GrowthApp(QMainWindow):
             "(~%.0f MB/hr at ~200 KB/frame PNG estimate)",
             heartbeat_s, _frames_per_hr, _est_mb_per_hr,
         )
+        # Surface the cadence on the Monitor tab so growers can confirm at
+        # a glance that the "movie" is being captured (Jul 10 2026 group-
+        # meeting design pressure). The footer indicator counts up on
+        # every successful heartbeat frame save.
+        self.monitor.set_continuous_capture_interval(heartbeat_s)
 
         self.monitor.set_state("running")
         self.statusBar().showMessage(f"Running \u2014 {sample_id}")
@@ -605,6 +610,11 @@ class GrowthApp(QMainWindow):
             pyro_temp=pyro_temp,
             frame_path=path,
         )
+        # Bump the Monitor-tab footer counter only after a successful
+        # save — a quality-gated skip must not inflate the display,
+        # otherwise the count drifts from the frames on disk that the
+        # scrubber will actually read.
+        self.monitor.increment_continuous_capture_count()
         self.statusBar().showMessage(
             f"Heartbeat anchor saved (#{self.growth_log._heartbeat_counter})", 3000,
         )

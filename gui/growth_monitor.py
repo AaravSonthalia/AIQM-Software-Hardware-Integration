@@ -356,6 +356,12 @@ class GrowthMonitor(QWidget):
         # increment on the same click; the button is disabled when no
         # session is armed so there's no drift path.
         self._manual_event_count: int = 0
+        # Continuous-capture ("movie") state for the Monitor footer indicator.
+        # Interval is set once at session start (mirrors the timer setup in
+        # growth_app._on_start); count increments on each heartbeat tick via
+        # set_continuous_capture_count. Both reset at session end.
+        self._continuous_capture_interval_s: Optional[float] = None
+        self._continuous_capture_count: int = 0
 
         self._build_ui()
         self._apply_state()
@@ -638,6 +644,21 @@ class GrowthMonitor(QWidget):
         self.auto_capture_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
         footer.addWidget(self.auto_capture_label, 1)
 
+        # Continuous-capture indicator (Jul 10 2026). Surfaces the "movie"
+        # cadence the growers asked for at the group meeting — otherwise
+        # the interval is buried on the Config tab and the grower can't
+        # confirm at a glance that frames are actually landing. Text
+        # format: "Capture: every 5s · 42 frames". Cyan (#0891b2) to
+        # separate visually from auto-capture (grey) and manual events
+        # (amber).
+        self.continuous_capture_label = QLabel("Capture: idle")
+        self.continuous_capture_label.setStyleSheet(
+            "color: #0891b2; font-size: 11px; padding: 4px 8px; "
+            "background-color: #1a1a1a; border-top: 1px solid #333;"
+        )
+        self.continuous_capture_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        footer.addWidget(self.continuous_capture_label, 0)
+
         # Manual-event counter — sits next to the auto-capture status so
         # both event streams are visible in one glance. Same footer
         # styling. Text stays "Manual events: N" as the counter climbs;
@@ -834,11 +855,18 @@ class GrowthMonitor(QWidget):
         self.config_interval_spin.setSingleStep(1.0)
         config_form.addRow("Recording interval:", self.config_interval_spin)
 
-        # Heartbeat interval — how often we save a RHEED frame regardless
-        # of detector flags. Default 5 s per the May 21 joint decision
-        # (was env-var-only before Jun 23). Range 1 s (dense) to 600 s
-        # (10 min, the old default). Spans the typical use cases.
-        # Applied at session START — changing mid-session has no effect.
+        # Continuous-capture interval — how often we save a RHEED frame
+        # regardless of detector flags. Historically named "heartbeat"
+        # (internal identifier still `_heartbeat_*` for compatibility);
+        # user-facing labels use the Jul 10 2026 grower vocabulary of
+        # "continuous capture" / "movie of the growth" instead.
+        #
+        # Default 5 s per the May 21 joint decision (was env-var-only
+        # before Jun 23). Range 1 s (dense) to 600 s (10 min, the old
+        # default). Applied at session START — changing mid-session has
+        # no effect. This is the primary feed for the scrubber timeline
+        # (workstream #3), so denser intervals give the scrubber a
+        # smoother movie at the cost of more disk.
         self.config_heartbeat_interval_spin = QDoubleSpinBox()
         self.config_heartbeat_interval_spin.setRange(1.0, 600.0)
         self.config_heartbeat_interval_spin.setValue(5.0)
@@ -846,12 +874,15 @@ class GrowthMonitor(QWidget):
         self.config_heartbeat_interval_spin.setDecimals(0)
         self.config_heartbeat_interval_spin.setSingleStep(1.0)
         self.config_heartbeat_interval_spin.setToolTip(
-            "How often to save a RHEED heartbeat frame. Lower = denser "
-            "data (more disk + memory); 5 s default per May 21 joint "
-            "group meeting."
+            "How often to save a RHEED frame during a session — the "
+            "'movie' that the scrubber will play back. Lower = denser "
+            "data + smoother scrub (more disk + memory); 5 s default "
+            "per May 21 joint group meeting. At 5 s, a 4-hour growth "
+            "produces ~2,880 frames (~1.4 GB at ~500 KB/frame BMP)."
         )
         config_form.addRow(
-            "RHEED heartbeat interval:", self.config_heartbeat_interval_spin,
+            "Continuous capture interval:",
+            self.config_heartbeat_interval_spin,
         )
 
         save_row = QHBoxLayout()
@@ -1770,6 +1801,53 @@ class GrowthMonitor(QWidget):
                 f"Manual events: {self._manual_event_count}"
             )
 
+    # ----- Continuous-capture indicator -----------------------------------
+
+    def set_continuous_capture_interval(self, interval_s: Optional[float]):
+        """Set (or clear) the continuous-capture interval shown in the footer.
+
+        Called by GrowthApp at session start with the interval that was
+        actually applied to _heartbeat_timer. Passing ``None`` clears the
+        indicator (back to "Capture: idle") — used at session end.
+        """
+        self._continuous_capture_interval_s = interval_s
+        self._update_continuous_capture_label()
+
+    def increment_continuous_capture_count(self):
+        """Bump the frame counter by 1 and refresh the footer label.
+
+        Called by GrowthApp from _on_heartbeat once the save actually
+        landed (after quality gate). Keeps the display in sync with the
+        real number of frames on disk — a quality-gated skip won't
+        increment.
+        """
+        self._continuous_capture_count += 1
+        self._update_continuous_capture_label()
+
+    def _update_continuous_capture_label(self):
+        """Refresh the footer's continuous-capture text.
+
+        Format: "Capture: idle" (no session) or "Capture: every 5s · 42 frames".
+        Interval float rendered as int seconds since the spinbox uses
+        decimals=0 anyway; keeps the label narrow enough that it doesn't
+        crowd the manual-event counter to its right.
+        """
+        interval = self._continuous_capture_interval_s
+        if interval is None:
+            self.continuous_capture_label.setText("Capture: idle")
+            return
+        # Interval as int when it's a whole number, otherwise 1 dp — keeps
+        # "every 5s" clean while still supporting sub-second intervals if
+        # the range ever expands.
+        if float(interval).is_integer():
+            interval_str = f"{int(interval)}s"
+        else:
+            interval_str = f"{interval:.1f}s"
+        self.continuous_capture_label.setText(
+            f"Capture: every {interval_str} · {self._continuous_capture_count} "
+            f"frame{'' if self._continuous_capture_count == 1 else 's'}"
+        )
+
     # ----- LOG ENTRY handler ----------------------------------------------
 
     def _on_commit(self):
@@ -2078,3 +2156,8 @@ class GrowthMonitor(QWidget):
         # so the next armed session starts on a clean slate.
         self._manual_event_count = 0
         self._update_manual_event_label()
+        # Continuous-capture indicator resets to "Capture: idle" — the
+        # next session's _on_start will re-populate the interval.
+        self._continuous_capture_interval_s = None
+        self._continuous_capture_count = 0
+        self._update_continuous_capture_label()

@@ -325,5 +325,127 @@ class DirectReadTabTests(unittest.TestCase):
         self.assertTrue(self.monitor.plasma_group.isHidden())
 
 
+class ContinuousCaptureIndicatorTests(unittest.TestCase):
+    """Jul 10 2026 Monitor-tab footer indicator for continuous capture.
+
+    Surfaces the 'movie' cadence + running frame count that the growers
+    asked for at the group meeting. Backed by the existing heartbeat
+    timer + save_heartbeat_frame path; this test class covers only the
+    UI-side counter + label formatting.
+    """
+
+    def setUp(self):
+        self.monitor = GrowthMonitor()
+
+    def tearDown(self):
+        self.monitor.deleteLater()
+
+    def test_idle_state_at_construction(self):
+        self.assertEqual(
+            self.monitor.continuous_capture_label.text(), "Capture: idle",
+        )
+
+    def test_set_interval_shows_zero_frames_with_plural_noun(self):
+        self.monitor.set_continuous_capture_interval(5.0)
+        # "0 frames" not "0 frame" — plural noun at zero count matches
+        # standard English usage and downstream test/log formatting.
+        self.assertEqual(
+            self.monitor.continuous_capture_label.text(),
+            "Capture: every 5s · 0 frames",
+        )
+
+    def test_integer_interval_renders_without_decimal(self):
+        self.monitor.set_continuous_capture_interval(10.0)
+        self.assertIn("every 10s", self.monitor.continuous_capture_label.text())
+        self.assertNotIn("10.0s", self.monitor.continuous_capture_label.text())
+
+    def test_fractional_interval_renders_one_decimal(self):
+        self.monitor.set_continuous_capture_interval(2.5)
+        self.assertIn("every 2.5s", self.monitor.continuous_capture_label.text())
+
+    def test_first_frame_uses_singular_noun(self):
+        self.monitor.set_continuous_capture_interval(5.0)
+        self.monitor.increment_continuous_capture_count()
+        self.assertEqual(
+            self.monitor.continuous_capture_label.text(),
+            "Capture: every 5s · 1 frame",
+        )
+
+    def test_count_increments_monotonically(self):
+        self.monitor.set_continuous_capture_interval(5.0)
+        for _ in range(3):
+            self.monitor.increment_continuous_capture_count()
+        self.assertEqual(
+            self.monitor.continuous_capture_label.text(),
+            "Capture: every 5s · 3 frames",
+        )
+
+    def test_set_interval_none_clears_indicator(self):
+        self.monitor.set_continuous_capture_interval(5.0)
+        self.monitor.increment_continuous_capture_count()
+        self.monitor.set_continuous_capture_interval(None)
+        # Interval None resets the display but the state fields stay
+        # consistent — count is preserved internally until the next
+        # session reset (via reset_displays).
+        self.assertEqual(
+            self.monitor.continuous_capture_label.text(), "Capture: idle",
+        )
+
+    def test_reset_displays_clears_indicator_and_count(self):
+        self.monitor.set_continuous_capture_interval(5.0)
+        for _ in range(4):
+            self.monitor.increment_continuous_capture_count()
+        self.monitor.reset_displays()
+        self.assertEqual(
+            self.monitor.continuous_capture_label.text(), "Capture: idle",
+        )
+        # Internal count reset — the next set_interval call starts from 0.
+        self.assertEqual(self.monitor._continuous_capture_count, 0)
+        self.assertIsNone(self.monitor._continuous_capture_interval_s)
+
+
+class ContinuousCaptureConfigTests(unittest.TestCase):
+    """Config-tab widget renames landed Jul 10 2026 — user-facing label
+    switched from 'RHEED heartbeat interval' to 'Continuous capture
+    interval' to match grower vocabulary. Internal name kept."""
+
+    def setUp(self):
+        self.monitor = GrowthMonitor()
+
+    def tearDown(self):
+        self.monitor.deleteLater()
+
+    def test_config_label_uses_grower_vocabulary(self):
+        # The label is set via config_form.addRow(label_text, widget) —
+        # QFormLayout stores it as a QLabel whose text() we can read.
+        # Find the row whose field is our spinbox.
+        spin = self.monitor.config_heartbeat_interval_spin
+        form = None
+        # Walk parent-widget siblings for the form layout that owns spin.
+        # Not perfect but works with the current widget hierarchy.
+        parent = spin.parentWidget()
+        if parent is not None:
+            for layout in parent.findChildren(type(parent.layout())):
+                if layout is not None and layout.indexOf(spin) != -1:
+                    form = layout
+                    break
+        # Fallback: iterate widget tree looking for a QLabel whose
+        # buddy is our spinbox.
+        from PyQt6.QtWidgets import QLabel
+        labels = self.monitor.findChildren(QLabel)
+        label_texts = [lbl.text() for lbl in labels if lbl.text()]
+        # New label should be present, old should not.
+        joined = " | ".join(label_texts)
+        self.assertIn("Continuous capture interval", joined)
+        self.assertNotIn("RHEED heartbeat interval", joined)
+
+    def test_internal_widget_name_unchanged(self):
+        # Programmatic access still uses config_heartbeat_interval_spin
+        # so nothing external breaks. Documents the compat contract.
+        self.assertTrue(
+            hasattr(self.monitor, "config_heartbeat_interval_spin")
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
