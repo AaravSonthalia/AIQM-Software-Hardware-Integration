@@ -178,6 +178,13 @@ class GrowthApp(QMainWindow):
         self.monitor.start_requested.connect(self._on_start)
         self.monitor.stop_requested.connect(self._on_stop)
         self.monitor.commit_requested.connect(self._on_commit)
+        # Grower-marked events (Jul 10 2026 group-meeting design shift).
+        # Widget emits the pyro/PSU/note snapshot; app-side attaches the
+        # current frame from the monitor's cache and calls
+        # logger.record_manual_event. Frame attachment lives here (not in
+        # the widget) so the widget stays independent of the growth-log
+        # file lifecycle.
+        self.monitor.manual_event_requested.connect(self._on_manual_event)
         self.monitor.export_requested.connect(self._on_export)
         self.monitor.auto_capture_pause_toggled.connect(
             self._on_auto_capture_pause_toggled,
@@ -449,6 +456,33 @@ class GrowthApp(QMainWindow):
 
         self.growth_log.log_commit(entry)
         self.statusBar().showMessage("Entry logged", 3000)
+
+    # --- MARK EVENT --------------------------------------------------------
+
+    @pyqtSlot(dict)
+    def _on_manual_event(self, payload: dict):
+        """Write a grower-marked event to manual_events.csv.
+
+        Payload arrives with the pyro/PSU/note snapshot already assembled
+        by the widget. This handler attaches the current frame from the
+        monitor's cache (same source LOG ENTRY uses) and hands off to
+        the logger. The logger writes both the CSV row and the BMP
+        preview under ``frames/``.
+
+        Silent no-op if no session is active — matches the widget's
+        button gating and the logger's record_manual_event contract.
+        """
+        frame = self.monitor.get_current_frame()
+        self.growth_log.record_manual_event(
+            elapsed_s=payload.get("elapsed_s", 0.0),
+            pyro_temp=payload.get("pyro_temp"),
+            voltage_V=payload.get("voltage_V"),
+            current_A=payload.get("current_A"),
+            psu_source=payload.get("psu_source", "none"),
+            frame=frame,
+            note=payload.get("note", ""),
+        )
+        self.statusBar().showMessage("Event marked", 2000)
 
     # --- Export ------------------------------------------------------------
 

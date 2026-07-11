@@ -125,6 +125,25 @@ class GrowthLogger:
         "channel", "old_value", "new_value", "delta",
         "pyrometer_temp_C",
     ]
+    # Grower-marked events (Jul 10 2026 group-meeting design shift). One
+    # row per MARK EVENT click. Deliberately kept lean so the click stays
+    # sub-second — no classifier snapshot, no slider dump. The scrubber
+    # (workstream #3) reads this file to render manual markers on the
+    # timeline; the wider (classifier + slider) capture stays on LOG
+    # ENTRY where the grower opts in to the fuller decision. See
+    # meeting_jul10_2026.md for the three-concern architecture
+    # (capture / mark / label) that motivated the split from
+    # AUTO_CAPTURE_FIELDS.
+    MANUAL_EVENT_FIELDS = [
+        "timestamp", "elapsed_s", "event_idx",
+        "pyrometer_temp_C",
+        "voltage_V", "current_A", "psu_source",
+        "frame_path",
+        # Optional — populated from the log-note input if the grower had
+        # text queued at click time. Blank otherwise (single-tap case is
+        # the primary path).
+        "note",
+    ]
     # Event labels written by the Events tab labeling form. The from/to
     # columns are reserved for the deferred reconstruction-transition
     # dropdowns — they exist now so future UI additions don't require a
@@ -161,9 +180,12 @@ class GrowthLogger:
         self._heartbeat_writer = None
         self._set_change_file = None
         self._set_change_writer = None
+        self._manual_event_file = None
+        self._manual_event_writer = None
         self._commit_counter = 0
         self._heartbeat_counter = 0
         self._set_change_counter = 0
+        self._manual_event_counter = 0
         self._entries: list[dict] = []  # Accumulated entries for export
 
     @property
@@ -222,9 +244,22 @@ class GrowthLogger:
         )
         self._set_change_writer.writeheader()
 
+        manual_event_path = self._session_dir / "manual_events.csv"
+        self._manual_event_file = open(manual_event_path, "w", newline="")
+        self._manual_event_writer = csv.DictWriter(
+            self._manual_event_file, fieldnames=self.MANUAL_EVENT_FIELDS,
+        )
+        self._manual_event_writer.writeheader()
+        # Flush the header immediately — downstream scrubber-timeline
+        # tooling may open the file for read while the session is running,
+        # and DictWriter buffers by default. Cost is negligible (one
+        # header line, one flush, per session).
+        self._manual_event_file.flush()
+
         self._commit_counter = 0
         self._heartbeat_counter = 0
         self._set_change_counter = 0
+        self._manual_event_counter = 0
         self._entries = []
 
     def log_sensors(
@@ -374,6 +409,84 @@ class GrowthLogger:
             ),
         })
         self._set_change_file.flush()
+
+    def record_manual_event(
+        self,
+        elapsed_s: float,
+        pyro_temp: Optional[float] = None,
+        voltage_V: Optional[float] = None,
+        current_A: Optional[float] = None,
+        psu_source: str = "none",
+        frame: Optional[np.ndarray] = None,
+        note: str = "",
+    ) -> int:
+        """Append a grower-marked event to manual_events.csv.
+
+        Sub-second reconstruction transitions surfaced at the Jul 10 2026
+        group meeting as a hard UX requirement — labeling takes ~30 s but
+        reconstructions can flip in ~1 s. Manual events decouple "grower
+        saw something NOW" from "grower labels retrospectively later".
+        Every click writes one row; the scrubber (workstream #3) reads
+        this file to render manual markers on the timeline.
+
+        When ``frame`` is provided, it's saved as
+        ``manual_event_NNN_HHMMSS.bmp`` alongside ``entry_*`` and
+        ``heartbeat_*`` under ``frames/`` — the scrubber can attach a
+        per-mark preview. Frame save is best-effort: the CSV row is
+        written even if PIL/cv2 aren't importable (grower's click is
+        stronger evidence of intent than a working image encoder).
+
+        Returns the 1-indexed event_idx so callers can update UI
+        counters without re-reading the file. Returns 0 (silent no-op)
+        if no session is active — mirrors log_commit's contract.
+        """
+        if not self._manual_event_writer:
+            return 0
+
+        self._manual_event_counter += 1
+        idx = self._manual_event_counter
+
+        # Save the frame first — a failed frame save must not block the
+        # row from landing (grower's click is evidence-of-intent). Same
+        # BMP + name-taxonomy pattern as save_frame + save_heartbeat_frame.
+        frame_path = ""
+        if frame is not None and self._session_dir is not None:
+            ts = datetime.now().strftime("%H%M%S")
+            fname = f"manual_event_{idx:03d}_{ts}.bmp"
+            path = self._session_dir / "frames" / fname
+            try:
+                from PIL import Image
+                Image.fromarray(frame).save(str(path))
+                frame_path = str(path)
+            except ImportError:
+                try:
+                    import cv2
+                    cv2.imwrite(
+                        str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                    )
+                    frame_path = str(path)
+                except ImportError:
+                    pass
+
+        self._manual_event_writer.writerow({
+            "timestamp": datetime.now().isoformat(),
+            "elapsed_s": f"{elapsed_s:.2f}",
+            "event_idx": idx,
+            "pyrometer_temp_C": (
+                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
+            ),
+            "voltage_V": (
+                f"{voltage_V:.3f}" if voltage_V is not None else ""
+            ),
+            "current_A": (
+                f"{current_A:.3f}" if current_A is not None else ""
+            ),
+            "psu_source": psu_source,
+            "frame_path": frame_path,
+            "note": note,
+        })
+        self._manual_event_file.flush()
+        return idx
 
     def log_heartbeat(
         self,
@@ -867,7 +980,7 @@ class GrowthLogger:
         for f in (
             self._sensor_file, self._commit_file,
             self._auto_capture_file, self._heartbeat_file,
-            self._set_change_file,
+            self._set_change_file, self._manual_event_file,
         ):
             if f and not f.closed:
                 f.close()
@@ -881,6 +994,8 @@ class GrowthLogger:
         self._heartbeat_writer = None
         self._set_change_file = None
         self._set_change_writer = None
+        self._manual_event_file = None
+        self._manual_event_writer = None
         # NOTE: _session_dir and _entries intentionally preserved
         # so Export Growth Log works after STOP.
 

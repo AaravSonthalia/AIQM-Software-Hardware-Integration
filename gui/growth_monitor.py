@@ -305,6 +305,18 @@ class GrowthMonitor(QWidget):
     start_requested = pyqtSignal()
     stop_requested = pyqtSignal()
     commit_requested = pyqtSignal(dict)
+    # Grower-marked event (Jul 10 2026 group-meeting design shift). Payload:
+    #   pyro_temp:  Optional[float]   — °C from _latest_pyro
+    #   voltage_V:  Optional[float]   — from _latest_mistral/_latest_psu
+    #   current_A:  Optional[float]   — from _latest_mistral/_latest_psu
+    #   psu_source: str               — "mistral" | "direct" | "none"
+    #   elapsed_s:  float             — seconds since start
+    #   note:       str               — from log_note_input if non-empty
+    # GrowthApp adds the frame from monitor.get_current_frame() and calls
+    # logger.record_manual_event. See meeting_jul10_2026.md for the
+    # three-concern architecture (capture / mark / label) that this signal
+    # sits inside.
+    manual_event_requested = pyqtSignal(dict)
     export_requested = pyqtSignal()
     # True = user wants auto-capture paused; False = wants it resumed.
     auto_capture_pause_toggled = pyqtSignal(bool)
@@ -338,6 +350,12 @@ class GrowthMonitor(QWidget):
         self._correction_active: bool = False
         self._adjusting: bool = False
         self._current_frame: Optional[np.ndarray] = None
+        # Grower-marked-event count for this session. Increments locally on
+        # every _on_mark_event and drives the footer counter label. Stays in
+        # sync with growth_logger's _manual_event_counter because both
+        # increment on the same click; the button is disabled when no
+        # session is armed so there's no drift path.
+        self._manual_event_count: int = 0
 
         self._build_ui()
         self._apply_state()
@@ -554,7 +572,37 @@ class GrowthMonitor(QWidget):
         )
         right.addWidget(self.log_note_input, 1)  # stretch to fill
 
-        # LOG ENTRY button — right below input
+        # Two-button action row: MARK EVENT (fast, single-tap) | LOG ENTRY
+        # (deliberate, sliders + note). Landed Jul 10 2026 to resolve the
+        # sub-second reconstruction problem — grower can flag "something
+        # happened NOW" without opening the labeling flow. Same height so
+        # neither dominates; distinct colors (amber vs teal) so the eye
+        # doesn't confuse them under mid-growth attention pressure.
+        action_row = QHBoxLayout()
+        action_row.setSpacing(6)
+        action_row.setContentsMargins(0, 0, 0, 0)
+
+        # MARK EVENT — placed LEFT so the grower's dominant-hand click path
+        # hits the fast button first. Amber (#d97706) distinguishes it from
+        # the teal LOG ENTRY. Keyboard shortcut "E" — avoids Space (used by
+        # sliders) and Enter (note editor).
+        self.mark_event_btn = QPushButton("⚡ MARK EVENT  (E)")
+        self.mark_event_btn.setStyleSheet(
+            "QPushButton { background-color: #d97706; color: white; "
+            "font-size: 16px; font-weight: bold; }"
+            "QPushButton:disabled { background-color: #222; color: #666; }"
+        )
+        self.mark_event_btn.setFixedHeight(54)
+        self.mark_event_btn.setToolTip(
+            "Log a grower-marked event NOW. Single-tap — no note required. "
+            "If the note field has text, it's captured with the event. "
+            "Snapshots the current frame + sensor state. Multi-click OK for "
+            "sub-second reconstructions. Shortcut: E."
+        )
+        self.mark_event_btn.clicked.connect(self._on_mark_event)
+        action_row.addWidget(self.mark_event_btn, 1)
+
+        # LOG ENTRY — the deliberate labeled path. Unchanged behavior.
         self.commit_btn = QPushButton("LOG ENTRY  (Ctrl+S)")
         self.commit_btn.setStyleSheet(
             "QPushButton { background-color: #0d9488; color: white; "
@@ -563,11 +611,15 @@ class GrowthMonitor(QWidget):
         )
         self.commit_btn.setFixedHeight(54)
         self.commit_btn.clicked.connect(self._on_commit)
-        right.addWidget(self.commit_btn)
+        action_row.addWidget(self.commit_btn, 1)
 
-        # Keyboard shortcut
+        right.addLayout(action_row)
+
+        # Keyboard shortcuts
         self._save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
         self._save_shortcut.activated.connect(self._on_commit)
+        self._mark_shortcut = QShortcut(QKeySequence("E"), self)
+        self._mark_shortcut.activated.connect(self._on_mark_event)
 
         content.addLayout(right, 1)
         layout.addLayout(content, 1)
@@ -585,6 +637,18 @@ class GrowthMonitor(QWidget):
         )
         self.auto_capture_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
         footer.addWidget(self.auto_capture_label, 1)
+
+        # Manual-event counter — sits next to the auto-capture status so
+        # both event streams are visible in one glance. Same footer
+        # styling. Text stays "Manual events: N" as the counter climbs;
+        # 0 case still shows the label so growers know the surface exists.
+        self.manual_event_label = QLabel("Manual events: 0")
+        self.manual_event_label.setStyleSheet(
+            "color: #d97706; font-size: 11px; padding: 4px 8px; "
+            "background-color: #1a1a1a; border-top: 1px solid #333;"
+        )
+        self.manual_event_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        footer.addWidget(self.manual_event_label, 0)
 
         # Pause toggle — soft halt of auto-capture only. Sensor logging,
         # heartbeat, and frame display all keep running. Emergency stop
@@ -1005,6 +1069,7 @@ class GrowthMonitor(QWidget):
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
             self.commit_btn.setEnabled(False)
+            self.mark_event_btn.setEnabled(False)
             self.sample_id_input.setEnabled(True)
             self.grower_input.setEnabled(True)
             # Config panel: fully editable in idle.
@@ -1017,6 +1082,7 @@ class GrowthMonitor(QWidget):
             self.start_btn.setStyleSheet(BTN_START)
             self.stop_btn.setEnabled(False)
             self.commit_btn.setEnabled(False)
+            self.mark_event_btn.setEnabled(False)
             self.sample_id_input.setEnabled(True)
             self.grower_input.setEnabled(True)
             # Config panel: locked — worker states already committed to
@@ -1028,6 +1094,11 @@ class GrowthMonitor(QWidget):
             self.stop_btn.setEnabled(True)
             self.stop_btn.setStyleSheet(BTN_STOP)
             self.commit_btn.setEnabled(True)
+            # MARK EVENT mirrors commit_btn's gating — enabled once the
+            # session is actively logging so every mark lands in a real
+            # session dir. Idle/armed clicks would go nowhere since the
+            # logger hasn't opened manual_events.csv yet.
+            self.mark_event_btn.setEnabled(True)
             self.sample_id_input.setEnabled(False)
             self.grower_input.setEnabled(False)
             # Config panel: stays locked — session in progress.
@@ -1625,6 +1696,80 @@ class GrowthMonitor(QWidget):
         finally:
             self._adjusting = False
 
+    # ----- MARK EVENT handler ---------------------------------------------
+
+    def _on_mark_event(self):
+        """Fire a manual event with the current sensor snapshot.
+
+        Design contract (Jul 10 2026): fast, low-friction, no dialogs, no
+        confirmations. Multi-click OK — every click is one event. Silently
+        no-ops if the button is disabled (no session armed), matching
+        _on_commit's guard so the E-key shortcut can't fire outside a
+        session either.
+
+        Payload assembly mirrors _on_commit but skips the classifier +
+        slider snapshots — those live on LOG ENTRY where the grower is
+        opting in to the fuller decision. Keeps this handler under the
+        sub-second budget the growers surfaced at the Jul 10 meeting.
+        """
+        if not self.mark_event_btn.isEnabled():
+            return
+
+        # PSU snapshot — same priority as _on_commit (mistral > direct >
+        # none). Keeps psu_source semantically identical between the two
+        # event families so downstream analysis can compare LOG ENTRY and
+        # MARK EVENT rows without branching on file source.
+        voltage_v: Optional[float] = None
+        current_a: Optional[float] = None
+        psu_source = "none"
+        if self._latest_mistral and self._latest_mistral.connected:
+            voltage_v = self._latest_mistral.v_actual
+            current_a = self._latest_mistral.i_actual
+            psu_source = "mistral"
+        elif self._latest_psu and self._latest_psu.connected:
+            voltage_v = self._latest_psu.voltage_measured
+            current_a = self._latest_psu.current_measured
+            psu_source = "direct"
+
+        pyro_temp: Optional[float] = None
+        if self._latest_pyro and self._latest_pyro.connected:
+            pyro_temp = self._latest_pyro.temperature
+
+        # Grab any queued note text WITHOUT clearing the input — the
+        # grower may want the same note attached to a following LOG
+        # ENTRY. If they don't, they can clear it manually. This is the
+        # low-cost, low-surprise choice for the primary "just mark it"
+        # flow.
+        note = self.log_note_input.toPlainText().strip()
+
+        payload = {
+            "elapsed_s": self.get_elapsed_seconds(),
+            "pyro_temp": pyro_temp,
+            "voltage_V": voltage_v,
+            "current_A": current_a,
+            "psu_source": psu_source,
+            "note": note,
+        }
+
+        # Bump the local counter + update the footer BEFORE emitting so
+        # the UI updates instantly even if the app-side handler takes a
+        # moment on a slow disk. GrowthApp is responsible for the CSV
+        # write; it uses its own counter which stays in sync because the
+        # button is disabled outside armed sessions.
+        self._manual_event_count += 1
+        self._update_manual_event_label()
+
+        self.manual_event_requested.emit(payload)
+
+    def _update_manual_event_label(self):
+        """Refresh the footer's manual-event counter text."""
+        if self._manual_event_count == 0:
+            self.manual_event_label.setText("Manual events: 0")
+        else:
+            self.manual_event_label.setText(
+                f"Manual events: {self._manual_event_count}"
+            )
+
     # ----- LOG ENTRY handler ----------------------------------------------
 
     def _on_commit(self):
@@ -1928,3 +2073,8 @@ class GrowthMonitor(QWidget):
         self._latest_mistral = None
         self._latest_evap = None
         self._latest_classifier = None
+        # Manual-event counter belongs to the session — a fresh session
+        # gets a fresh count. Footer label re-renders to "Manual events: 0"
+        # so the next armed session starts on a clean slate.
+        self._manual_event_count = 0
+        self._update_manual_event_label()

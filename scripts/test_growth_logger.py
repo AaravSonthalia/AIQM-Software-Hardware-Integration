@@ -1,11 +1,13 @@
 """Unit tests for GrowthLogger — focused on save_frame's Jul 8 2026 contract
-change (LOG ENTRY saves unconditionally, returns quality metadata).
+change (LOG ENTRY saves unconditionally, returns quality metadata) plus the
+Jul 10 2026 grower-marked events schema (record_manual_event).
 
 Small test surface; no Qt required (GrowthLogger is a plain Python class).
 Run: ``python scripts/test_growth_logger.py`` or under pytest.
 """
 from __future__ import annotations
 
+import csv
 import sys
 import tempfile
 import unittest
@@ -117,6 +119,207 @@ class CommitFieldsTests(unittest.TestCase):
         i_path = fields.index("frame_path")
         i_qual = fields.index("frame_quality_pass")
         self.assertGreater(i_qual, i_path)
+
+
+class ManualEventSchemaTests(unittest.TestCase):
+    """Schema-level tests for MANUAL_EVENT_FIELDS (Jul 10 2026 addition).
+
+    The scrubber timeline (workstream #3) will read manual_events.csv, so
+    every field name is load-bearing. These tests lock the contract.
+    """
+
+    def test_schema_contains_expected_columns(self):
+        expected = {
+            "timestamp", "elapsed_s", "event_idx",
+            "pyrometer_temp_C",
+            "voltage_V", "current_A", "psu_source",
+            "frame_path", "note",
+        }
+        self.assertEqual(set(GrowthLogger.MANUAL_EVENT_FIELDS), expected)
+
+    def test_timestamp_first_event_idx_third(self):
+        # Ordering convention: timestamp is column 1 (mirrors other logs),
+        # event_idx is column 3 (after elapsed_s). Downstream sort/plot
+        # code relies on this ordering.
+        self.assertEqual(GrowthLogger.MANUAL_EVENT_FIELDS[0], "timestamp")
+        self.assertEqual(GrowthLogger.MANUAL_EVENT_FIELDS[1], "elapsed_s")
+        self.assertEqual(GrowthLogger.MANUAL_EVENT_FIELDS[2], "event_idx")
+
+
+class ManualEventLifecycleTests(unittest.TestCase):
+    """File-lifecycle tests: manual_events.csv opens on start_session,
+    closes on end_session, and has the correct header."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.logger = GrowthLogger(base_dir=self.tmp.name)
+
+    def tearDown(self):
+        try:
+            self.logger.end_session()
+        except Exception:
+            pass
+        self.tmp.cleanup()
+
+    def test_manual_events_csv_created_on_start_session(self):
+        self.logger.start_session("TEST_MANUAL_EVENTS")
+        csv_path = self.logger.session_dir / "manual_events.csv"
+        self.assertTrue(csv_path.exists())
+
+    def test_manual_events_csv_has_correct_header(self):
+        self.logger.start_session("TEST_HEADER")
+        csv_path = self.logger.session_dir / "manual_events.csv"
+        with open(csv_path, "r", newline="") as f:
+            header = next(csv.reader(f))
+        self.assertEqual(header, GrowthLogger.MANUAL_EVENT_FIELDS)
+
+    def test_counter_resets_on_new_session(self):
+        # Log an event, end the session, start a new one — counter should
+        # be 0 again so the next event is idx=1.
+        self.logger.start_session("TEST_A")
+        idx_a = self.logger.record_manual_event(elapsed_s=1.0)
+        self.assertEqual(idx_a, 1)
+        self.logger.end_session()
+
+        self.logger.start_session("TEST_B")
+        idx_b = self.logger.record_manual_event(elapsed_s=2.0)
+        # Fresh session → fresh counter starting at 1, not 2.
+        self.assertEqual(idx_b, 1)
+
+    def test_file_closed_on_end_session(self):
+        self.logger.start_session("TEST_CLOSE")
+        self.logger.end_session()
+        # Writer refs cleared so a stray record_manual_event no-ops safely.
+        self.assertIsNone(self.logger._manual_event_writer)
+
+    def test_no_session_returns_zero(self):
+        # No start_session — record must silently no-op with idx 0.
+        idx = self.logger.record_manual_event(elapsed_s=10.0)
+        self.assertEqual(idx, 0)
+
+
+def _dummy_frame() -> np.ndarray:
+    """A modest-intensity 100x100x3 frame that PIL / cv2 can encode as BMP."""
+    return (np.random.default_rng(7).integers(40, 200, (100, 100, 3))
+            .astype(np.uint8))
+
+
+class ManualEventRecordTests(unittest.TestCase):
+    """End-to-end tests for record_manual_event's row + frame behavior."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.logger = GrowthLogger(base_dir=self.tmp.name)
+        self.logger.start_session("TEST_RECORD")
+        self.csv_path = self.logger.session_dir / "manual_events.csv"
+
+    def tearDown(self):
+        try:
+            self.logger.end_session()
+        except Exception:
+            pass
+        self.tmp.cleanup()
+
+    def _read_rows(self) -> list[dict]:
+        with open(self.csv_path, "r", newline="") as f:
+            return list(csv.DictReader(f))
+
+    def test_bare_click_writes_one_row_with_index_1(self):
+        # Simulates a grower click with no note, no frame, no PSU state.
+        idx = self.logger.record_manual_event(elapsed_s=42.0)
+        self.assertEqual(idx, 1)
+
+        rows = self._read_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["event_idx"], "1")
+        self.assertEqual(rows[0]["elapsed_s"], "42.00")
+        # Optional fields blank when None is passed.
+        self.assertEqual(rows[0]["pyrometer_temp_C"], "")
+        self.assertEqual(rows[0]["voltage_V"], "")
+        self.assertEqual(rows[0]["current_A"], "")
+        self.assertEqual(rows[0]["psu_source"], "none")
+        self.assertEqual(rows[0]["frame_path"], "")
+        self.assertEqual(rows[0]["note"], "")
+
+    def test_full_payload_populates_all_columns(self):
+        idx = self.logger.record_manual_event(
+            elapsed_s=123.45,
+            pyro_temp=650.7,
+            voltage_V=12.345,
+            current_A=0.678,
+            psu_source="mistral",
+            note="rt13 blooming",
+        )
+        self.assertEqual(idx, 1)
+        rows = self._read_rows()
+        self.assertEqual(rows[0]["elapsed_s"], "123.45")
+        self.assertEqual(rows[0]["pyrometer_temp_C"], "650.7")
+        self.assertEqual(rows[0]["voltage_V"], "12.345")
+        self.assertEqual(rows[0]["current_A"], "0.678")
+        self.assertEqual(rows[0]["psu_source"], "mistral")
+        self.assertEqual(rows[0]["note"], "rt13 blooming")
+
+    def test_counter_increments_monotonically_across_calls(self):
+        # Multi-click safety: consecutive fast clicks all land as
+        # distinct events with monotonically increasing indices.
+        idxs = [
+            self.logger.record_manual_event(elapsed_s=float(i))
+            for i in range(5)
+        ]
+        self.assertEqual(idxs, [1, 2, 3, 4, 5])
+        rows = self._read_rows()
+        self.assertEqual(len(rows), 5)
+        # Row order matches call order (append semantics).
+        self.assertEqual(
+            [r["event_idx"] for r in rows],
+            ["1", "2", "3", "4", "5"],
+        )
+
+    def test_frame_is_saved_when_provided(self):
+        # A supplied frame should be written to frames/ as
+        # manual_event_NNN_HHMMSS.bmp; the row's frame_path points to it.
+        frame = _dummy_frame()
+        idx = self.logger.record_manual_event(elapsed_s=5.0, frame=frame)
+        self.assertEqual(idx, 1)
+
+        rows = self._read_rows()
+        frame_path = rows[0]["frame_path"]
+        self.assertNotEqual(frame_path, "")
+        self.assertTrue(Path(frame_path).exists())
+        self.assertTrue(
+            Path(frame_path).name.startswith("manual_event_001_"),
+            f"expected manual_event_001_ prefix, got {Path(frame_path).name}",
+        )
+        self.assertTrue(frame_path.endswith(".bmp"))
+
+    def test_frame_path_empty_when_no_frame_passed(self):
+        # A bare click still records the event but leaves frame_path
+        # blank so the scrubber can render "mark-only" tick marks.
+        idx = self.logger.record_manual_event(elapsed_s=5.0, frame=None)
+        self.assertEqual(idx, 1)
+        rows = self._read_rows()
+        self.assertEqual(rows[0]["frame_path"], "")
+
+    def test_frame_files_are_distinct_across_events(self):
+        # Frame filename includes the event_idx so consecutive marks
+        # don't collide even at the same HH:MM:SS second.
+        frame = _dummy_frame()
+        self.logger.record_manual_event(elapsed_s=1.0, frame=frame)
+        self.logger.record_manual_event(elapsed_s=1.1, frame=frame)
+        rows = self._read_rows()
+        p1 = Path(rows[0]["frame_path"]).name
+        p2 = Path(rows[1]["frame_path"]).name
+        self.assertNotEqual(p1, p2)
+        self.assertIn("manual_event_001_", p1)
+        self.assertIn("manual_event_002_", p2)
+
+    def test_saved_bmp_is_valid_bmp_format(self):
+        frame = _dummy_frame()
+        self.logger.record_manual_event(elapsed_s=1.0, frame=frame)
+        rows = self._read_rows()
+        from PIL import Image
+        with Image.open(rows[0]["frame_path"]) as img:
+            self.assertEqual(img.format, "BMP")
 
 
 if __name__ == "__main__":
