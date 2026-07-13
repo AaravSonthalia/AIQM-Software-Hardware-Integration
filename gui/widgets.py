@@ -1,13 +1,16 @@
 """
 Reusable widgets for the hardware control GUI.
 """
+from __future__ import annotations
+
+from typing import Optional
 
 from PyQt6.QtWidgets import (
     QFrame, QVBoxLayout, QGridLayout, QLabel, QPushButton,
-    QGroupBox, QDoubleSpinBox,
+    QGroupBox, QDoubleSpinBox, QSizePolicy, QWidget,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QPixmap
 
 from gui.state import PowerSupplyState
 
@@ -188,3 +191,72 @@ class ProtectionPanel(QGroupBox):
     def reset_initialized(self):
         """Reset initialization flag (call on disconnect)."""
         self._initialized = False
+
+
+class ScalingImageLabel(QLabel):
+    """QLabel that keeps an aspect-ratio-scaled view of a source pixmap.
+
+    Extracted Jul 13 2026 from two near-identical private classes:
+      - ``gui.events_tab._ScalingImageLabel`` (minimum size 320×240,
+        auto-capture buffer preview pane)
+      - ``gui.scrubber_tab._ScrubberImageLabel`` (minimum size 480×360,
+        full-timeline playback pane)
+
+    The two originals differed only in their initial ``setMinimumSize``
+    call. Consumers now pass their prior minimum size via the
+    ``minimum_size`` parameter (default 320×240 preserves the smaller
+    events-tab default for any incidental callers).
+
+    Behavior contract (preserved verbatim from both originals):
+      - ``setOriginalPixmap`` caches the full-resolution pixmap so each
+        resize re-scales from source (not from an already-shrunk pixmap
+        — compounding lossy rescales would blur the image over time).
+      - ``resizeEvent`` re-runs the aspect-ratio-preserving scale so a
+        QSplitter drag re-fits the label content.
+      - ``clearImage`` drops the cached pixmap and clears the label.
+      - ``setOriginalPixmap(None)`` (or a null pixmap) is treated the
+        same as ``clearImage`` — makes the "no image yet" and "clear
+        the image" call sites identical.
+    """
+
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        minimum_size: tuple[int, int] = (320, 240),
+    ) -> None:
+        super().__init__(parent)
+        self._original: Optional[QPixmap] = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet(
+            "background-color: #000; border: 1px solid #555;"
+        )
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
+        )
+        self.setMinimumSize(minimum_size[0], minimum_size[1])
+
+    def setOriginalPixmap(self, pixmap: Optional[QPixmap]) -> None:
+        if pixmap is None or pixmap.isNull():
+            self._original = None
+            self.clear()
+            return
+        self._original = pixmap
+        self._rescale()
+
+    def clearImage(self) -> None:
+        self._original = None
+        self.clear()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rescale()
+
+    def _rescale(self) -> None:
+        if self._original is None:
+            return
+        scaled = self._original.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(scaled)

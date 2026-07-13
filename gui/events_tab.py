@@ -36,7 +36,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QSizePolicy,
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton,
     QSlider, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -46,6 +46,7 @@ from gui.growth_logger import (
     EVENT_STATE_KEPT_EXPLICIT,
     GrowthLogger,
 )
+from gui.widgets import ScalingImageLabel
 
 
 # Five canonical RHEED reconstruction names + meta-categories for events
@@ -77,55 +78,6 @@ _REVIEWED_STATES = (
     EVENT_STATE_DISCARDED,
     EVENT_STATE_AUTO_SKIPPED,
 )
-
-
-class _ScalingImageLabel(QLabel):
-    """QLabel that keeps an aspect-ratio-scaled view of a source pixmap.
-
-    The QSplitter resizes the *inner* detail pane when its handle is
-    dragged, not the outer EventsTab — so the right place to react is
-    the label's own resizeEvent. Storing the original pixmap means each
-    resize re-scales from full resolution rather than compounding lossy
-    rescales on already-shrunk pixels.
-    """
-
-    def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._original: Optional[QPixmap] = None
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet(
-            "background-color: #000; border: 1px solid #555;"
-        )
-        self.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
-        )
-        self.setMinimumSize(320, 240)
-
-    def setOriginalPixmap(self, pixmap: Optional[QPixmap]) -> None:
-        if pixmap is None or pixmap.isNull():
-            self._original = None
-            self.clear()
-            return
-        self._original = pixmap
-        self._rescale()
-
-    def clearImage(self) -> None:
-        self._original = None
-        self.clear()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._rescale()
-
-    def _rescale(self) -> None:
-        if self._original is None:
-            return
-        scaled = self._original.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.setPixmap(scaled)
 
 
 # Master-list column indices. Score-color cell coloring and a label-state
@@ -294,7 +246,9 @@ class EventsTab(QWidget):
         self._metadata_label.setWordWrap(True)
         content.addWidget(self._metadata_label)
 
-        self._image_label = _ScalingImageLabel()
+        # Shared widget extracted Jul 13 2026; events tab keeps its historical
+        # 320×240 minimum-size hint via the default arg.
+        self._image_label = ScalingImageLabel()
         content.addWidget(self._image_label, 1)
 
         slider_row = QHBoxLayout()

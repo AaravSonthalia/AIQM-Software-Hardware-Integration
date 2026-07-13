@@ -48,9 +48,10 @@ from typing import NamedTuple, Optional
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSlider, QVBoxLayout,
-    QWidget,
+    QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget,
 )
+
+from gui.widgets import ScalingImageLabel
 
 
 # Source-to-marker-color mapping — kept in sync with the Monitor tab's
@@ -247,53 +248,6 @@ class _MarkedSlider(QSlider):
         painter.end()
 
 
-class _ScrubberImageLabel(QLabel):
-    """QLabel that keeps an aspect-ratio-scaled view of a source pixmap.
-
-    Duplicated (minor) from events_tab._ScalingImageLabel — same class
-    but with a slightly larger minimum size since the scrubber tab
-    typically has more vertical space. A shared widgets module is a
-    reasonable future refactor.
-    """
-
-    def __init__(self, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._original: Optional[QPixmap] = None
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet(
-            "background-color: #000; border: 1px solid #555;"
-        )
-        self.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding,
-        )
-        self.setMinimumSize(480, 360)
-
-    def setOriginalPixmap(self, pixmap: Optional[QPixmap]) -> None:
-        if pixmap is None or pixmap.isNull():
-            self._original = None
-            self.clear()
-            return
-        self._original = pixmap
-        self._rescale()
-
-    def clearImage(self) -> None:
-        self._original = None
-        self.clear()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._rescale()
-
-    def _rescale(self):
-        if self._original is None:
-            return
-        self.setPixmap(self._original.scaled(
-            self.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        ))
-
-
 class ScrubberTab(QWidget):
     """Timeline scrubber over a growth session's captured frames.
 
@@ -326,7 +280,10 @@ class ScrubberTab(QWidget):
         layout.setSpacing(8)
 
         # Frame image — top, biggest single element.
-        self._image_label = _ScrubberImageLabel()
+        # Shared widget extracted Jul 13 2026; scrubber preserves its larger
+        # 480×360 minimum-size hint (typical playback pane has more vertical
+        # space than the events-tab buffer preview).
+        self._image_label = ScalingImageLabel(minimum_size=(480, 360))
         layout.addWidget(self._image_label, 1)
 
         # Metadata line under the image.
