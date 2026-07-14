@@ -282,6 +282,101 @@ class ResetForNewSessionTests(unittest.TestCase):
             self.assertEqual(slider.value(), 20)
 
 
+class PauseButtonTests(unittest.TestCase):
+    """Freeze frame / Resume live toggle behavior (Jul 14 2026 addition).
+
+    Locks the three-part invariant: (1) button label describes the NEXT
+    action, not the current state; (2) paused = camera frames dropped
+    while cached frame preserved; (3) session reset restores unpaused
+    default so the next armed session doesn't start frozen.
+    """
+
+    def setUp(self):
+        self.tab = LiveEqualizerTab()
+
+    def tearDown(self):
+        self.tab.deleteLater()
+
+    def test_initial_state_is_unpaused_with_freeze_label(self):
+        # Fresh tab: not paused, button says what pressing it will do.
+        self.assertFalse(self.tab._paused)
+        self.assertFalse(self.tab._pause_btn.isChecked())
+        self.assertEqual(self.tab._pause_btn.text(), "Freeze frame")
+
+    def test_toggle_on_pauses_and_flips_label(self):
+        self.tab._pause_btn.setChecked(True)
+        self.assertTrue(self.tab._paused)
+        # Label now describes the NEXT action (resume), not the current
+        # state (paused).
+        self.assertEqual(self.tab._pause_btn.text(), "Resume live")
+
+    def test_toggle_off_resumes_and_flips_label_back(self):
+        self.tab._pause_btn.setChecked(True)
+        self.tab._pause_btn.setChecked(False)
+        self.assertFalse(self.tab._paused)
+        self.assertEqual(self.tab._pause_btn.text(), "Freeze frame")
+
+    def test_paused_update_camera_frame_is_ignored(self):
+        # Seed with a first frame so we have a known "frozen" state to
+        # compare against.
+        seed_frame = _rgb_frame(color=90)
+        self.tab.update_camera_frame(seed_frame)
+        cached_at_pause = self.tab.get_current_full_frame()
+        self.assertIsNotNone(cached_at_pause)
+
+        # Pause, then try to push a new frame.
+        self.tab._pause_btn.setChecked(True)
+        new_frame = _rgb_frame(color=200)
+        self.tab.update_camera_frame(new_frame)
+
+        # Cache still points at the pre-pause frame — new frame ignored.
+        cached_after = self.tab.get_current_full_frame()
+        self.assertTrue(np.array_equal(cached_after, seed_frame))
+        self.assertFalse(np.array_equal(cached_after, new_frame))
+
+    def test_paused_frame_still_saveable(self):
+        # Frozen frame must still be reachable via get_current_full_frame
+        # so the Save path (GrowthApp -> record_live_label) snapshots the
+        # frame the grower was actually looking at.
+        frame = _rgb_frame(color=120)
+        self.tab.update_camera_frame(frame)
+        self.tab._pause_btn.setChecked(True)
+        # get_current_full_frame is what growth_app._on_live_label_save
+        # reads.
+        self.assertTrue(
+            np.array_equal(self.tab.get_current_full_frame(), frame)
+        )
+
+    def test_resume_lets_new_frames_land(self):
+        # After unpausing, the next update_camera_frame call updates the
+        # cache. Guards against a bug where _paused stays True after the
+        # button uncheck (state-machine leak).
+        self.tab.update_camera_frame(_rgb_frame(color=50))
+        self.tab._pause_btn.setChecked(True)
+        # New frame while paused: ignored.
+        self.tab.update_camera_frame(_rgb_frame(color=200))
+        # Unpause + push a distinctive frame.
+        self.tab._pause_btn.setChecked(False)
+        new_frame = _rgb_frame(color=175)
+        self.tab.update_camera_frame(new_frame)
+        self.assertTrue(
+            np.array_equal(self.tab.get_current_full_frame(), new_frame)
+        )
+
+    def test_reset_for_new_session_clears_pause(self):
+        # Set up a paused state, then reset → button unchecked, label
+        # back to Freeze frame, _paused False.
+        self.tab.update_camera_frame(_rgb_frame(color=80))
+        self.tab._pause_btn.setChecked(True)
+        self.assertTrue(self.tab._paused)
+
+        self.tab.reset_for_new_session()
+
+        self.assertFalse(self.tab._paused)
+        self.assertFalse(self.tab._pause_btn.isChecked())
+        self.assertEqual(self.tab._pause_btn.text(), "Freeze frame")
+
+
 class TabRegistrationTests(unittest.TestCase):
     """Live Equalizer is mounted at the expected tab index in GrowthMonitor."""
 

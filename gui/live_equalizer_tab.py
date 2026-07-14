@@ -54,9 +54,12 @@ Design notes:
     spellings; ``CLASSIFIER_LABEL_MAP`` bridges them so the classifier's
     smoothed_percent (keyed by RECON_LABELS) drives the classifier %
     display (keyed by our shorter names).
-  - No pause button in v1. Frame updates land as they arrive. If the
-    grower needs a still target, they use the retrospective Equalizer
-    on the Events tab.
+  - Pause via Freeze frame button (Jul 14 2026). When toggled on,
+    ``update_camera_frame`` drops incoming frames so the Selected pane
+    holds the last-displayed frame. Grower can then balance sliders +
+    Save against a stable image. Label + Auto-fit + Save all operate on
+    the frozen frame. Amber (#d97706) match the MARK EVENT identity so
+    grower-in-the-loop UI has consistent visual cues across tabs.
   - No auto-save. Saving is explicit; the grower decides when the mix
     matches the target.
 """
@@ -123,6 +126,11 @@ class LiveEqualizerTab(QWidget):
         # each slider, which recomputes reconstruction each time. Guarding
         # keeps the recompute to once per user action.
         self._adjusting = False
+        # Pause state (Jul 14 2026). When True, update_camera_frame drops
+        # incoming frames on the floor so the 'Selected' pane holds
+        # whatever was last displayed. Grower can then Auto-fit / Save
+        # against a stable image. Toggled via _pause_btn's checked state.
+        self._paused = False
 
         self._build_ui()
         self._load_basis()
@@ -288,6 +296,29 @@ class LiveEqualizerTab(QWidget):
         self._reset_btn.clicked.connect(self._reset_to_uniform)
         btn_row.addWidget(self._reset_btn)
 
+        # Pause button (Jul 14 2026). Checkable so Qt tracks the visual
+        # state without us maintaining a duplicate flag. Amber (#d97706)
+        # when checked matches the MARK EVENT identity + Manual-events
+        # footer counter — a grower looking at any of the three "amber
+        # is grower-in-the-loop" surfaces sees the same visual cue.
+        # Label flips between "Freeze frame" (pressing will freeze) and
+        # "Resume live" (pressing will resume) so the button describes
+        # the action, not the current state.
+        self._pause_btn = QPushButton("Freeze frame")
+        self._pause_btn.setCheckable(True)
+        self._pause_btn.setToolTip(
+            "Freeze the 'Selected' pane on the current frame so you can "
+            "balance sliders without the image changing under you. Auto-"
+            "fit + Save still work against the frozen frame."
+        )
+        self._pause_btn.setStyleSheet(
+            "QPushButton { padding: 4px 12px; }"
+            "QPushButton:checked { background-color: #d97706; color: white; "
+            "font-weight: bold; }"
+        )
+        self._pause_btn.toggled.connect(self._on_pause_toggled)
+        btn_row.addWidget(self._pause_btn)
+
         btn_row.addStretch(1)
 
         self._save_btn = QPushButton("Save label")
@@ -324,8 +355,15 @@ class LiveEqualizerTab(QWidget):
 
         Silently no-ops on decode error (rare — camera may deliver a
         weird frame under stress). The last successful target stays.
+
+        When ``self._paused`` is True (Freeze frame toggled on), the
+        incoming frame is dropped on the floor — cache + displayed
+        pixmap both preserve whatever was current at pause time. That
+        stable state is what Auto-fit / Save see.
         """
         if frame is None:
+            return
+        if self._paused:
             return
         self._current_full_frame = frame
         try:
@@ -385,8 +423,8 @@ class LiveEqualizerTab(QWidget):
         """Wipe transient state so the next session starts fresh.
 
         Called by GrowthApp on session reset (disarm). Preserves the
-        loaded basis + slider defaults; only the live-camera cache
-        and classifier % display are cleared.
+        loaded basis + slider defaults; only the live-camera cache,
+        classifier % display, and pause state are cleared.
         """
         self._current_target = None
         self._current_full_frame = None
@@ -394,7 +432,27 @@ class LiveEqualizerTab(QWidget):
         self._selected_label.setText("Waiting for live camera stream…")
         for lbl in self._classifier_value_labels.values():
             lbl.setText("—%")
+        # Clear pause state so the next armed session starts with a
+        # streaming Selected pane, not stuck on the previous session's
+        # last frame. setChecked triggers _on_pause_toggled which flips
+        # _paused + updates the label, keeping all three in sync.
+        if self._pause_btn.isChecked():
+            self._pause_btn.setChecked(False)
+        # Defensive: even if the button was already unchecked (no
+        # toggled emission), force _paused False + label back.
+        self._paused = False
+        self._pause_btn.setText("Freeze frame")
         self._reset_to_uniform()
+
+    def _on_pause_toggled(self, checked: bool):
+        """React to the Freeze frame / Resume live toggle.
+
+        ``checked=True`` → frozen; button label switches to "Resume live"
+        so the next click's action is legible. ``checked=False`` → live;
+        label back to "Freeze frame".
+        """
+        self._paused = checked
+        self._pause_btn.setText("Resume live" if checked else "Freeze frame")
 
     # ----- Slider mechanics -----------------------------------------------
 
