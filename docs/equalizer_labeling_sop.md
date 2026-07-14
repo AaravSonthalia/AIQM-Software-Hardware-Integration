@@ -171,6 +171,53 @@ sensor trajectory) for context around the labeled moment.
 
 ---
 
+## Reconstruction transition labeling (Jul 15 2026)
+
+**Location:** Events tab → labeling form → "Change (from → to):" row
+(two dropdowns with an arrow between them).
+
+**What it captures:** the moment a growth transitions between two
+reconstructions. Single-class labeling (via "Primary reconstruction")
+answers *what is this frame?*; transition labeling answers *what did
+this frame CHANGE from and to?* The two coexist — you can set
+primary_reconstruction *and* change_from/change_to on the same event,
+and downstream analysis reads whichever it needs.
+
+**Workflow:**
+
+1. In the Events tab, select an auto-capture event you believe
+   captured a reconstruction transition
+2. In the labeling form, set "Change (from):" to the reconstruction
+   you saw before the event, and "Change (to):" to the one you saw
+   after
+3. Selection is atomic-per-dropdown: each change writes to
+   `events_labels.csv` immediately (no separate Save button)
+4. Both default to "(unlabeled)" — leave them there if the event
+   isn't a transition (grower didn't see a clear before/after)
+
+**Which fields to use:**
+
+- **Just primary_reconstruction:** steady-state frame ("this event
+  captured a good example of 1x1")
+- **Just change_from / change_to:** transition frame ("this event
+  captured 1x1 → Twinned")
+- **All three:** both signals for the same frame (rare but legit —
+  useful when the frame is at the crest of a transition and the
+  primary label captures the dominant class)
+- **None of them:** event doesn't need a label (mislabeled auto-
+  capture, artifact, out-of-frame beam). Discard it via the banner
+  instead of leaving the labels blank.
+
+**Downstream ML tie-in:** the change_from / change_to columns are the
+primary signal for Yuxin's #1 active-comparisons pipeline, which
+trains a model to discriminate transition frames from steady-state
+frames. High-quality transition labels are more scarce than
+steady-state ones, so growers filling these dropdowns during a
+labeling session directly increases the pool of transition-training
+data.
+
+---
+
 ## Common pitfalls
 
 1. **Save button greyed out:** the session must be running. Arm →

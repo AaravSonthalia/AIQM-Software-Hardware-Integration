@@ -121,6 +121,79 @@ class CommitFieldsTests(unittest.TestCase):
         self.assertGreater(i_qual, i_path)
 
 
+class UpdateEventLabelPartialUpdateTests(unittest.TestCase):
+    """Jul 15 2026 additions: change_from and change_to are UI-populated
+    via events_tab dropdowns. update_event_label's None-preserving
+    contract must not clobber sibling columns when only one of these
+    kwargs is passed. Guards against a subtle bug where the two new
+    columns' UI-populated status accidentally makes them "always
+    written" rather than "written when explicitly passed".
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.logger = GrowthLogger(base_dir=self.tmp.name)
+        self.logger.start_session("TEST_UPDATE_LABEL")
+
+    def tearDown(self):
+        try:
+            self.logger.end_session()
+        except Exception:
+            pass
+        self.tmp.cleanup()
+
+    def _read_row_for_event(self, event_idx: int) -> dict:
+        csv_path = self.logger.session_dir / "events_labels.csv"
+        with open(csv_path) as f:
+            for row in csv.DictReader(f):
+                if row.get("event_idx") == str(event_idx):
+                    return row
+        return {}
+
+    def test_update_event_label_change_from_only_preserves_other_fields(self):
+        # Set primary + notes, then update change_from alone. Expect the
+        # earlier fields to survive the partial update.
+        self.logger.update_event_label(
+            event_idx=1,
+            primary_reconstruction="c(6x2)",
+            notes="test note",
+        )
+        self.logger.update_event_label(event_idx=1, change_from="1x1")
+
+        row = self._read_row_for_event(1)
+        self.assertEqual(row["primary_reconstruction"], "c(6x2)")
+        self.assertEqual(row["notes"], "test note")
+        self.assertEqual(row["change_from"], "1x1")
+        # change_to still blank — not touched by either call.
+        self.assertEqual(row["change_to"], "")
+
+    def test_update_event_label_change_to_only_preserves_other_fields(self):
+        # Mirror of above for change_to.
+        self.logger.update_event_label(
+            event_idx=2,
+            primary_reconstruction="rt13xrt13",
+            notes="another note",
+        )
+        self.logger.update_event_label(event_idx=2, change_to="HTR")
+
+        row = self._read_row_for_event(2)
+        self.assertEqual(row["primary_reconstruction"], "rt13xrt13")
+        self.assertEqual(row["notes"], "another note")
+        self.assertEqual(row["change_to"], "HTR")
+        self.assertEqual(row["change_from"], "")
+
+    def test_update_change_from_and_to_together(self):
+        # Common case: grower sets both dropdowns as consecutive
+        # dropdown activations. Two separate update calls, one per
+        # dropdown, must both land.
+        self.logger.update_event_label(event_idx=3, change_from="1x1")
+        self.logger.update_event_label(event_idx=3, change_to="Twinned (2x1)")
+
+        row = self._read_row_for_event(3)
+        self.assertEqual(row["change_from"], "1x1")
+        self.assertEqual(row["change_to"], "Twinned (2x1)")
+
+
 class ManualEventSchemaTests(unittest.TestCase):
     """Schema-level tests for MANUAL_EVENT_FIELDS (Jul 10 2026 addition).
 

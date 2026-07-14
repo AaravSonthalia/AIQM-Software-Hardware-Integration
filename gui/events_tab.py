@@ -19,10 +19,9 @@ Current scope:
     field, atomic-per-change writes through GrowthLogger, in-memory
     label cache loaded on session attach
 
-Reconstruction-transition labeling (change_from / change_to) and the
-default-hide-discarded filter are deferred. The CSV schema reserves
-the change_from / change_to columns from day one so the deferred UI
-lands without migration.
+Reconstruction-transition labeling (change_from / change_to) shipped
+Jul 15 2026 as two dropdowns in the labeling form. The default-hide-
+discarded filter remains deferred.
 """
 from __future__ import annotations
 
@@ -291,15 +290,20 @@ class EventsTab(QWidget):
     def _build_label_form(self) -> QGroupBox:
         """Labeling form — primary reconstruction dropdown + notes field.
 
-        The change_from / change_to dropdowns are deferred to a follow-up
-        commit per AJ's scoping decision. The CSV schema reserves their
-        columns from day one so the future UI lands without migration.
+        Change_from / change_to dropdowns (Jul 15 2026) let the grower
+        label reconstruction *transitions* — i.e. "this event captured
+        the moment we went from 1x1 to Twinned(2x1)". Feeds Yuxin's #1
+        active-comparisons training signal, which discriminates
+        transition frames from steady-state frames. Both default to
+        the RECON_UNLABELED sentinel; the "Primary reconstruction"
+        dropdown above is for single-class labels (steady state), so
+        the two label systems complement without overwriting.
 
-        Uses ``activated`` (not ``currentIndexChanged``) on the dropdown
-        so programmatic ``setCurrentIndex`` during selection-change
-        loading doesn't trigger spurious writes. Notes use a debounced
-        timer so per-keystroke writes don't spam disk or persist
-        garbage like "substrate fla".
+        Uses ``activated`` (not ``currentIndexChanged``) on all three
+        combos so programmatic ``setCurrentIndex`` during selection-
+        change loading doesn't trigger spurious writes. Notes use a
+        debounced timer so per-keystroke writes don't spam disk or
+        persist garbage like "substrate fla".
         """
         box = QGroupBox("Label")
         form = QFormLayout(box)
@@ -314,6 +318,38 @@ class EventsTab(QWidget):
             self._on_primary_recon_activated,
         )
         form.addRow("Primary reconstruction:", self._primary_recon_combo)
+
+        # Change from → to (Jul 15 2026). Same RECON_LABEL_OPTIONS list
+        # as the primary dropdown; growers get familiar visual + kbd
+        # muscle memory. Both default to RECON_UNLABELED so a grower
+        # who only cares about the single-class primary label doesn't
+        # accidentally write a partial transition.
+        self._change_from_combo = QComboBox()
+        self._change_from_combo.addItem("(unlabeled)", RECON_UNLABELED)
+        for name in RECON_LABEL_OPTIONS:
+            self._change_from_combo.addItem(name, name)
+        self._change_from_combo.activated.connect(
+            self._on_change_from_activated,
+        )
+
+        self._change_to_combo = QComboBox()
+        self._change_to_combo.addItem("(unlabeled)", RECON_UNLABELED)
+        for name in RECON_LABEL_OPTIONS:
+            self._change_to_combo.addItem(name, name)
+        self._change_to_combo.activated.connect(
+            self._on_change_to_activated,
+        )
+
+        change_row = QHBoxLayout()
+        change_row.setSpacing(6)
+        change_row.setContentsMargins(0, 0, 0, 0)
+        change_row.addWidget(self._change_from_combo, 1)
+        arrow_label = QLabel("→")
+        arrow_label.setStyleSheet("font-size: 14px; padding: 0 4px;")
+        arrow_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        change_row.addWidget(arrow_label, 0)
+        change_row.addWidget(self._change_to_combo, 1)
+        form.addRow("Change (from → to):", change_row)
 
         self._notes_input = QLineEdit()
         self._notes_input.setPlaceholderText("Optional notes…")
@@ -715,9 +751,9 @@ class EventsTab(QWidget):
 
         Programmatic setCurrentIndex on the QComboBox doesn't fire
         ``activated`` (only user interaction does), so no blockSignals
-        is needed there. QLineEdit.setText DOES fire ``textChanged``,
-        which would start the debounce timer pointlessly — so we block
-        signals around the notes setText.
+        is needed for the three combos. QLineEdit.setText DOES fire
+        ``textChanged``, which would start the debounce timer
+        pointlessly — so we block signals around the notes setText.
         """
         label = (
             self._labels_cache.get(event_idx)
@@ -726,12 +762,19 @@ class EventsTab(QWidget):
         primary = (label or {}).get(
             "primary_reconstruction", RECON_UNLABELED,
         )
+        change_from = (label or {}).get("change_from", RECON_UNLABELED)
+        change_to = (label or {}).get("change_to", RECON_UNLABELED)
         notes = (label or {}).get("notes", "")
 
-        target_idx = self._primary_recon_combo.findData(primary)
-        if target_idx < 0:
-            target_idx = 0  # fall back to "(unlabeled)"
-        self._primary_recon_combo.setCurrentIndex(target_idx)
+        for combo, value in (
+            (self._primary_recon_combo, primary),
+            (self._change_from_combo, change_from),
+            (self._change_to_combo, change_to),
+        ):
+            target_idx = combo.findData(value)
+            if target_idx < 0:
+                target_idx = 0  # fall back to "(unlabeled)"
+            combo.setCurrentIndex(target_idx)
 
         self._notes_input.blockSignals(True)
         self._notes_input.setText(notes)
@@ -765,6 +808,62 @@ class EventsTab(QWidget):
         cached["primary_reconstruction"] = primary
         cached["label_timestamp_iso"] = datetime.now().isoformat()
         self._refresh_unreviewed_badge()
+
+    @pyqtSlot(int)
+    def _on_change_from_activated(self, idx: int) -> None:
+        """Persist the new Change (from) selection to events_labels.csv.
+
+        Mirrors _on_primary_recon_activated but writes only the
+        change_from column. Does NOT refresh the unreviewed-count badge:
+        the badge only tracks primary_reconstruction (see
+        _refresh_unreviewed_badge), so change_from/to updates don't
+        affect the "kept_explicit-without-label" bucket. Downstream
+        (Yuxin's #1 pipeline) consumes change_from/to as its own signal
+        distinct from the single-class primary label.
+        """
+        if (
+            self._currently_displayed_event_idx is None
+            or self._growth_logger is None
+        ):
+            return
+        value = self._change_from_combo.itemData(idx)
+        self._growth_logger.update_event_label(
+            self._currently_displayed_event_idx,
+            change_from=value,
+        )
+        cached = self._labels_cache.setdefault(
+            self._currently_displayed_event_idx,
+            {f: "" for f in GrowthLogger.EVENT_LABEL_FIELDS},
+        )
+        cached["event_idx"] = str(self._currently_displayed_event_idx)
+        cached["change_from"] = value
+        cached["label_timestamp_iso"] = datetime.now().isoformat()
+
+    @pyqtSlot(int)
+    def _on_change_to_activated(self, idx: int) -> None:
+        """Persist the new Change (to) selection to events_labels.csv.
+
+        Same pattern + rationale as _on_change_from_activated. Writes
+        the change_to column only. See that docstring for badge-refresh
+        semantics.
+        """
+        if (
+            self._currently_displayed_event_idx is None
+            or self._growth_logger is None
+        ):
+            return
+        value = self._change_to_combo.itemData(idx)
+        self._growth_logger.update_event_label(
+            self._currently_displayed_event_idx,
+            change_to=value,
+        )
+        cached = self._labels_cache.setdefault(
+            self._currently_displayed_event_idx,
+            {f: "" for f in GrowthLogger.EVENT_LABEL_FIELDS},
+        )
+        cached["event_idx"] = str(self._currently_displayed_event_idx)
+        cached["change_to"] = value
+        cached["label_timestamp_iso"] = datetime.now().isoformat()
 
     @pyqtSlot()
     def _on_notes_text_changed(self) -> None:

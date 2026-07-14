@@ -784,6 +784,16 @@ class GrowthLogger:
         clobbering a previously-typed notes string. ``label_timestamp_iso``
         is always refreshed to record when the label was last touched.
 
+        Kwarg source map (Jul 15 2026):
+          - primary_reconstruction, change_from, change_to → three
+            dropdowns on events_tab labeling form (Jul 15). change_from/to
+            went from "reserved-but-unused" to UI-populated in the same
+            commit that landed the labeling-form dropdowns.
+          - notes → events_tab text field (debounced)
+          - recon_1x1 / recon_tw / recon_c6x2 / recon_rt13 / recon_HTR →
+            Equalizer popup save callback (see events_tab.
+            _make_equalizer_save_callback)
+
         File is created on first write — sessions with no labeling
         activity won't leave behind an empty events_labels.csv.
 
