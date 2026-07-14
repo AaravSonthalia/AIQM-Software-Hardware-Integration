@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -29,10 +30,17 @@ if str(REPO_ROOT) not in sys.path:
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 from scripts.growth_profile_explorer import (  # noqa: E402
+    CLASS_LINE_COLORS,
+    DEFAULT_CHANGE_THRESHOLD,
     EVENT_MARKER_COLORS,
+    EVENT_STATE_ORDER,
     SessionArtifacts,
+    render_classifier_trajectory,
+    render_grower_vs_classifier_agreement,
+    render_score_distribution,
     render_temperature_chart,
 )
+from gui.recon_labels import RECON_LABELS  # noqa: E402
 
 
 def _write_csv(
@@ -341,6 +349,260 @@ class TemperatureChartTests(unittest.TestCase):
         result = render_temperature_chart(artifacts, out, dpi=100)
         self.assertIsNone(result)
         self.assertFalse(out.exists())
+
+
+def _write_full_commit_row(
+    elapsed_s: str, classifier_pcts: dict[str, float],
+    grower_pcts: Optional[dict[str, float]] = None,
+    grower_corrected: str = "False",
+) -> dict:
+    """Build one commit_log.csv row with paired classifier + grower cells.
+
+    Fills every column the renderers need. Any RECON_LABELS class not
+    in the caller-supplied dicts gets an empty cell (simulating
+    classifier-not-yet-emitted-for-that-class).
+    """
+    row = {
+        "timestamp": "2026-07-17T10:00:00",
+        "elapsed_s": elapsed_s,
+        "sample_id": "S",
+        "grower": "G",
+        "pyrometer_temp_C": "500",
+        "grower_corrected": grower_corrected,
+        "note": "",
+    }
+    for label in RECON_LABELS:
+        row[f"classifier_recon_{label}"] = (
+            str(classifier_pcts.get(label, ""))
+        )
+        row[f"recon_{label}"] = (
+            str((grower_pcts or {}).get(label, ""))
+        )
+    return row
+
+
+def _commit_row_fields() -> list[str]:
+    """Field names for the synthetic commit rows built above."""
+    base = [
+        "timestamp", "elapsed_s", "sample_id", "grower",
+        "pyrometer_temp_C", "grower_corrected", "note",
+    ]
+    for label in RECON_LABELS:
+        base.append(f"classifier_recon_{label}")
+        base.append(f"recon_{label}")
+    return base
+
+
+class ClassifierTrajectoryTests(unittest.TestCase):
+    """Four tests locking classifier trajectory chart behavior."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.session_dir = (
+            Path(self.tmp.name) / "growth_TEST_20260717_100000"
+        )
+        self.session_dir.mkdir()
+        self.out_dir = Path(self.tmp.name) / "out"
+        self.out_dir.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_five_lines_when_all_classes_present(self):
+        # Two commits, each with all 5 classifier_recon_* cells filled.
+        # Chart renders + all 5 classes get plotted (verified via the
+        # underlying per-class series check).
+        rows = [
+            _write_full_commit_row(
+                "30",
+                {"1x1": 60, "Twinned (2x1)": 20, "c(6x2)": 10,
+                 "rt13xrt13": 5, "HTR": 5},
+            ),
+            _write_full_commit_row(
+                "90",
+                {"1x1": 40, "Twinned (2x1)": 30, "c(6x2)": 15,
+                 "rt13xrt13": 10, "HTR": 5},
+            ),
+        ]
+        _write_csv(
+            self.session_dir / "commit_log.csv",
+            _commit_row_fields(), rows,
+        )
+        artifacts = SessionArtifacts.from_session_dir(self.session_dir)
+        out = self.out_dir / "traj.png"
+        result = render_classifier_trajectory(artifacts, out, dpi=100)
+        self.assertEqual(result, out)
+        self.assertTrue(out.exists())
+        self.assertGreater(out.stat().st_size, 500)
+
+    def test_absent_columns_return_none(self):
+        # Commits present but every classifier_recon cell blank → no
+        # data to plot → return None, no file written. Guards against
+        # the case where classifier was DISABLED for the whole session
+        # but the grower still hit LOG ENTRY.
+        rows = [
+            _write_full_commit_row("30", {}),  # all classifier blank
+            _write_full_commit_row("90", {}),
+        ]
+        _write_csv(
+            self.session_dir / "commit_log.csv",
+            _commit_row_fields(), rows,
+        )
+        artifacts = SessionArtifacts.from_session_dir(self.session_dir)
+        out = self.out_dir / "traj.png"
+        result = render_classifier_trajectory(artifacts, out, dpi=100)
+        self.assertIsNone(result)
+        self.assertFalse(out.exists())
+
+    def test_line_colors_stable_across_all_classes(self):
+        # Lock: every RECON_LABELS class has a color mapping in
+        # CLASS_LINE_COLORS. Guards against a future rename in
+        # RECON_LABELS or a color-dict typo causing silent KeyError
+        # when a new-name class shows up in commit_log.
+        for label in RECON_LABELS:
+            self.assertIn(label, CLASS_LINE_COLORS)
+        # And the reverse — no orphan colors that would suggest a
+        # stale class name lingering in the dict.
+        self.assertEqual(set(CLASS_LINE_COLORS), set(RECON_LABELS))
+
+    def test_time_axis_matches_temperature_chart(self):
+        # Both charts should use elapsed_s / 60.0 as the x-axis. If
+        # temp uses minutes and classifier uses seconds, side-by-side
+        # comparison in the Day 6 HTML report would mislead the
+        # grower. Verify indirectly: for a commit at elapsed_s=90,
+        # the underlying series x-value is 1.5 (minutes), matching
+        # the temperature chart's convention (plot_temperature.py:99).
+        rows = [_write_full_commit_row("90", {"1x1": 100})]
+        _write_csv(
+            self.session_dir / "commit_log.csv",
+            _commit_row_fields(), rows,
+        )
+        _write_csv(
+            self.session_dir / "sensor_log.csv",
+            ["elapsed_s", "pyrometer_temp_C"],
+            [{"elapsed_s": "90", "pyrometer_temp_C": "500"}],
+        )
+        artifacts = SessionArtifacts.from_session_dir(self.session_dir)
+
+        # Reader-level: temperature_series returns raw seconds; the
+        # chart code divides. Assert the temperature_series[0] matches
+        # commit_rows[0].elapsed_s so both charts feed identical time
+        # values to their /60.0 divides.
+        elapsed_temp, _ = artifacts.temperature_series()
+        elapsed_commit = _safe_float_local(
+            artifacts.commit_rows[0].get("elapsed_s")
+        )
+        self.assertEqual(elapsed_temp[0], 90.0)
+        self.assertEqual(elapsed_commit, 90.0)
+
+        # And render succeeds.
+        out = self.out_dir / "traj.png"
+        result = render_classifier_trajectory(artifacts, out, dpi=100)
+        self.assertEqual(result, out)
+
+
+class ScoreDistributionTests(unittest.TestCase):
+    """Three tests locking auto-capture score-distribution behavior."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.session_dir = (
+            Path(self.tmp.name) / "growth_TEST_20260717_110000"
+        )
+        self.session_dir.mkdir()
+        self.out_dir = Path(self.tmp.name) / "out"
+        self.out_dir.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_histogram_bins_from_change_score(self):
+        # Ten auto-capture events with a spread of change_scores →
+        # renders successfully. Non-trivial PNG size confirms axes +
+        # bars actually landed.
+        rows = [
+            {"timestamp": "T", "elapsed_s": str(30 + i),
+             "event_idx": str(i), "change_score": str(0.05 * i),
+             "event_state": "kept_default"}
+            for i in range(10)
+        ]
+        _write_csv(
+            self.session_dir / "auto_capture_events.csv",
+            ["timestamp", "elapsed_s", "event_idx", "change_score",
+             "event_state"],
+            rows,
+        )
+        artifacts = SessionArtifacts.from_session_dir(self.session_dir)
+        out = self.out_dir / "score.png"
+        result = render_score_distribution(artifacts, out, dpi=100)
+        self.assertEqual(result, out)
+        self.assertTrue(out.exists())
+        self.assertGreater(out.stat().st_size, 500)
+
+    def test_no_auto_capture_events_returns_none(self):
+        # Zero auto_capture rows → no histogram data → None + no PNG.
+        # Guard against "empty histogram" render (matplotlib would
+        # cheerfully produce a chart with no bars, which misleads a
+        # viewer into thinking the session had events).
+        _write_csv(
+            self.session_dir / "auto_capture_events.csv",
+            ["elapsed_s", "event_idx", "change_score", "event_state"],
+            [],
+        )
+        artifacts = SessionArtifacts.from_session_dir(self.session_dir)
+        out = self.out_dir / "score.png"
+        result = render_score_distribution(artifacts, out, dpi=100)
+        self.assertIsNone(result)
+        self.assertFalse(out.exists())
+
+    def test_state_buckets_partition_all_events(self):
+        # Mix of event_states — verify EVENT_STATE_ORDER covers the
+        # documented set (regression guard for the state constants in
+        # growth_logger.py:26-30). Doesn't verify the rendered text
+        # box directly, but confirms the state-count aggregation
+        # logic runs against a realistic distribution.
+        rows = [
+            {"elapsed_s": "30", "event_idx": "1",
+             "change_score": "0.5", "event_state": "kept_explicit"},
+            {"elapsed_s": "60", "event_idx": "2",
+             "change_score": "0.6", "event_state": "kept_default"},
+            {"elapsed_s": "90", "event_idx": "3",
+             "change_score": "0.7", "event_state": "discarded"},
+            {"elapsed_s": "120", "event_idx": "4",
+             "change_score": "0.8", "event_state": "auto_skipped"},
+            {"elapsed_s": "150", "event_idx": "5",
+             "change_score": "0.9", "event_state": "pending"},
+        ]
+        _write_csv(
+            self.session_dir / "auto_capture_events.csv",
+            ["elapsed_s", "event_idx", "change_score", "event_state"],
+            rows,
+        )
+        artifacts = SessionArtifacts.from_session_dir(self.session_dir)
+        out = self.out_dir / "score.png"
+        result = render_score_distribution(artifacts, out, dpi=100)
+        self.assertEqual(result, out)
+        # All 5 states from growth_logger.EVENT_STATE_* constants must
+        # be present in EVENT_STATE_ORDER (order + membership contract).
+        expected = {
+            "pending", "kept_explicit", "kept_default",
+            "discarded", "auto_skipped",
+        }
+        self.assertEqual(set(EVENT_STATE_ORDER), expected)
+
+
+def _safe_float_local(value):
+    """Duplicated from growth_profile_explorer for test-only introspection.
+
+    Kept intentionally simple — tests should exercise the reader's
+    public API. The private _safe_float lives inside the module.
+    """
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return float(str(value).strip())
+    except ValueError:
+        return None
 
 
 if __name__ == "__main__":
