@@ -37,6 +37,7 @@ from scripts.growth_profile_explorer import (  # noqa: E402
     SessionArtifacts,
     render_classifier_trajectory,
     render_grower_vs_classifier_agreement,
+    render_html_report,
     render_score_distribution,
     render_temperature_chart,
 )
@@ -603,6 +604,183 @@ def _safe_float_local(value):
         return float(str(value).strip())
     except ValueError:
         return None
+
+
+def _write_synthetic_chart_png(path: Path) -> None:
+    """Write a tiny valid PNG for HTML-report base64 embedding tests.
+
+    matplotlib in Agg would work too, but this stays lighter and
+    lets the HTML tests be independent of the chart-render code
+    path. Bytes below are a 1x1 transparent PNG — enough for the
+    base64-embedding + <img> path to exercise, not visually
+    interesting.
+    """
+    # Smallest valid PNG (1x1 transparent, ~67 bytes).
+    tiny_png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000"
+        "001f15c4890000000d49444154789c626001000000050001a5f6450b"
+        "0000000049454e44ae426082"
+    )
+    path.write_bytes(tiny_png)
+
+
+class HtmlReportTests(unittest.TestCase):
+    """Four tests locking HTML report assembly behavior."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.session_dir = (
+            Path(self.tmp.name) / "growth_TEST_20260720_100000"
+        )
+        self.session_dir.mkdir()
+        self.out_dir = Path(self.tmp.name) / "out"
+        self.out_dir.mkdir()
+        # A minimal session so metadata() has something to surface.
+        _write_csv(
+            self.session_dir / "sensor_log.csv",
+            ["elapsed_s", "pyrometer_temp_C"],
+            [{"elapsed_s": str(15.0 * i),
+              "pyrometer_temp_C": str(500 + i)} for i in range(6)],
+        )
+        _write_csv(
+            self.session_dir / "commit_log.csv",
+            ["timestamp", "elapsed_s", "sample_id", "grower", "note"],
+            [{"timestamp": "T", "elapsed_s": "30",
+              "sample_id": "STO_1", "grower": "AJ", "note": "n"}],
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_html_created_when_charts_exist(self):
+        # One fake PNG in the "written" list → HTML lands on disk
+        # with a non-trivial size (metadata + template ~2KB minimum).
+        chart_path = self.out_dir / "temperature_profile_annotated.png"
+        _write_synthetic_chart_png(chart_path)
+        artifacts = SessionArtifacts.from_session_dir(self.session_dir)
+        out = self.out_dir / "report.html"
+        result = render_html_report(artifacts, out, [chart_path])
+        self.assertEqual(result, out)
+        self.assertTrue(out.exists())
+        self.assertGreater(out.stat().st_size, 1500)
+
+    def test_base64_png_embedded_in_html(self):
+        # HTML output includes the data:image/png;base64, prefix for
+        # the embedded chart. Guards against a future refactor that
+        # accidentally switches to <img src=file:...> (would break
+        # the "self-contained, emailable" contract).
+        chart_path = self.out_dir / "temperature_profile_annotated.png"
+        _write_synthetic_chart_png(chart_path)
+        artifacts = SessionArtifacts.from_session_dir(self.session_dir)
+        out = self.out_dir / "report.html"
+        render_html_report(artifacts, out, [chart_path])
+        html = out.read_text(encoding="utf-8")
+        self.assertIn("data:image/png;base64,", html)
+        # No file:// or absolute-path leaks in the src attributes.
+        self.assertNotIn("file://", html)
+        self.assertNotIn(str(chart_path), html)
+
+    def test_metadata_header_present(self):
+        # Session name + grower + sample_id from the commit row land
+        # in the HTML body. Guards against a template change that
+        # accidentally drops a metadata field.
+        chart_path = self.out_dir / "temperature_profile_annotated.png"
+        _write_synthetic_chart_png(chart_path)
+        artifacts = SessionArtifacts.from_session_dir(self.session_dir)
+        out = self.out_dir / "report.html"
+        render_html_report(artifacts, out, [chart_path])
+        html = out.read_text(encoding="utf-8")
+        self.assertIn("growth_TEST_20260720_100000", html)
+        self.assertIn("AJ", html)
+        self.assertIn("STO_1", html)
+
+    def test_stride_reduces_data_points(self):
+        # SessionArtifacts.subsample(N) yields shorter sensor + heartbeat
+        # rows but leaves event-based CSVs untouched. Locks the "sparse
+        # events are never subsampled" contract — else --stride 5 on a
+        # session with 4 grower events might silently drop the last one.
+        _write_csv(
+            self.session_dir / "heartbeat_log.csv",
+            ["elapsed_s", "heartbeat_idx", "frame_path"],
+            [{"elapsed_s": str(i), "heartbeat_idx": str(i),
+              "frame_path": f"/x{i}"} for i in range(20)],
+        )
+        artifacts = SessionArtifacts.from_session_dir(self.session_dir)
+        # Baseline
+        self.assertEqual(len(artifacts.sensor_rows), 6)
+        self.assertEqual(len(artifacts.heartbeat_rows), 20)
+        self.assertEqual(len(artifacts.commit_rows), 1)
+        # Subsample every 3rd row
+        sub = artifacts.subsample(3)
+        # ceil(6 / 3) = 2  and  ceil(20 / 3) = 7  under Python slicing
+        self.assertEqual(len(sub.sensor_rows), 2)
+        self.assertEqual(len(sub.heartbeat_rows), 7)
+        # Event-based CSVs preserved
+        self.assertEqual(len(sub.commit_rows), 1)
+        # stride=1 returns the same object (no-op fast path)
+        self.assertIs(artifacts.subsample(1), artifacts)
+
+
+class CliSmokeTests(unittest.TestCase):
+    """Two tests exercising the argparse main() end-to-end via subprocess."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.session_dir = (
+            Path(self.tmp.name) / "growth_TEST_20260720_110000"
+        )
+        self.session_dir.mkdir()
+        # Minimal session: enough for temperature chart to render.
+        _write_csv(
+            self.session_dir / "sensor_log.csv",
+            ["elapsed_s", "pyrometer_temp_C"],
+            [{"elapsed_s": str(15.0 * i),
+              "pyrometer_temp_C": str(500 + i)} for i in range(5)],
+        )
+        self.script_path = (
+            REPO_ROOT / "scripts" / "growth_profile_explorer.py"
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missing_session_exits_1(self):
+        # Nonexistent session path → exit 1 + stderr diagnostic.
+        # Guards against a silent "wrote 0 charts" success on a typo.
+        import subprocess
+        result = subprocess.run(
+            [
+                sys.executable, str(self.script_path),
+                "/tmp/does-not-exist-12345",
+            ],
+            capture_output=True, text=True,
+            env={**os.environ, "MPLBACKEND": "Agg"},
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Error", result.stderr)
+
+    def test_success_prints_output_paths(self):
+        # Valid session → exit 0 + stdout lists the chart file names.
+        # Also verifies HTML report lands by default (no --no-html).
+        import subprocess
+        result = subprocess.run(
+            [
+                sys.executable, str(self.script_path),
+                str(self.session_dir),
+                "--output-dir", str(Path(self.tmp.name) / "analysis"),
+            ],
+            capture_output=True, text=True,
+            env={**os.environ, "MPLBACKEND": "Agg"},
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            msg=f"stderr: {result.stderr}",
+        )
+        self.assertIn("Rendered", result.stdout)
+        self.assertIn(
+            "temperature_profile_annotated.png", result.stdout,
+        )
+        self.assertIn("growth_profile_report.html", result.stdout)
 
 
 if __name__ == "__main__":

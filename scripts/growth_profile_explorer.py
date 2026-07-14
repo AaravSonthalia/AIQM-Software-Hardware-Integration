@@ -2,8 +2,8 @@
 """Growth Profile Explorer — post-hoc session analysis.
 
 Reads a Growth Monitor session directory and renders diagnostic charts
-that would otherwise require manual CSV wrangling. Day 5 (Jul 17 2026)
-ships 5 panels total — Day 4 shipped the first two, Day 5 adds three:
+that would otherwise require manual CSV wrangling. Day 6 (Jul 20 2026)
+completes the B1 arc — 5 PNG panels + an HTML report wrapping them:
 
   - ``temperature_profile_annotated.png`` — T vs t with commit / manual /
     auto-capture event overlays  [Day 4]
@@ -14,14 +14,20 @@ ships 5 panels total — Day 4 shipped the first two, Day 5 adds three:
     with threshold reference + per-state count summary  [Day 5]
   - ``grower_vs_classifier.png`` — 5-panel scatter of grower slider %
     vs classifier % per LOG ENTRY, one panel per class  [Day 5]
-
-Day 6 (Jul 20) will wrap all five into an HTML report with base64-
-embedded PNGs + session-metadata header.
+  - ``growth_profile_report.html`` — self-contained page with all 5
+    PNGs base64-embedded + session metadata header (grower,
+    sample_id, duration, event counts). Openable in any browser
+    with no external dependencies.  [Day 6]
 
 Usage:
     python scripts/growth_profile_explorer.py \\
         logs/growths/<session_dir>/ \\
         --output-dir logs/growths/<session_dir>/analysis/
+
+    # Long sessions: subsample sensor + heartbeat rows to keep
+    # PNGs readable and file sizes bounded
+    python scripts/growth_profile_explorer.py \\
+        logs/growths/<session_dir>/ --stride 4
 
 Consumed CSVs (all optional except ``sensor_log.csv`` — missing files
 yield empty row lists so the tool works against pre-Jul-10 sessions
@@ -277,6 +283,90 @@ class SessionArtifacts:
             if row.get("event_idx") == target:
                 return row
         return None
+
+    def metadata(self) -> dict[str, str]:
+        """Extract session-metadata fields for the HTML report header.
+
+        Pulls grower / sample_id from the first commit row (they're the
+        same every commit) and derives duration + event counts from
+        the sensor and event CSVs. Empty string for fields not
+        populated in this session — the HTML template renders "—"
+        for missing values rather than crashing.
+
+        Returns a flat dict of stringified values so the caller can
+        f-string it into HTML without further type coercion.
+        """
+        # Session identity comes from the first commit row if any
+        # (grower / sample_id are commit-scoped, not session-scoped
+        # in the schema — grower can vary mid-session if the LOG
+        # ENTRY hand-off happens). We surface the first-seen value
+        # as the "primary" for the report header; a mid-session
+        # grower swap is rare enough not to warrant multi-value
+        # display.
+        grower = sample_id = ""
+        for row in self.commit_rows:
+            if not grower:
+                grower = row.get("grower", "").strip()
+            if not sample_id:
+                sample_id = row.get("sample_id", "").strip()
+            if grower and sample_id:
+                break
+
+        # Duration from the last sensor row's elapsed_s. Falls back
+        # to the last heartbeat row if sensor is missing. If neither,
+        # duration is unknown.
+        duration_s: Optional[float] = None
+        for source in (self.sensor_rows, self.heartbeat_rows):
+            if source:
+                t = _safe_float(source[-1].get("elapsed_s"))
+                if t is not None:
+                    duration_s = t
+                    break
+
+        if duration_s is not None:
+            mins = int(duration_s // 60)
+            secs = int(duration_s % 60)
+            duration_str = f"{mins}m {secs}s"
+        else:
+            duration_str = "—"
+
+        # Event counts across the four discrete-event surfaces.
+        return {
+            "grower": grower or "—",
+            "sample_id": sample_id or "—",
+            "session_name": self.session_dir.name,
+            "duration": duration_str,
+            "commits": str(len(self.commit_rows)),
+            "auto_captures": str(len(self.auto_capture_rows)),
+            "manual_events": str(len(self.manual_event_rows)),
+            "heartbeats": str(len(self.heartbeat_rows)),
+            "event_labels": str(len(self.event_label_rows)),
+            "sensor_readings": str(len(self.sensor_rows)),
+        }
+
+    def subsample(self, stride: int) -> "SessionArtifacts":
+        """Return a new SessionArtifacts with sensor + heartbeat rows
+        subsampled every N. Event-based CSVs pass through unchanged
+        (they're already sparse; further subsampling would silently
+        hide events).
+
+        ``stride=1`` returns an equivalent copy (no subsampling).
+        ``stride<=0`` is treated as 1. Used by the CLI ``--stride``
+        flag to keep chart file sizes bounded on multi-hour sessions
+        without dropping any grower/classifier decision points.
+        """
+        stride = max(1, int(stride))
+        if stride == 1:
+            return self
+        return SessionArtifacts(
+            session_dir=self.session_dir,
+            sensor_rows=self.sensor_rows[::stride],
+            commit_rows=list(self.commit_rows),
+            auto_capture_rows=list(self.auto_capture_rows),
+            manual_event_rows=list(self.manual_event_rows),
+            heartbeat_rows=self.heartbeat_rows[::stride],
+            event_label_rows=list(self.event_label_rows),
+        )
 
 
 def render_temperature_chart(
@@ -649,6 +739,137 @@ def render_grower_vs_classifier_agreement(
     return output_path
 
 
+# HTML report template. Kept as a module-level constant string (not a
+# separate .html file) so the script stays a single-file drop-in.
+# Uses {name} placeholders — .format() is called with metadata dict +
+# a pre-composed panels_html string containing the <img> tags.
+_HTML_REPORT_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Growth profile — {session_name}</title>
+<style>
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 1200px; margin: 0 auto; padding: 24px;
+    background: #fafafa; color: #1a1a1a;
+  }}
+  h1 {{ margin: 0 0 8px; font-size: 20px; }}
+  h2 {{ margin: 24px 0 8px; font-size: 16px; color: #0d9488; }}
+  .meta {{
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 6px;
+    padding: 12px 16px; margin-bottom: 16px; font-size: 14px;
+  }}
+  .meta table {{ border-collapse: collapse; width: 100%; }}
+  .meta td {{ padding: 4px 8px; vertical-align: top; }}
+  .meta td.k {{ color: #6b7280; width: 140px; }}
+  .meta td.v {{ font-family: ui-monospace, monospace; }}
+  .panel {{
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 6px;
+    padding: 12px; margin-bottom: 16px; text-align: center;
+  }}
+  .panel img {{ max-width: 100%; height: auto; }}
+  .footer {{
+    margin-top: 32px; padding-top: 12px; border-top: 1px solid #e5e7eb;
+    color: #6b7280; font-size: 12px;
+  }}
+</style>
+</head>
+<body>
+<h1>Growth profile — {session_name}</h1>
+<div class="meta">
+  <table>
+    <tr><td class="k">Grower</td><td class="v">{grower}</td>
+        <td class="k">Sample</td><td class="v">{sample_id}</td></tr>
+    <tr><td class="k">Duration</td><td class="v">{duration}</td>
+        <td class="k">Sensor readings</td><td class="v">{sensor_readings}</td></tr>
+    <tr><td class="k">LOG ENTRY commits</td><td class="v">{commits}</td>
+        <td class="k">Heartbeats</td><td class="v">{heartbeats}</td></tr>
+    <tr><td class="k">Auto-capture events</td><td class="v">{auto_captures}</td>
+        <td class="k">Manual events</td><td class="v">{manual_events}</td></tr>
+    <tr><td class="k">Event labels</td><td class="v">{event_labels}</td>
+        <td class="k">Generated</td><td class="v">{generated_iso}</td></tr>
+  </table>
+</div>
+{panels_html}
+<div class="footer">
+  Rendered by <code>scripts/growth_profile_explorer.py</code>. All
+  images are base64-embedded — this file is self-contained and can be
+  emailed, saved, or opened offline without accompanying assets.
+</div>
+</body>
+</html>
+"""
+
+# Human-readable panel titles keyed to the chart filenames the main()
+# emits. Order controls the order they appear in the report.
+_PANEL_TITLES: list[tuple[str, str]] = [
+    ("temperature_profile_annotated.png",
+     "Temperature profile with event overlays"),
+    ("pyro_stability.png",
+     "Pyrometer stability (mean ± σ)"),
+    ("classifier_trajectory.png",
+     "Classifier smoothed % per class"),
+    ("score_distribution.png",
+     "Auto-capture score distribution"),
+    ("grower_vs_classifier.png",
+     "Grower slider % vs classifier %"),
+]
+
+
+def render_html_report(
+    artifacts: SessionArtifacts,
+    output_path: Path,
+    chart_paths: list[Path],
+) -> Optional[Path]:
+    """Assemble the 5 PNG panels into a self-contained HTML report.
+
+    Reads each chart PNG bytes-only, base64-encodes it, and embeds it
+    inline as ``<img src="data:image/png;base64,...">``. No external
+    file references — the resulting HTML travels standalone.
+
+    ``chart_paths`` should be the actual list of PNGs written by the
+    prior renderer calls (may be shorter than the full 5 if some
+    renderers returned None). Panel order matches
+    ``_PANEL_TITLES``.
+
+    Returns ``output_path`` on success, or ``None`` if no charts
+    exist to embed (all renderers returned None — nothing to
+    display beyond the metadata header, so we skip the report
+    entirely).
+    """
+    if not chart_paths:
+        return None
+
+    from base64 import b64encode
+    from datetime import datetime
+
+    chart_paths_by_name = {p.name: p for p in chart_paths}
+    panels: list[str] = []
+    for filename, title in _PANEL_TITLES:
+        p = chart_paths_by_name.get(filename)
+        if p is None or not p.exists():
+            continue
+        with open(p, "rb") as f:
+            b64 = b64encode(f.read()).decode("ascii")
+        panels.append(
+            f'<div class="panel">\n'
+            f'  <h2>{title}</h2>\n'
+            f'  <img src="data:image/png;base64,{b64}" '
+            f'alt="{title}">\n'
+            f'</div>'
+        )
+
+    meta = artifacts.metadata()
+    meta["generated_iso"] = datetime.now().isoformat(timespec="seconds")
+    meta["panels_html"] = "\n".join(panels)
+
+    html = _HTML_REPORT_TEMPLATE.format(**meta)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return output_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -666,6 +887,18 @@ def main():
         ),
     )
     parser.add_argument("--dpi", type=int, default=150)
+    parser.add_argument(
+        "--stride", type=int, default=1,
+        help=(
+            "Subsample sensor + heartbeat rows every N (default 1 = "
+            "no subsampling). Use for long sessions where charts get "
+            "dense; event-based CSVs are never subsampled."
+        ),
+    )
+    parser.add_argument(
+        "--no-html", action="store_true",
+        help="Skip HTML report assembly; write PNGs only.",
+    )
     args = parser.parse_args()
 
     try:
@@ -673,6 +906,9 @@ def main():
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+    if args.stride > 1:
+        artifacts = artifacts.subsample(args.stride)
 
     out_dir = args.output_dir or (args.session_path / "analysis")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -702,9 +938,21 @@ def main():
         )
         sys.exit(1)
 
+    # HTML report wraps whatever PNGs actually landed. If a renderer
+    # returned None its panel is silently skipped in the report.
+    html_path = None
+    if not args.no_html:
+        html_path = render_html_report(
+            artifacts,
+            out_dir / "growth_profile_report.html",
+            written,
+        )
+
     print(f"Rendered {len(written)} chart(s) to {out_dir}:")
     for p in written:
         print(f"  {p.name}")
+    if html_path is not None:
+        print(f"  {html_path.name}  (open in browser)")
 
 
 if __name__ == "__main__":

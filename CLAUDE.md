@@ -76,9 +76,18 @@ auto-timestamps grower notes, and exports partially-filled growth logs.
 Each session creates a directory under the configured save folder containing:
 - `sensor_log.csv` — periodic temperature readings at configured interval (default 10s)
 - `commit_log.csv` — timestamped grower entries with notes, temp, V, I, frame paths
-- `frames/` — RHEED frame PNGs captured at each LOG ENTRY
+- `frames/` — RHEED frame BMPs captured at each LOG ENTRY (BMP matches Justin's training-data format)
 - `session_metadata.json` — grower, sample ID, date, entry count
 - `growth_log.xlsx` — OMBE growth log export (auto-generated on STOP, also via Export button)
+- `temperature_profile.png` — auto-generated T-vs-t plot at STOP
+
+Post-hoc analysis (via `scripts/growth_profile_explorer.py`) adds an `analysis/` subdirectory:
+- `temperature_profile_annotated.png` — T-vs-t with commit / manual / auto-capture overlays
+- `pyro_stability.png` — pyrometer mean ± σ band
+- `classifier_trajectory.png` — classifier smoothed % per class over time
+- `score_distribution.png` — auto-capture change_score histogram + per-state counts
+- `grower_vs_classifier.png` — 5-panel scatter of grower slider % vs classifier %
+- `growth_profile_report.html` — self-contained HTML wrapping all 5 with metadata (emailable, no external deps)
 
 ### Config Defaults
 - Recording interval: 1s minimum, whole seconds (prevents faster-than-hardware commits)

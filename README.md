@@ -128,18 +128,29 @@ diagnostic charts and reports after the fact — no lab PC required.
 | Script | Output | Use |
 |---|---|---|
 | `scripts/plot_temperature.py` | Single T-vs-t PNG | Quick temperature-trace view of one session |
-| `scripts/growth_profile_explorer.py` | Multi-chart PNG set in `<session>/analysis/` | Fuller session review: T + std band + event overlays (commit / manual / auto). More charts land Days 5-6 (classifier trajectory, score distributions, HTML report) |
+| `scripts/growth_profile_explorer.py` | 5 PNGs + self-contained HTML report in `<session>/analysis/` | Full session review: T + std band + event overlays + classifier trajectory + auto-capture score distribution + grower-vs-classifier agreement scatter. HTML wraps all 5 with base64-embedded PNGs and a session metadata header — emailable, no external dependencies |
 | `scripts/validate_angle_robustness.py` | HTML report + CSV | Classifier sensitivity to camera-angle rotations against an archived session |
 
 ```bash
-# Two-chart post-hoc explorer
+# Five-chart + HTML report
 python scripts/growth_profile_explorer.py \
     logs/growths/growth_Group-Test_20260710_161714/
+# → writes analysis/{temperature_profile_annotated,pyro_stability,
+#   classifier_trajectory,score_distribution,grower_vs_classifier}.png
+# and analysis/growth_profile_report.html (open in browser)
 
 # Custom output directory + DPI
 python scripts/growth_profile_explorer.py \
     logs/growths/<session_dir>/ \
     --output-dir /tmp/analysis --dpi 200
+
+# Long session — subsample sensor + heartbeat rows every N
+python scripts/growth_profile_explorer.py \
+    logs/growths/<session_dir>/ --stride 4
+
+# PNGs only, skip HTML assembly
+python scripts/growth_profile_explorer.py \
+    logs/growths/<session_dir>/ --no-html
 ```
 
 ## Hardware (Bulbasaur lab PC)
