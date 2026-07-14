@@ -119,6 +119,29 @@ python growth_monitor_app.py
 # Top bar: enter Grower name + Sample ID → ARM → START
 ```
 
+## Post-hoc analysis tools
+
+Session directories under `logs/growths/` accumulate CSVs + frames as
+a session runs. These CLI scripts turn those artifacts into
+diagnostic charts and reports after the fact — no lab PC required.
+
+| Script | Output | Use |
+|---|---|---|
+| `scripts/plot_temperature.py` | Single T-vs-t PNG | Quick temperature-trace view of one session |
+| `scripts/growth_profile_explorer.py` | Multi-chart PNG set in `<session>/analysis/` | Fuller session review: T + std band + event overlays (commit / manual / auto). More charts land Days 5-6 (classifier trajectory, score distributions, HTML report) |
+| `scripts/validate_angle_robustness.py` | HTML report + CSV | Classifier sensitivity to camera-angle rotations against an archived session |
+
+```bash
+# Two-chart post-hoc explorer
+python scripts/growth_profile_explorer.py \
+    logs/growths/growth_Group-Test_20260710_161714/
+
+# Custom output directory + DPI
+python scripts/growth_profile_explorer.py \
+    logs/growths/<session_dir>/ \
+    --output-dir /tmp/analysis --dpi 200
+```
+
 ## Hardware (Bulbasaur lab PC)
 
 | Device | Connection | Notes |
