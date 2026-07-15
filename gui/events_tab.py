@@ -22,6 +22,34 @@ Current scope:
 Reconstruction-transition labeling (change_from / change_to) shipped
 Jul 15 2026 as two dropdowns in the labeling form. The default-hide-
 discarded filter remains deferred.
+
+Table of contents (search-friendly section labels — each group below
+is bracketed by ``# === <label> ===`` header comments):
+
+  UI SETUP           _build_ui, _build_master_pane, _build_detail_pane,
+                     _build_label_form
+  SESSION LIFECYCLE  attach_session
+  LIVE UPDATES       on_frame_captured (slot),
+                     on_decision_made (slot)
+  MASTER LIST I/O    _load_csv_rows, _refresh_unreviewed_badge,
+                     _add_event_row
+  DETAIL PANE        _set_placeholder, _show_detail_content,
+                     _on_selection_changed, _load_detail,
+                     _format_metadata, _display_frame_at
+  LABELING FORM      _populate_label_form, _on_primary_recon_activated,
+                     _on_change_from_activated, _on_change_to_activated,
+                     _on_notes_text_changed, _flush_notes_to_disk
+  CLASSIFIER + EQ    _default_ai_repo_root, _get_classifier,
+                     _on_classify_clicked, _on_open_equalizer,
+                     _make_equalizer_save_callback,
+                     _render_classifier_result
+
+File size discipline: 1100+ lines is at the upper end of what a single
+QWidget module should carry. Future additions to the labeling form or
+classifier surface should first consider splitting the labeling form
+into its own LabelingFormWidget (extracted from _build_label_form +
+_populate_label_form + the four _on_*_activated slots), keeping
+EventsTab as the master/detail orchestrator.
 """
 from __future__ import annotations
 
@@ -152,7 +180,9 @@ class EventsTab(QWidget):
             self._on_selection_changed,
         )
 
-    # --- UI ---------------------------------------------------------------
+    # =====================================================================
+    # === UI SETUP ===
+    # =====================================================================
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -398,7 +428,10 @@ class EventsTab(QWidget):
 
         return box
 
-    # --- Public API used by GrowthApp -------------------------------------
+    # =====================================================================
+    # === SESSION LIFECYCLE ===
+    # === (public API used by GrowthApp) ===
+    # =====================================================================
 
     def attach_session(self, growth_logger: Optional[GrowthLogger]) -> None:
         """Point the tab at the active session's logger and reload the list.
@@ -433,6 +466,11 @@ class EventsTab(QWidget):
         self._notes_save_timer.stop()
         self._set_placeholder("Select an event to view buffer frames.")
         self._load_csv_rows()
+
+    # =====================================================================
+    # === LIVE UPDATES ===
+    # === (slots wired by GrowthApp to AutoCaptureEngine + GrowthMonitor) ===
+    # =====================================================================
 
     @pyqtSlot(np.ndarray, float)
     def on_frame_captured(self, frame: np.ndarray, score: float) -> None:  # noqa: ARG002
@@ -489,7 +527,10 @@ class EventsTab(QWidget):
 
         self._refresh_unreviewed_badge()
 
-    # --- Internal ---------------------------------------------------------
+    # =====================================================================
+    # === MASTER LIST I/O ===
+    # === (CSV read → table population, badge recompute) ===
+    # =====================================================================
 
     def _load_csv_rows(self) -> None:
         """Append rows past the watermark from auto_capture_events.csv.
@@ -606,7 +647,10 @@ class EventsTab(QWidget):
         self.events_table.setItem(0, COL_TEMP, QTableWidgetItem(temp_str))
         self.events_table.setItem(0, COL_STATE, QTableWidgetItem(state))
 
-    # --- Detail pane ------------------------------------------------------
+    # =====================================================================
+    # === DETAIL PANE ===
+    # === (placeholder ↔ content, selection handling, image display) ===
+    # =====================================================================
 
     def _set_placeholder(self, text: str) -> None:
         """Show the placeholder copy and hide the image viewer."""
@@ -745,6 +789,11 @@ class EventsTab(QWidget):
             f"Event #{event_idx}  ·  {time_str}  ·  "
             f"score {score_str}  ·  {temp_str}  ·  {state}"
         )
+
+    # =====================================================================
+    # === LABELING FORM ===
+    # === (populate on select + atomic-per-change write slots) ===
+    # =====================================================================
 
     def _populate_label_form(self, event_idx: Optional[int]) -> None:
         """Pre-fill the labeling form from the cache for ``event_idx``.
@@ -918,7 +967,10 @@ class EventsTab(QWidget):
             self._classifier_result_label.setText("<i>not yet classified</i>")
             self._classifier_result_label.setStyleSheet("color: #888;")
 
-    # --- Experimental: Classifier2 integration ----------------------------
+    # =====================================================================
+    # === CLASSIFIER + EQUALIZER ===
+    # === (per-event classify button + Equalizer launcher for labeling) ===
+    # =====================================================================
 
     @staticmethod
     def _default_ai_repo_root() -> "Path":
