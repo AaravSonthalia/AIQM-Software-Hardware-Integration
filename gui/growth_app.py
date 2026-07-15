@@ -365,6 +365,13 @@ class GrowthApp(QMainWindow):
         # start (before any heartbeat has fired) just shows the "No
         # frames captured yet" placeholder until the grower hits Reload.
         self.monitor.scrubber_tab.attach_session(self.growth_log.session_dir)
+        # Turn on live auto-poll: the scrubber's 5s QTimer will pick
+        # up new heartbeat/manual/auto-capture rows without the
+        # grower having to hit ↻ Reload. The race guard inside
+        # scrubber_tab defers reloads if the grower is actively
+        # scrubbing, so background refresh doesn't yank playback
+        # position mid-drag. Turned off in _on_stop.
+        self.monitor.scrubber_tab.set_live_polling(True)
         # Reset the other two session-scoped tables (Sensor Log + Growth
         # Notes). Events tab handles its own reset inside attach_session.
         self.monitor.clear_session_tables()
@@ -422,6 +429,12 @@ class GrowthApp(QMainWindow):
         """End a growth session — save metadata, auto-export, stop logging."""
         self._sensor_log_timer.stop()
         self._heartbeat_timer.stop()
+
+        # Turn off scrubber live-polling — the session's CSVs will
+        # stop being appended to, so background reloads only waste
+        # cycles. Set BEFORE growth_log.end_session so the timer
+        # doesn't race with a partially-closed CSV.
+        self.monitor.scrubber_tab.set_live_polling(False)
 
         # Disarm auto-capture; engine state cleaned up so the next session
         # starts fresh in _on_start.

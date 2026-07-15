@@ -431,5 +431,99 @@ class ScrubberTabRegistrationTests(unittest.TestCase):
         self.assertTrue(hasattr(self.monitor, "scrubber_tab"))
 
 
+class AutoPollTests(unittest.TestCase):
+    """Locks the C4 (Day 8) live-polling behavior:
+
+      - Timer default OFF; set_live_polling(True/False) toggles
+      - Tick invokes _reload_index unless race guard fires
+      - Reload button label reflects state
+      - Recent user scrub defers the next auto-reload
+    """
+
+    def setUp(self):
+        from gui.scrubber_tab import ScrubberTab
+        self.tab = ScrubberTab()
+
+    def tearDown(self):
+        self.tab.deleteLater()
+
+    def test_auto_polling_disabled_at_construction(self):
+        # Fresh tab must not fire a QTimer — tests + standalone
+        # launches shouldn't be pounding _reload_index at 5s cadence
+        # before a session has been armed.
+        self.assertFalse(self.tab._live_polling)
+        self.assertFalse(self.tab._auto_poll_timer.isActive())
+
+    def test_set_live_polling_true_starts_timer(self):
+        self.tab.set_live_polling(True)
+        self.assertTrue(self.tab._live_polling)
+        self.assertTrue(self.tab._auto_poll_timer.isActive())
+        # Idempotent: calling True twice doesn't double-start.
+        self.tab.set_live_polling(True)
+        self.assertTrue(self.tab._auto_poll_timer.isActive())
+
+    def test_set_live_polling_false_stops_timer(self):
+        self.tab.set_live_polling(True)
+        self.tab.set_live_polling(False)
+        self.assertFalse(self.tab._live_polling)
+        self.assertFalse(self.tab._auto_poll_timer.isActive())
+
+    def test_tick_calls_reload_index(self):
+        # Mock _reload_index and drive the tick directly. QTimer
+        # asynchrony would make time-based tests flaky; instead
+        # invoke _on_auto_poll_tick and verify the code path.
+        call_count = {"n": 0}
+        orig_reload = self.tab._reload_index
+
+        def fake_reload():
+            call_count["n"] += 1
+        self.tab._reload_index = fake_reload
+        try:
+            self.tab._on_auto_poll_tick()
+        finally:
+            self.tab._reload_index = orig_reload
+        self.assertEqual(call_count["n"], 1)
+
+    def test_reload_btn_label_reflects_state(self):
+        default_text = self.tab._reload_btn.text()
+        self.assertNotIn("auto", default_text)
+        self.tab.set_live_polling(True)
+        self.assertIn("auto", self.tab._reload_btn.text())
+        self.tab.set_live_polling(False)
+        self.assertEqual(self.tab._reload_btn.text(), default_text)
+
+    def test_recent_user_scrub_defers_reload(self):
+        # Simulate the grower having dragged the slider "just now"
+        # (last interaction = current time). Race guard should kick
+        # in and skip the reload. Next tick fires the normal cadence
+        # later (not tested here — this is a pure guard-logic test).
+        import time as _time
+        call_count = {"n": 0}
+        orig_reload = self.tab._reload_index
+
+        def fake_reload():
+            call_count["n"] += 1
+        self.tab._reload_index = fake_reload
+        try:
+            self.tab._last_slider_interaction = _time.time()
+            self.tab._on_auto_poll_tick()
+        finally:
+            self.tab._reload_index = orig_reload
+        self.assertEqual(call_count["n"], 0)  # skipped
+
+        # And when the interaction is far enough in the past, the
+        # tick fires normally. Backdate by 2× the guard window.
+        self.tab._reload_index = fake_reload
+        try:
+            self.tab._last_slider_interaction = (
+                _time.time()
+                - 2 * self.tab.AUTO_POLL_RACE_GUARD_S
+            )
+            self.tab._on_auto_poll_tick()
+        finally:
+            self.tab._reload_index = orig_reload
+        self.assertEqual(call_count["n"], 1)  # fired
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

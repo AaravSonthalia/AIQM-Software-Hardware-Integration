@@ -27,8 +27,18 @@ v1 scope:
   - Reload button forces a re-read of the CSVs — used for live sessions
     where new frames land after the tab was attached.
 
+Live auto-poll (shipped Jul 22 2026 — Day 8 sprint):
+  - GrowthApp.on_start calls set_live_polling(True); on_stop calls
+    set_live_polling(False). Timer ticks every 5s and calls
+    _reload_index — same code path as the manual ↻ Reload button.
+  - Race guard: if the grower dragged the slider in the last 3s,
+    the tick is skipped so the auto-reload never yanks the
+    playback position out from under a scrubbing session.
+  - Reload button label appends " (auto)" while live-polling is
+    active to signal to the grower that manual Reload is
+    optional.
+
 Deferred to v2+:
-  - Live auto-poll (currently manual Reload button)
   - LRU frame cache (measure first, add if scrubbing feels laggy)
   - Play button with fps control
   - Filter by event source
@@ -42,10 +52,11 @@ UI thread beyond the currently-displayed frame.
 from __future__ import annotations
 
 import csv
+import time
 from pathlib import Path
 from typing import NamedTuple, Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget,
@@ -267,11 +278,31 @@ class ScrubberTab(QWidget):
     # the matching row").
     position_changed = pyqtSignal(int)
 
+    # Race-guard window: if the grower dragged the slider in the last
+    # N seconds, skip the next auto-poll tick. Keeps _reload_index
+    # from stealing the playback position mid-scrub. 3s is enough
+    # slack for a grower to think between drags without also
+    # blocking useful reloads.
+    AUTO_POLL_INTERVAL_MS: int = 5000
+    AUTO_POLL_RACE_GUARD_S: float = 3.0
+
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._session_dir: Optional[Path] = None
         self._index: list[FrameIndexEntry] = []
         self._current_pos: int = 0
+        # Live-polling state — flipped via set_live_polling(bool).
+        # Default False so tests + standalone launches don't start
+        # firing timers before a session is armed.
+        self._live_polling: bool = False
+        self._last_slider_interaction: float = 0.0
+        # QTimer is parented to self so Qt cleans it up on tab
+        # destruction; setSingleShot(False) means it re-fires each
+        # AUTO_POLL_INTERVAL_MS until stopped.
+        self._auto_poll_timer = QTimer(self)
+        self._auto_poll_timer.setInterval(self.AUTO_POLL_INTERVAL_MS)
+        self._auto_poll_timer.setSingleShot(False)
+        self._auto_poll_timer.timeout.connect(self._on_auto_poll_tick)
         self._build_ui()
 
     def _build_ui(self):
@@ -415,6 +446,15 @@ class ScrubberTab(QWidget):
     def _on_slider_changed(self, value: int):
         if value == self._current_pos:
             return
+        # Timestamp any user-driven position change so the auto-poll
+        # tick can back off during active scrubbing (see
+        # _on_auto_poll_tick + AUTO_POLL_RACE_GUARD_S). Programmatic
+        # position updates (attach_session, Prev/Next buttons) also
+        # go through here — the race guard is intentionally
+        # conservative, treating any position change as
+        # user-initiated. Cost: one skipped auto-reload after a
+        # Prev/Next click. Benefit: no false-positive scrub-stealing.
+        self._last_slider_interaction = time.time()
         self._current_pos = value
         self._display_frame(value)
         self.position_changed.emit(value)
@@ -428,6 +468,52 @@ class ScrubberTab(QWidget):
             self._slider.setValue(self._current_pos + 1)
 
     def _on_reload(self):
+        self._reload_index()
+
+    # ----- Live auto-poll --------------------------------------------------
+
+    def set_live_polling(self, enabled: bool) -> None:
+        """Turn the 5-second auto-reload timer on or off.
+
+        GrowthApp calls this from _on_start (True) and _on_stop
+        (False). Idempotent — calling True twice, or False on a
+        non-active timer, is a no-op. The reload button label
+        reflects state so the grower always sees whether background
+        refresh is active.
+        """
+        enabled = bool(enabled)
+        if enabled == self._live_polling:
+            return
+        self._live_polling = enabled
+        if enabled:
+            self._auto_poll_timer.start()
+            self._reload_btn.setText("↻ Reload (auto)")
+            self._reload_btn.setToolTip(
+                "Session is live-polling every "
+                f"{self.AUTO_POLL_INTERVAL_MS // 1000}s — the tab "
+                "picks up new frames automatically. Click to force "
+                "an immediate reload."
+            )
+        else:
+            self._auto_poll_timer.stop()
+            self._reload_btn.setText("↻ Reload")
+            self._reload_btn.setToolTip(
+                "Re-read the session CSVs to pick up frames that "
+                "landed after this tab was attached."
+            )
+
+    def _on_auto_poll_tick(self) -> None:
+        """Timer callback — reload the index unless the grower is scrubbing.
+
+        Race guard: if the last user slider interaction was less
+        than AUTO_POLL_RACE_GUARD_S ago, skip this tick to avoid
+        yanking the playback position out from under an active
+        drag. The next tick fires AUTO_POLL_INTERVAL_MS later and
+        will pick up any new frames that landed in the interim.
+        """
+        if (time.time() - self._last_slider_interaction
+                < self.AUTO_POLL_RACE_GUARD_S):
+            return
         self._reload_index()
 
     def _display_frame(self, pos: int):
