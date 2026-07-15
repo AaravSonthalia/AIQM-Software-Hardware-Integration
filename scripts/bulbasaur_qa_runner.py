@@ -371,6 +371,43 @@ VALIDATION_QUEUE: list[ValidationItem] = [
             "Multi-client safe (can run alongside MistralGui)."
         ),
     ),
+    # -- Research probes (Path B — kSA TEXT_CMD image export) ----------
+    ValidationItem(
+        id="jul15_ksa_textcmd_image_probes",
+        title="Path B — kSA TEXT_CMD image-export probes",
+        area="drivers",
+        shipped_ref=(
+            "docs/ksa_camera_research_findings.md (Jul 15 2026)"
+        ),
+        description=(
+            "Probe kSA's TEXT_CMD scripting language for image-export "
+            "commands. If any succeed, we have a concurrent-with-kSA "
+            "camera read path (VmbCamera's exclusive-lock constraint "
+            "goes away). See docs/ksa_camera_research_findings.md §Path B."
+        ),
+        steps=[
+            "kSA 400 must be running with acquisition open",
+            "In a Python shell:",
+            "  from drivers.ksa_comm import KsaCommClient",
+            "  with KsaCommClient() as c:",
+            "    for probe in ['save current image \"C:\\\\temp\\\\p.bmp\"',",
+            "                  'image save \"C:\\\\temp\\\\p2.bmp\"',",
+            "                  'roi save \"C:\\\\temp\\\\r.bmp\"',",
+            "                  'get_pixel_data 0 0 100 100',",
+            "                  'help', '?commands', 'roi list']:",
+            "        print(probe, '→', c.send_text(probe))",
+            "Note which probes succeed vs which return err != 0",
+            "For any success — verify the BMP landed on disk + "
+            "check its bit depth (should be 12-bit or 16-bit if "
+            "kSA preserves precision)",
+        ],
+        expected=(
+            "AT LEAST ONE probe succeeds with err=0. Success → "
+            "next-step: build KsaImageExporter driver mirroring "
+            "ScreenGrabCamera's poll-loop shape. Failure on ALL → "
+            "Path C (GigE multi-cast) becomes primary next avenue."
+        ),
+    ),
 ]
 
 
