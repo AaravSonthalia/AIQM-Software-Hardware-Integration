@@ -8,21 +8,28 @@ view? Or must we keep relying on screengrab?
 
 ## TL;DR
 
-The fundamental camera-lock constraint holds: **`VmbCamera` and
-kSA cannot both hold the Manta G-033B at the same time.** Three
-non-screengrab paths exist, each with a different cost:
+The fundamental camera-lock constraint holds for the **full-owner**
+mode: `VmbCamera` and kSA cannot both hold the Manta G-033B with
+`AccessMode.Full` at the same time. **But** — per Codex's Jul 16
+investigation — Allied Vision's VmbPy exposes `AccessMode.Read`,
+which is documented for passive frame reception while another app
+owns the camera. That's a fourth path.
 
 | Path | State | Blocker |
 |---|---|---|
-| A — VmbCamera direct (`vmbpy`) | ✅ Shipped (`drivers/rheed_camera.py::VmbCamera`) | Exclusive lock — can't run alongside kSA |
-| B — kSA TEXT_CMD image export | ❓ Unexplored | Need to probe kSA scripting language for `save current image` or `get frame` commands |
-| C — GigE multi-cast shared stream | ❓ Requires network reconfig | Camera XML shows `StreamCount=1`; Manta hardware supports multi-cast but the current lab config doesn't use it |
+| A — VmbCamera direct (`vmbpy`, `AccessMode.Full`) | ✅ Shipped (`drivers/rheed_camera.py::VmbCamera`) | Exclusive lock — can't run alongside kSA |
+| B — kSA TEXT_CMD image export | ❓ Unprobed | Need to probe kSA scripting for `save current image` etc. Probe script ready (`scripts/probe_ksa_image_export.py`). **Caveat: kSA advertises 8-bit or 10-bit programmable output — exported files may NOT preserve 12-bit precision** |
+| C — GigE multi-cast shared stream | ❓ Requires network reconfig | Camera XML shows `StreamCount=1`; Manta supports multi-cast but lab config doesn't |
+| **D — VmbPy `AccessMode.Read` coexistence** | ❓ Unprobed (Codex finding Jul 16) | Simpler than B or C if it works. Probe script ready (`scripts/probe_vimba_access_modes.py`). Allied Vision docs describe this as the passive-read/multicast path |
 
-**Recommendation:** Path B is the highest-value unexplored option
-because it doesn't require the grower to stop kSA. Path C is
-architecturally cleaner but requires network configuration changes
-on Bulbasaur that need coordination with lab IT. Path A is our
-current shipped fallback and stays.
+**Recommendation:** probe B and D in the same lab session
+(items #14 + #15 in the Bulbasaur QA runner queue). If either
+works, we have concurrent-with-kSA operation. Path A stays as
+the shipped fallback for dedicated AIQM sessions.
+
+**Related Codex artifacts** (in `test-codex/codex-mirrors/AIQM-Software-Hardware-Integration copy/docs/`):
+- `direct_camera_access_investigation.md` — Codex's parallel investigation with detailed outcome rules per probe
+- `ksa_camera_research_findings.md` — Codex's version of THIS doc; overlaps but includes the kSA 8-bit output finding + `AccessMode.Read` discovery this doc now incorporates
 
 ---
 
@@ -141,6 +148,55 @@ already polls kSA's own screen — polling a file is easier).
 
 ---
 
+## Path D — VmbPy `AccessMode.Read` (Codex discovery, Jul 16)
+
+Allied Vision's VmbPy documents a `Camera.set_access_mode(...)`
+API with `AccessMode.Read` as an explicit option. Per the VmbC
+docs, Read access is the passive frame reception mode intended
+for cases where another application (kSA in our case) already
+owns the camera as the primary controller.
+
+If this works, it's simpler than Path B (no vendor scripting
+language reverse engineering) and simpler than Path C (no
+network reconfig, no vendor coordination for kSA multi-cast
+support).
+
+**Codex has already scaffolded the probe.**
+
+```
+scripts/probe_vimba_access_modes.py --result-json <path>
+# inventory only — no camera open
+
+scripts/probe_vimba_access_modes.py \
+  --attempt-read-open --attempt-read-stream --duration-s 5 \
+  --result-json <path>
+# opens in Read mode, tries to receive frames for 5s
+```
+
+**Expected results by outcome:**
+
+- Read-mode opens + receives frames while kSA is running →
+  build a `VmbCameraReadOnly` driver that consumes frames the
+  same way `VmbCamera` does but with `AccessMode.Read`. Route
+  through the same worker + state machinery. Grower workflow
+  unchanged.
+- Read-mode opens but no frames arrive → passive read requires
+  the primary owner (kSA) to be configured for multi-cast
+  streaming. Escalates to a kSA vendor conversation.
+- Read-mode won't open at all → VmbPy install issue, or the
+  camera firmware doesn't support Read mode for this vendor
+  configuration.
+
+**Blocker:** none Mac-side. The probe script is ready; needs a
+Bulbasaur lab session with kSA running.
+
+**Related Codex investigation:** see
+`test-codex/.../docs/direct_camera_access_investigation.md`
+for detailed outcome rules per probe and the vendor questions
+Codex drafted for k-Space/Allied Vision.
+
+---
+
 ## Path C — GigE multi-cast (architectural)
 
 Manta G-033B is a GigE Vision camera and supports multi-cast mode:
@@ -180,17 +236,22 @@ operation is a hard requirement. Not the first thing to try.
 
 ---
 
-## Path A vs B vs C — decision matrix
+## Path A vs B vs C vs D — decision matrix
 
-| Criterion | Path A (VmbCamera) | Path B (TEXT_CMD) | Path C (multi-cast) |
-|---|---|---|---|
-| Works alongside kSA | ❌ No | ✅ Yes (probably) | ✅ Yes (with config) |
-| Full 12-bit precision | ✅ Yes | ❓ Unknown | ✅ Yes |
-| Requires vendor docs | ❌ No | ⚠️ Some | ⚠️ Yes |
-| Requires network admin | ❌ No | ❌ No | ✅ Yes |
-| Latency | Low (~10ms) | Medium (disk poll) | Low (~10ms) |
-| Effort to implement | ✅ Done | 1-2 days | 3-5 days |
-| Bulbasaur session cost | 0 | 30-45 min | 2-4 hours |
+| Criterion | A (Vmb Full) | B (TEXT_CMD) | C (multi-cast) | D (Vmb Read) |
+|---|---|---|---|---|
+| Works alongside kSA | ❌ No | ✅ Yes (probably) | ✅ Yes (with config) | ✅ Yes (per Allied Vision docs) |
+| Full 12-bit precision | ✅ Yes | ⚠️ No (kSA outputs 8 or 10-bit) | ✅ Yes | ✅ Yes (native SDK path) |
+| Requires vendor docs | ❌ No | ⚠️ Some | ⚠️ Yes | ✅ Standard Allied Vision docs |
+| Requires network admin | ❌ No | ❌ No | ✅ Yes | ❌ Probably not |
+| Latency | Low (~10ms) | Medium (disk poll) | Low (~10ms) | Low (~10ms) |
+| Effort to implement | ✅ Done | 1-2 days after probe | 3-5 days | 1 day after probe |
+| Bulbasaur session cost | 0 | 30-45 min | 2-4 hours | 30-45 min |
+| Probe script ready | ✅ N/A | ✅ `probe_ksa_image_export.py` | ❌ | ✅ `probe_vimba_access_modes.py` |
+
+**Path D leapfrogs B on precision** (full 12-bit vs kSA's 8/10-bit
+programmable output) IF the read-mode probe returns frames.
+Whichever probe hits green first at the next lab session wins.
 
 ---
 
@@ -198,22 +259,27 @@ operation is a hard requirement. Not the first thing to try.
 
 Ordered by expected ROI:
 
-1. **Add Path B probing to the Bulbasaur QA runner queue.** Item 14:
-   "Probe kSA TEXT_CMD for image-export commands (5 probe strings)."
-   30-45 min in-lab. Result determines whether Path B is viable.
+1. **Bulbasaur QA queue items #14 + #15.** Both probes run in the
+   same lab visit. ~1 hour combined. Result answers whether B or
+   D (or both) are viable.
 
-2. **Clone Jacques' new Mini-MBE repo** (per
-   `direct_read_research_jun23` memory) and grep for
-   `SaveImage` / `save current` / `pixel_data` / `image save` —
-   he may have already solved this and not told us. 15 min Mac-side.
+2. **Adopt Codex's `KsaImageExportCamera` stub** into
+   `drivers/rheed_camera.py` if Path B probe succeeds. Codex has
+   the stub in their mirror.
 
-3. **WebFetch kSA vendor docs** for the scripting language reference.
-   Look for image-related commands. May require account login to
-   kSA's customer portal.
+3. **Build `VmbCameraReadOnly`** if Path D probe succeeds.
+   Trivial refactor of `VmbCamera` — swap `AccessMode.Full` for
+   `AccessMode.Read` and skip the trigger commands.
 
-4. **If B fails, prototype C on a Mac-side dev cam** first — Manta
-   G-033B multi-cast can be tested without touching Bulbasaur if
-   we have any GigE camera on hand.
+4. **Clone Jacques' new Mini-MBE repo** (per
+   `direct_read_research_jun23` memory) if BOTH probes fail —
+   Jacques may have solved this with a different technique we
+   haven't considered. 15 min Mac-side.
+
+5. **k-Space vendor question** (Codex drafted the text) if paths
+   B, C, and D all fail: does kSA 400 expose the current live
+   RHEED image to another process while kSA owns an Allied
+   Vision GigE camera?
 
 ---
 

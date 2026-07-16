@@ -371,41 +371,86 @@ VALIDATION_QUEUE: list[ValidationItem] = [
             "Multi-client safe (can run alongside MistralGui)."
         ),
     ),
-    # -- Research probes (Path B — kSA TEXT_CMD image export) ----------
+    # -- Research probes (kSA + Vimba direct-read) ---------------------
     ValidationItem(
         id="jul15_ksa_textcmd_image_probes",
         title="Path B — kSA TEXT_CMD image-export probes",
         area="drivers",
         shipped_ref=(
-            "docs/ksa_camera_research_findings.md (Jul 15 2026)"
+            "scripts/probe_ksa_image_export.py "
+            "(Codex-authored, adopted Jul 16 2026)"
         ),
         description=(
             "Probe kSA's TEXT_CMD scripting language for image-export "
             "commands. If any succeed, we have a concurrent-with-kSA "
             "camera read path (VmbCamera's exclusive-lock constraint "
-            "goes away). See docs/ksa_camera_research_findings.md §Path B."
+            "goes away). See docs/ksa_camera_research_findings.md §Path B. "
+            "Caveat: kSA advertises 8-bit or 10-bit programmable data "
+            "output — exported files may NOT preserve full 12-bit "
+            "precision even if the command works."
         ),
         steps=[
-            "kSA 400 must be running with acquisition open",
-            "In a Python shell:",
-            "  from drivers.ksa_comm import KsaCommClient",
-            "  with KsaCommClient() as c:",
-            "    for probe in ['save current image \"C:\\\\temp\\\\p.bmp\"',",
-            "                  'image save \"C:\\\\temp\\\\p2.bmp\"',",
-            "                  'roi save \"C:\\\\temp\\\\r.bmp\"',",
-            "                  'get_pixel_data 0 0 100 100',",
-            "                  'help', '?commands', 'roi list']:",
-            "        print(probe, '→', c.send_text(probe))",
-            "Note which probes succeed vs which return err != 0",
-            "For any success — verify the BMP landed on disk + "
-            "check its bit depth (should be 12-bit or 16-bit if "
-            "kSA preserves precision)",
+            "kSA 400 must be running with acquisition open + a live "
+            "image visible",
+            "cd to the AIQM repo on Bulbasaur",
+            "python scripts/probe_ksa_image_export.py "
+            "--out-dir C:\\temp\\aiqm_ksa_probe "
+            "--result-json C:\\temp\\aiqm_ksa_probe\\result.json",
+            "Inspect result.json for per-probe: err code, reply text, "
+            "and whether an image file landed on disk",
+            "For any file that landed: check dtype + min/max +"
+            "observed bit depth (script includes this in the JSON)",
+            "If AIQM_KSA_EXPORT_COMMAND env var route is discovered, "
+            "note the working command template for the next step",
         ],
         expected=(
-            "AT LEAST ONE probe succeeds with err=0. Success → "
-            "next-step: build KsaImageExporter driver mirroring "
-            "ScreenGrabCamera's poll-loop shape. Failure on ALL → "
-            "Path C (GigE multi-cast) becomes primary next avenue."
+            "AT LEAST ONE probe succeeds with err=0 AND writes a "
+            "valid image. Success → next-step: wire KsaImageExporter "
+            "driver into rheed_camera.py (Codex has a stub). Failure "
+            "on ALL → move to item #15 (Path D: VmbPy AccessMode.Read)."
+        ),
+    ),
+    ValidationItem(
+        id="jul16_vimba_access_mode_probes",
+        title="Path D — VmbPy AccessMode.Read coexistence probes",
+        area="drivers",
+        shipped_ref=(
+            "scripts/probe_vimba_access_modes.py "
+            "(Codex-authored, adopted Jul 16 2026)"
+        ),
+        description=(
+            "Probe VmbPy's AccessMode.Read path — Allied Vision's "
+            "documented mode for passive frame reception while "
+            "another app owns the camera (kSA). If this works, "
+            "we have concurrent-with-kSA camera access without "
+            "needing kSA's scripting language OR GigE multi-cast "
+            "reconfig. See docs/ksa_camera_research_findings.md "
+            "§Path D. This is Codex's discovery from Jul 15-16 "
+            "investigation that AJ's yesterday research missed."
+        ),
+        steps=[
+            "PHASE 1 (kSA open, camera in kSA's control):",
+            "  python scripts/probe_vimba_access_modes.py "
+            "--result-json C:\\temp\\aiqm_vimba\\inventory.json",
+            "  Confirm VmbPy imports + camera visible",
+            "PHASE 2 (kSA still open):",
+            "  python scripts/probe_vimba_access_modes.py "
+            "--attempt-read-open --attempt-read-stream "
+            "--duration-s 5 "
+            "--result-json C:\\temp\\aiqm_vimba\\read.json",
+            "  Success = frames received without disrupting kSA",
+            "PHASE 3 (kSA CLOSED, diagnostic only):",
+            "  python scripts/probe_vimba_access_modes.py "
+            "--attempt-full-open --list-features "
+            "--result-json C:\\temp\\aiqm_vimba\\full.json",
+            "  Confirms baseline Vimba works in dedicated sessions",
+        ],
+        expected=(
+            "PHASE 1 must pass to proceed. PHASE 2 success = Path D "
+            "viable, we can build a VmbCameraReadOnly driver. "
+            "PHASE 2 opens but no frames → GigE multi-cast config "
+            "required (Path C). PHASE 3 always passes if Vimba "
+            "installed correctly."
         ),
     ),
 ]
