@@ -23,7 +23,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          cache: pip
+          # No cache: pip — that flag needs a requirements.txt or
+          # pyproject.toml in the repo to compute a cache key from,
+          # and we have neither (deps installed inline below). Cache
+          # miss on every run adds ~30s to pip install; acceptable
+          # for a 5-dep list. Revisit if we add requirements.txt.
 
       - name: Install Linux Qt runtime deps
         # PyQt6 offscreen platform needs libxkbcommon + libEGL on
