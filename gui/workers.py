@@ -7,25 +7,57 @@ from typing import Optional
 
 import numpy as np
 from PyQt6.QtCore import QMutex, QThread, pyqtSignal
-import pyvisa
 
 from gui.state import (
     CameraState, ClassifierState, EvapControlState, MistralState, PowerSupplyState,
     PyrometerState, TemperatureState,
 )
-from owon_power_supply import OWONPowerSupply
+
+# ---------------------------------------------------------------------------
+# Optional heater-control deps (pyvisa + owon_power_supply)
+# ---------------------------------------------------------------------------
+# These are used ONLY by PowerSupplyWorker (the OWON PSU driver for the
+# separate Heater Control Dashboard). Making them optional here means
+# importing gui.workers stays cheap on machines that don't have pyvisa
+# or the owon_power_supply local module — Bulbasaur's Growth Monitor,
+# CI runners, and any Mac dev workflow that doesn't touch the heater
+# dashboard. PowerSupplyWorker guards its actual usage below by
+# checking these for None.
+try:
+    import pyvisa  # noqa: F401
+except ImportError:  # pragma: no cover — env-specific
+    pyvisa = None  # type: ignore[assignment]
+
+try:
+    from owon_power_supply import OWONPowerSupply
+except ImportError:  # pragma: no cover — env-specific
+    OWONPowerSupply = None  # type: ignore[assignment]
 
 
 class PowerSupplyWorker(QThread):
-    """Background thread for power supply communication."""
+    """Background thread for power supply communication.
+
+    Requires the ``pyvisa`` package + the ``owon_power_supply`` local
+    module. Both are guarded at module import (see top of file); if
+    either is unavailable, this worker cannot be instantiated and
+    raises ``ImportError`` at ``__init__`` time. Growth Monitor never
+    constructs this class — it's used by the separate Heater Control
+    Dashboard.
+    """
 
     state_updated = pyqtSignal(PowerSupplyState)
 
     def __init__(self, resource: str, poll_interval: float = 0.5):
+        if pyvisa is None or OWONPowerSupply is None:
+            raise ImportError(
+                "PowerSupplyWorker requires pyvisa + owon_power_supply. "
+                "Install pyvisa (`pip install pyvisa`) and make sure "
+                "owon_power_supply.py is on PYTHONPATH."
+            )
         super().__init__()
         self.resource = resource
         self.poll_interval = poll_interval
-        self.psu: Optional[OWONPowerSupply] = None
+        self.psu = None
         # Set in __init__ (not run()) to close the stop()-before-run
         # race — if stop() fires between start() and the first line of
         # run(), it must not be undone by a re-assignment. See
