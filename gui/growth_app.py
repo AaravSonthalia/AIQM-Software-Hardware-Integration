@@ -94,21 +94,38 @@ def resolve_workspace_folder(folder: str | Path) -> Path:
     return path
 
 
+# Known AI_for_quantum clone locations, in preference order. Kept in
+# sync with EventsTab._KNOWN_AI_REPO_ROOTS in gui/events_tab.py — if
+# a third caller shows up, move both to a shared module.
+_KNOWN_AI_REPO_ROOTS = [
+    # Bulbasaur (O-MBE)
+    r"C:\Users\Lab10\AI_for_quantum",
+    # Ch-MBE (Omicron chalcogenide MBE) — added 2026-07-21
+    r"C:\Users\Omicron\AI_for_quantum",
+    # AJ's Mac dev clone
+    "/Users/aj/test-claude/projects/ai-for-quantum",
+]
+
+
 def _resolve_ai_repo_root() -> str:
     """Find the AI_for_quantum repo path for ClassifierBridge.
 
-    Matches ``gui/events_tab.py::_default_ai_repo_root`` — precedence:
-    ``AI_REPO_ROOT`` env var → Bulbasaur default (Windows) → Mac default.
-    Duplicated here rather than shared because the two callers otherwise
-    have no other coupling; move to a shared module if a third caller
-    appears.
+    Precedence:
+      1. ``AI_REPO_ROOT`` env var — per-machine escape hatch
+      2. First existing path from ``_KNOWN_AI_REPO_ROOTS``
+      3. First entry as fallback (error message will point at a concrete
+         path we tried)
+
+    Kept in sync with ``gui/events_tab.py::_default_ai_repo_root``.
     """
     env = os.environ.get("AI_REPO_ROOT")
     if env:
         return env
-    if sys.platform == "win32":
-        return r"C:\Users\Lab10\AI_for_quantum"
-    return "/Users/aj/test-claude/projects/ai-for-quantum"
+    from pathlib import Path
+    for candidate in _KNOWN_AI_REPO_ROOTS:
+        if Path(candidate).exists():
+            return candidate
+    return _KNOWN_AI_REPO_ROOTS[0]
 
 
 class GrowthApp(QMainWindow):
