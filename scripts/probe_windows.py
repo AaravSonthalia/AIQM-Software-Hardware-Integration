@@ -24,6 +24,15 @@ import time
 from contextlib import redirect_stdout
 from pathlib import Path
 
+# Ensure repo root on path so we can share the argtypes fix that
+# drivers/ocr.py already applies — otherwise 64-bit Windows HWND values
+# fail with OverflowError on IsWindowVisible / GetWindowTextLengthW.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from drivers.ocr import configure_user32_argtypes  # noqa: E402
+configure_user32_argtypes()
+
 OUT_DIR = (
     Path(__file__).resolve().parent.parent
     / "probe_output"
@@ -33,6 +42,8 @@ OUT_DIR = (
 TARGETS: dict[str, list[str]] = {
     "mistral": ["mistral"],
     "evap_control": ["evaporation control", "evap control"],
+    "ksa": ["ksa", "avt manta", "live video"],
+    "temperasure": ["temperasure", "basf"],
 }
 
 
