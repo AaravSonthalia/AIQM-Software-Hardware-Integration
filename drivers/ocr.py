@@ -22,6 +22,49 @@ TESSERACT_PATHS = [
     r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
 ]
 
+
+def configure_user32_argtypes() -> None:
+    """Declare argtypes/restype for the user32 functions we call.
+
+    64-bit-safety: without explicit argtypes, ctypes defaults to C int
+    (32-bit signed) for HWND arguments. HWND values on 64-bit Windows
+    commonly exceed 2^31-1, so passing an HWND to IsWindowVisible /
+    GetWindowRect / etc. raises ``OverflowError: int too long to
+    convert``. Surfaced on Ch-MBE 2026-07-21; never bit Bulbasaur only
+    because its HWNDs happened to fit in 32-bit range.
+
+    Idempotent — safe to call from multiple modules on every import.
+    No-op on non-Windows platforms so imports on Mac/Linux dev machines
+    stay clean.
+    """
+    if sys.platform != "win32":
+        return
+    user32 = ctypes.windll.user32
+    user32.IsWindowVisible.argtypes = [ctypes.wintypes.HWND]
+    user32.IsWindowVisible.restype = ctypes.wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [ctypes.wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [
+        ctypes.wintypes.HWND, ctypes.wintypes.LPWSTR, ctypes.c_int,
+    ]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [
+        ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.RECT),
+    ]
+    user32.GetWindowRect.restype = ctypes.wintypes.BOOL
+    user32.ShowWindow.argtypes = [ctypes.wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = ctypes.wintypes.BOOL
+    user32.SetWindowPos.argtypes = [
+        ctypes.wintypes.HWND, ctypes.wintypes.HWND,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    user32.SetWindowPos.restype = ctypes.wintypes.BOOL
+
+
+# Run at import time — one-shot configuration for the process.
+configure_user32_argtypes()
+
 # Set AIQM_OCR_DEBUG=1 to print raw OCR output to stderr on every read AND
 # save each crop PNG to logs/ocr_debug/. Use for diagnosing wrong/blank
 # pressure or V/I readings — the saved crops give a per-call corpus you

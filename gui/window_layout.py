@@ -30,6 +30,14 @@ import sys
 from dataclasses import dataclass
 from typing import Optional
 
+from drivers.ocr import configure_user32_argtypes
+
+# Ensure user32 argtypes are declared for 64-bit HWND safety before we
+# make any calls. See drivers.ocr.configure_user32_argtypes for the full
+# story — Ch-MBE 2026-07-21 surfaced the OverflowError this prevents.
+# Idempotent; safe to call on every import of this module.
+configure_user32_argtypes()
+
 log = logging.getLogger(__name__)
 
 
