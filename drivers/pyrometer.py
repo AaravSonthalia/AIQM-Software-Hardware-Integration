@@ -353,22 +353,56 @@ class ScreenGrabPyrometer(TemperatureSensor):
     Uses pywinauto (Windows only) to find the TemperaSure window, locate
     ToolBar2, and extract the temperature from its Edit control.
 
-    Two window title variants:
-      - Oxide MBE:       'BASF TemperaSure 5.7.0.4 Advanced Mode'
-      - Chalcogenide MBE: 'BASF TemperaSure 5.7.0.4'
+    Auto-detects the correct window title across lab machines by trying
+    ``KNOWN_WINDOW_TITLES`` in order. Extend the list as we onboard new
+    machines rather than requiring each site to override the title.
+
+    Currently known titles:
+      - Bulbasaur (Oxide MBE): 'BASF TemperaSure 5.7.0.4 Advanced Mode'
+      - Ch-MBE (Chalcogenide): 'BASF TemperaSure 5.7.0.4'
+
+    Env var ``AIQM_TEMPERASURE_TITLE`` overrides auto-detection when
+    set — per-machine escape hatch. Explicit ``window_title`` argument
+    still overrides everything (backward-compatible with existing tests).
     """
+
+    # Preference order for auto-detection. Same pattern as
+    # ElogReader.KNOWN_LOG_DIRS + _KNOWN_AI_REPO_ROOTS in growth_app /
+    # events_tab. Add new machines here.
+    KNOWN_WINDOW_TITLES = [
+        "BASF TemperaSure 5.7.0.4 Advanced Mode",  # Bulbasaur (Oxide MBE)
+        "BASF TemperaSure 5.7.0.4",                # Ch-MBE (added 2026-07-21)
+    ]
 
     def __init__(
         self,
-        window_title: str = "BASF TemperaSure 5.7.0.4 Advanced Mode",
+        window_title: Optional[str] = None,
         exe_path: Optional[str] = None,
         auto_start: bool = False,
     ):
+        # None sentinel = auto-detect at connect time. Explicit string
+        # bypasses auto-detection (backward compat with test callers that
+        # pass a specific title).
         self._window_title = window_title
         self._exe_path = exe_path
         self._auto_start = auto_start
         self._app = None
         self._connected = False
+
+    @classmethod
+    def _candidate_titles(cls, explicit: Optional[str]) -> list[str]:
+        """Ordered list of titles to try when connecting.
+
+        Precedence: explicit arg → AIQM_TEMPERASURE_TITLE env var →
+        KNOWN_WINDOW_TITLES in list order.
+        """
+        if explicit is not None:
+            return [explicit]
+        import os
+        env = os.environ.get("AIQM_TEMPERASURE_TITLE", "").strip()
+        if env:
+            return [env]
+        return list(cls.KNOWN_WINDOW_TITLES)
 
     def connect(self) -> None:
         try:
@@ -378,18 +412,32 @@ class ScreenGrabPyrometer(TemperatureSensor):
                 "pywinauto not installed (Windows only): pip install pywinauto"
             )
 
+        candidates = self._candidate_titles(self._window_title)
+
         if self._auto_start and self._exe_path:
+            # auto_start path — use the first candidate as the title
+            # to launch/kill against. Not iterated because launching
+            # requires a single canonical title.
+            self._window_title = candidates[0]
             self._app = self._start_temperasure(Application)
         else:
-            # Connect to existing TemperaSure window
-            try:
-                self._app = Application(backend="uia").connect(
-                    title=self._window_title
-                )
-            except Exception as e:
+            # Connect to existing TemperaSure window — try each candidate
+            # in order; use the first that succeeds. If all fail, raise
+            # with the full list so the operator knows what we tried.
+            last_error: Optional[Exception] = None
+            for title in candidates:
+                try:
+                    self._app = Application(backend="uia").connect(title=title)
+                    self._window_title = title  # remember which one worked
+                    break
+                except Exception as e:
+                    last_error = e
+                    continue
+            else:
+                # Every candidate failed
                 raise RuntimeError(
-                    f"Could not connect to TemperaSure window "
-                    f"'{self._window_title}': {e}"
+                    f"Could not connect to TemperaSure. Tried titles "
+                    f"{candidates!r}. Last error: {last_error}"
                 )
 
         self._connected = True
