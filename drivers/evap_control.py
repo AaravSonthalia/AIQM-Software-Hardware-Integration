@@ -17,6 +17,7 @@ sessions where the .elo file is unreachable.
 
 import logging
 import math
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -169,10 +170,43 @@ class ElogReader:
     the next ``read()``.
     """
 
-    DEFAULT_LOG_DIR = (
+    # Known EvapControl log directory paths, in preference order.
+    # Ships as a list because different lab machines install EvapControl at
+    # different paths — the Bulbasaur O-MBE has a Scienta-managed install
+    # with a doubly-nested version dir under _Omicron_Software; the Ch-MBE
+    # (Omicron) has a flat install at C:\evap_control_<version>\.
+    # Resolution: check AIQM_EVAP_LOG_DIR env var first, then the first
+    # entry from this list that actually exists. Extend as we onboard new
+    # machines rather than forcing each site to set an env var.
+    KNOWN_LOG_DIRS = [
+        # Bulbasaur (O-MBE), evap_control 1.2.0.51 nested install
         r"C:\_Omicron_Software\EvapControl\evap_control_1.2.0.51"
-        r"\evap_control_1.2.0.51\log"
-    )
+        r"\evap_control_1.2.0.51\log",
+        # Ch-MBE, evap_control 1.2.0.48 flat install
+        r"C:\evap_control_1.2.0.48\log",
+    ]
+
+    # Kept for backward compatibility with any external callers that
+    # reference DEFAULT_LOG_DIR. New code should call _resolve_log_dir().
+    DEFAULT_LOG_DIR = KNOWN_LOG_DIRS[0]
+
+    @classmethod
+    def _resolve_log_dir(cls) -> str:
+        """Find the EvapControl log dir on this machine.
+
+        Precedence:
+          1. ``AIQM_EVAP_LOG_DIR`` env var — per-machine escape hatch
+          2. First existing dir from ``KNOWN_LOG_DIRS``
+          3. First entry of ``KNOWN_LOG_DIRS`` (fallback so the eventual
+             error message points at *some* concrete path we tried)
+        """
+        env = os.environ.get("AIQM_EVAP_LOG_DIR", "").strip()
+        if env:
+            return env
+        for candidate in cls.KNOWN_LOG_DIRS:
+            if Path(candidate).exists():
+                return candidate
+        return cls.KNOWN_LOG_DIRS[0]
 
     # elog variable name → EvapControlState field name (also the dict
     # key returned by ``read()``). Edit this to expose more growth state
@@ -202,7 +236,7 @@ class ElogReader:
         log_dir: Optional[str] = None,
         var_map: Optional[dict[str, str]] = None,
     ):
-        self._log_dir = log_dir or self.DEFAULT_LOG_DIR
+        self._log_dir = log_dir or self._resolve_log_dir()
         self._var_map = var_map or self.DEFAULT_VAR_MAP
         self._connected = False
         self._last_log_path: Optional[Path] = None
