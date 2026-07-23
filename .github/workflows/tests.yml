@@ -68,7 +68,7 @@ jobs:
             test_ksa_comm.py test_mistral_jsonrpc.py
             test_mistral_jsonrpc_discovery.py test_ocr.py
             test_confirm_event_plateau_shift.py test_elog.py
-            test_elog_synthetic.py
+            test_elog_synthetic.py test_ads_read.py
         # File-by-file loop matches the local run pattern. Fail-fast
         # off so a single flake doesn't hide other failures in the
         # report.
