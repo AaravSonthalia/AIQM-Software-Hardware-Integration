@@ -1,0 +1,7 @@
+PyQt6
+numpy
+matplotlib
+scikit-learn
+Pillow
+# Windows-only (Ch-MBE Beckhoff TwinCAT ADS direct-read):
+# pyads

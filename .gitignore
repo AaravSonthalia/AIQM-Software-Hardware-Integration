@@ -17,6 +17,9 @@ logs/
 # OCR debug crops (set by AIQM_OCR_DEBUG=1, scoped under logs/ but explicit)
 logs/ocr_debug/
 
+# Test runner cache
+.pytest_cache/
+
 # Local-only build outputs
 *.egg-info/
 dist/
