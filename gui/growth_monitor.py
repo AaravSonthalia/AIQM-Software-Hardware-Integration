@@ -979,7 +979,7 @@ class GrowthMonitor(QWidget):
         # before running the discovery probe on Bulbasaur produces a
         # connected driver with all-None V/I readings (read_config empty)
         # — no crashes, just no data until set_read_config populates methods.
-        self.config_mistral_mode.addItems(["dummy", "screengrab", "jsonrpc"])
+        self.config_mistral_mode.addItems(["dummy", "screengrab", "jsonrpc", "ads"])
         self.config_mistral_mode.setCurrentText("screengrab")
         config_form.addRow("MISTRAL mode:", self.config_mistral_mode)
 

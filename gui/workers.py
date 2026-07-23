@@ -558,6 +558,17 @@ class MistralWorker(QThread):
             # replaces MistralGui as the primary path.
             from drivers.mistral_jsonrpc import MistralJsonRpcClient
             return MistralJsonRpcClient()
+        elif self.mode == "ads":
+            # Beckhoff TwinCAT ADS direct-read — Ch-MBE only.
+            # Discovered Jul 22 2026: MistralGui on Ch-MBE is an ADS client
+            # to a Beckhoff PLC (not the Kestrel JSON-RPC backend that
+            # Bulbasaur uses). pyads reads Cell1-7 T/V/I via two ports
+            # (851 = main PLC, 852 = PID program). v_actual = Cell1_V
+            # (manipulator); i_actual = Cell1_I. v_set / i_set = None
+            # (ADS exposes temperature setpoints, not V/I setpoints).
+            # READ ONLY — write_by_name is never called.
+            from drivers.mistral_ads import MistralAdsClient
+            return MistralAdsClient()
         else:
             from drivers.mistral import DummyMistralGui
             return DummyMistralGui()
