@@ -522,6 +522,10 @@ class MistralWorker(QThread):
                 state.v_actual = vals.get("v_actual")
                 state.i_set = vals.get("i_set")
                 state.i_actual = vals.get("i_actual")
+                # ads_cells: full extended read() dict when mode="ads"
+                # (Ch-MBE Beckhoff TwinCAT ADS). Includes cell{1..7}_T,
+                # ion gauge pressure, turbo RPM, etc. None in other modes.
+                state.ads_cells = vals if self.mode == "ads" else None
                 state.connected = True
                 state.error = ""
             except Exception as e:

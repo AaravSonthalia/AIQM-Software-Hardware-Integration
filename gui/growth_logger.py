@@ -46,6 +46,11 @@ class GrowthLogger:
         "cell_HTEC2_pv_C",
         "cell_Y_pv_C", "cell_Sr_pv_C", "cell_Eu_pv_C", "cell_Er_pv_C",
         "plasma_dc_bias_V", "plasma_forward_W", "plasma_reflected_W",
+        # ADS-mode cell temperatures (Ch-MBE, mode="ads"). Empty in O-MBE
+        # sessions (MistralState.ads_cells is None). Cell1–7 map to the
+        # Beckhoff PLC's PIDProgram.Cell{i}_pidTDK.ActualTemperature.
+        "cell1_T_C", "cell2_T_C", "cell3_T_C", "cell4_T_C",
+        "cell5_T_C", "cell6_T_C", "cell7_T_C",
     ]
     COMMIT_FIELDS = [
         "timestamp", "time_display", "elapsed_s", "sample_id", "grower",
@@ -304,6 +309,9 @@ class GrowthLogger:
         cell_Eu_pv_C=None, cell_Er_pv_C=None,
         plasma_dc_bias_V=None, plasma_forward_W=None,
         plasma_reflected_W=None,
+        # ADS-mode extensions (Jul 23 2026 — MistralWorker mode="ads").
+        # Full read() dict from MistralAdsClient; None in O-MBE sessions.
+        ads_cells=None,
     ):
         """Append a row to sensor_log.csv. All values may be None.
 
@@ -348,6 +356,13 @@ class GrowthLogger:
             "plasma_dc_bias_V":   _f(plasma_dc_bias_V, 1),
             "plasma_forward_W":   _f(plasma_forward_W, 1),
             "plasma_reflected_W": _f(plasma_reflected_W, 1),
+            # ADS cell temps — populated from ads_cells dict when mode="ads"
+            **{
+                f"cell{i}_T_C": _f(
+                    ads_cells.get(f"cell{i}_T") if ads_cells else None, 1
+                )
+                for i in range(1, 8)
+            },
         })
         self._sensor_file.flush()
 

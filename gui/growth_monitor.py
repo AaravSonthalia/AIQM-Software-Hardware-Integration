@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from drivers.config import MBESystemConfig, get_active_config
+
 import numpy as np
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -333,8 +335,9 @@ class GrowthMonitor(QWidget):
     # auto_capture_events.csv via GrowthLogger.update_auto_capture_state.
     auto_capture_decision = pyqtSignal(int, str, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, config: Optional[MBESystemConfig] = None):
         super().__init__(parent)
+        self._cfg: MBESystemConfig = config if config is not None else get_active_config()
         self.setStyleSheet(DARK_STYLESHEET)
 
         self._state = "idle"  # idle | armed | running
@@ -768,21 +771,17 @@ class GrowthMonitor(QWidget):
             substrate_layout.addWidget(d)
         layout.addWidget(substrate_group)
 
-        # --- Effusion cells section (5 cells; see DEFAULT_VAR_MAP) ---
+        # --- Effusion cells section (count and labels from chamber config) ---
         cells_group = QGroupBox("Effusion cells")
         cells_layout = QHBoxLayout(cells_group)
-        self.cell_HTEC2_display = ValueDisplay("HTEC2", "°C", 1)
-        self.cell_Y_display = ValueDisplay("Y (Yttrium)", "°C", 1)
-        self.cell_Sr_display = ValueDisplay("Sr", "°C", 1)
-        self.cell_Eu_display = ValueDisplay("Eu", "°C", 1)
-        self.cell_Er_display = ValueDisplay("Er", "°C", 1)
-        for d in (
-            self.cell_HTEC2_display, self.cell_Y_display,
-            self.cell_Sr_display, self.cell_Eu_display,
-            self.cell_Er_display,
-        ):
+        # self._cell_displays[i] corresponds to self._cfg.cell_display[i].
+        # O-MBE: 5 elog-sourced cells; Ch-MBE: 7 ADS-sourced cells.
+        self._cell_displays: list = []
+        for cell_def in self._cfg.cell_display:
+            d = ValueDisplay(cell_def["label"], "°C", 1)
             d.setStyleSheet(_field_style)
             cells_layout.addWidget(d)
+            self._cell_displays.append(d)
         layout.addWidget(cells_group)
 
         # --- Plasma section: hidden by default; revealed when any
@@ -980,7 +979,7 @@ class GrowthMonitor(QWidget):
         # connected driver with all-None V/I readings (read_config empty)
         # — no crashes, just no data until set_read_config populates methods.
         self.config_mistral_mode.addItems(["dummy", "screengrab", "jsonrpc", "ads"])
-        self.config_mistral_mode.setCurrentText("screengrab")
+        self.config_mistral_mode.setCurrentText(self._cfg.mistral_mode_default)
         config_form.addRow("MISTRAL mode:", self.config_mistral_mode)
 
         self.config_evap_mode = QComboBox()
@@ -1002,7 +1001,7 @@ class GrowthMonitor(QWidget):
         # dropdown back to "screengrab" for OCR fallback. Auto-
         # fallback deferred (memory Jul 9 open question #1).
         self.config_evap_mode.addItems(["dummy", "elog", "screengrab"])
-        self.config_evap_mode.setCurrentText("elog")
+        self.config_evap_mode.setCurrentText(self._cfg.evap_mode_default)
         config_form.addRow("Evap Control mode:", self.config_evap_mode)
 
         # Enable/disable the live classifier. Off = classifier worker
@@ -1282,6 +1281,17 @@ class GrowthMonitor(QWidget):
             self.current_display.set_value(state.i_actual)
         else:
             self.current_display.value.setText("---")
+        # ADS extended cell temps (Ch-MBE mode="ads").
+        # Overrides the elog-based update in update_evap_state() for cells
+        # whose state_field is None (all Ch-MBE cells). No-op on O-MBE
+        # where ads_cells is None.
+        if state.ads_cells:
+            for i, display in enumerate(self._cell_displays, start=1):
+                t = state.ads_cells.get(f"cell{i}_T")
+                if t is None:
+                    display.value.setText("---")
+                else:
+                    display.set_value(t)
 
     def update_evap_state(self, state: EvapControlState):
         self._latest_evap = state
@@ -1303,21 +1313,21 @@ class GrowthMonitor(QWidget):
         # mode with the variable absent from the elog schema), same
         # "---".
         connected = state.connected
+        # Cell displays: driven by EvapControlState fields when state_field
+        # is set (O-MBE elog path). Ch-MBE cells have state_field=None and
+        # are updated from ads_cells in update_mistral_state() instead.
+        for display, cell_def in zip(self._cell_displays, self._cfg.cell_display):
+            sf = cell_def.get("state_field")
+            val = getattr(state, sf, None) if (sf and connected) else None
+            if val is None:
+                display.value.setText("---")
+            else:
+                display.set_value(val)
         for display, value in (
             (self.substrate_pv_display,
              state.substrate_temp_pv_C if connected else None),
             (self.substrate_sp_display,
              state.substrate_temp_setpoint_C if connected else None),
-            (self.cell_HTEC2_display,
-             state.cell_HTEC2_pv_C if connected else None),
-            (self.cell_Y_display,
-             state.cell_Y_pv_C if connected else None),
-            (self.cell_Sr_display,
-             state.cell_Sr_pv_C if connected else None),
-            (self.cell_Eu_display,
-             state.cell_Eu_pv_C if connected else None),
-            (self.cell_Er_display,
-             state.cell_Er_pv_C if connected else None),
             (self.plasma_dc_display,
              state.plasma_dc_bias_V if connected else None),
             (self.plasma_fwd_display,
@@ -2204,12 +2214,11 @@ class GrowthMonitor(QWidget):
         # Direct-read tab: all fields back to "---", plasma section hidden.
         for d in (
             self.substrate_pv_display, self.substrate_sp_display,
-            self.cell_HTEC2_display, self.cell_Y_display,
-            self.cell_Sr_display, self.cell_Eu_display,
-            self.cell_Er_display,
             self.plasma_dc_display, self.plasma_fwd_display,
             self.plasma_rfl_display,
         ):
+            d.value.setText("---")
+        for d in self._cell_displays:
             d.value.setText("---")
         self.plasma_group.setVisible(False)
         self.rheed_image_label.clear()

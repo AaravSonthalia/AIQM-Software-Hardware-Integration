@@ -133,7 +133,9 @@ class GrowthApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OMBE Growth Monitor")
+        from drivers.config import get_active_config
+        self._chamber_config = get_active_config()
+        self.setWindowTitle(f"{self._chamber_config.name} Growth Monitor")
         self.setMinimumSize(1000, 700)
 
         self.camera_worker: Optional[RheedCameraWorker] = None
@@ -197,8 +199,9 @@ class GrowthApp(QMainWindow):
         self._last_v_set: Optional[float] = None
         self._last_i_set: Optional[float] = None
 
-        # Central widget
-        self.monitor = GrowthMonitor()
+        # Central widget — pass chamber config so the monitor can set
+        # cell display labels and driver mode defaults from it.
+        self.monitor = GrowthMonitor(config=self._chamber_config)
         self.setCentralWidget(self.monitor)
 
         # Connect monitor signals → app handlers
@@ -731,6 +734,7 @@ class GrowthApp(QMainWindow):
         e = self.monitor._latest_evap
         mistral_ok = m is not None and m.connected
         evap_ok = e is not None and e.connected
+        ads_cells = m.ads_cells if mistral_ok else None
         self.growth_log.log_sensors(
             pyro_temp,
             self.monitor.get_elapsed_seconds(),
@@ -759,6 +763,7 @@ class GrowthApp(QMainWindow):
             plasma_dc_bias_V=e.plasma_dc_bias_V if evap_ok else None,
             plasma_forward_W=e.plasma_forward_W if evap_ok else None,
             plasma_reflected_W=e.plasma_reflected_W if evap_ok else None,
+            ads_cells=ads_cells,
         )
 
         from datetime import datetime

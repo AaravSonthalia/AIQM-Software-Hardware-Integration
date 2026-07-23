@@ -80,7 +80,13 @@ class MistralState:
     i_actual: Optional[float] = None
     connected: bool = False
     error: str = ""
-    mode: str = ""  # "screengrab" or "dummy"
+    mode: str = ""  # "screengrab", "jsonrpc", "ads", or "dummy"
+    # Populated by MistralWorker when mode="ads" (Beckhoff TwinCAT ADS,
+    # Ch-MBE only). Full read() output from MistralAdsClient — superset
+    # of the 4 standard keys. Keys include cell{1..7}_T/V/I/power/state/
+    # shutter_open/shutter_closed, ebvm_*, ion_gauge_*_P, pirani_*_P,
+    # turbo*_rpm, service_mode. None in all other modes.
+    ads_cells: Optional[dict] = None
 
 
 @dataclass
