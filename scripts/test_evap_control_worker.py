@@ -76,20 +76,17 @@ def _make_evap_state(
 
 
 def _all_direct_read_displays(monitor: GrowthMonitor):
-    """The 10 direct-read ValueDisplay widgets on the Direct-read tab.
+    """The direct-read ValueDisplay widgets on the Direct-read tab.
 
-    Kept as a helper so a schema addition only requires updating this
-    list plus ``_build_direct_read_tab`` — tests that iterate over "all
-    direct-read displays" automatically pick up new fields.
+    Kept as a helper so tests that iterate over "all direct-read displays"
+    automatically pick up new fields. Cell widgets live in
+    ``monitor._cell_displays`` (built from config) so adding/removing
+    cells only requires updating ``_build_direct_read_tab``, not this list.
     """
     return (
         monitor.substrate_pv_display,
         monitor.substrate_sp_display,
-        monitor.cell_HTEC2_display,
-        monitor.cell_Y_display,
-        monitor.cell_Sr_display,
-        monitor.cell_Eu_display,
-        monitor.cell_Er_display,
+        *monitor._cell_displays,
         monitor.plasma_dc_display,
         monitor.plasma_fwd_display,
         monitor.plasma_rfl_display,
@@ -228,22 +225,10 @@ class DirectReadTabTests(unittest.TestCase):
         self.assertEqual(
             self.monitor.substrate_sp_display.value.text(), "725.0 °C",
         )
-        # Cells
-        self.assertEqual(
-            self.monitor.cell_HTEC2_display.value.text(), "425.0 °C",
-        )
-        self.assertEqual(
-            self.monitor.cell_Y_display.value.text(), "632.1 °C",
-        )
-        self.assertEqual(
-            self.monitor.cell_Sr_display.value.text(), "550.3 °C",
-        )
-        self.assertEqual(
-            self.monitor.cell_Eu_display.value.text(), "580.7 °C",
-        )
-        self.assertEqual(
-            self.monitor.cell_Er_display.value.text(), "610.2 °C",
-        )
+        # Cells — order matches OXIDE_MBE.cell_display: HTEC2, Y, Sr, Eu, Er
+        expected_cell_temps = ["425.0 °C", "632.1 °C", "550.3 °C", "580.7 °C", "610.2 °C"]
+        for display, expected in zip(self.monitor._cell_displays, expected_cell_temps):
+            self.assertEqual(display.value.text(), expected)
         # Plasma
         self.assertEqual(
             self.monitor.plasma_dc_display.value.text(), "45.2 V",
