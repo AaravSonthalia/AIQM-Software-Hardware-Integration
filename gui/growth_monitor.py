@@ -2200,6 +2200,11 @@ class GrowthMonitor(QWidget):
             "date": datetime.now().strftime("%Y-%m-%d"),
             "grower": self.grower_input.text(),
             "sample_id": self.sample_id_input.text(),
+            "chamber_id": self._cfg.chamber_id,
+            "camera_mode": self.config_camera_mode.currentText(),
+            "mistral_mode": self.config_mistral_mode.currentText(),
+            "evap_mode": self.config_evap_mode.currentText(),
+            "pyrometer_mode": self.config_pyrometer_mode.currentText(),
         }
 
     # ----- Reset -----------------------------------------------------------

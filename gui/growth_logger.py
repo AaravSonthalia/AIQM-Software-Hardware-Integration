@@ -209,6 +209,8 @@ class GrowthLogger:
         self._set_change_counter = 0
         self._manual_event_counter = 0
         self._live_label_counter = 0
+        self._sensor_row_counter = 0
+        self._session_start: Optional[datetime] = None
         self._entries: list[dict] = []  # Accumulated entries for export
 
     @property
@@ -292,6 +294,8 @@ class GrowthLogger:
         self._set_change_counter = 0
         self._manual_event_counter = 0
         self._live_label_counter = 0
+        self._sensor_row_counter = 0
+        self._session_start = datetime.now()
         self._entries = []
 
     def log_sensors(
@@ -365,6 +369,7 @@ class GrowthLogger:
             },
         })
         self._sensor_file.flush()
+        self._sensor_row_counter += 1
 
     def log_commit(self, entry: dict):
         """Append a row to commit_log.csv and accumulate for export."""
@@ -989,10 +994,20 @@ class GrowthLogger:
         """Save session metadata to a JSON file."""
         if self._session_dir is None:
             return
+        now = datetime.now()
         meta = {
             **metadata,
-            "session_end": datetime.now().isoformat(),
-            "total_entries": len(self._entries),
+            "session_start": self._session_start.isoformat() if self._session_start else None,
+            "session_end": now.isoformat(),
+            "session_duration_s": (
+                round((now - self._session_start).total_seconds(), 1)
+                if self._session_start else None
+            ),
+            "sensor_row_count": self._sensor_row_counter,
+            "commit_entry_count": len(self._entries),
+            "heartbeat_frame_count": self._heartbeat_counter,
+            "manual_event_count": self._manual_event_counter,
+            "live_label_count": self._live_label_counter,
         }
         meta_path = self._session_dir / "session_metadata.json"
         with open(meta_path, "w") as f:

@@ -735,6 +735,10 @@ class GrowthApp(QMainWindow):
         mistral_ok = m is not None and m.connected
         evap_ok = e is not None and e.connected
         ads_cells = m.ads_cells if mistral_ok else None
+        # Pressure priority: EvapControl elog (O-MBE) → ADS ion_gauge_1_P (Ch-MBE ADS mode)
+        _evap_p = e.chamber_pressure_mbar if evap_ok else None
+        _ads_p  = ads_cells.get("ion_gauge_1_P") if ads_cells else None
+        _pressure = _evap_p if _evap_p is not None else _ads_p
         self.growth_log.log_sensors(
             pyro_temp,
             self.monitor.get_elapsed_seconds(),
@@ -742,9 +746,7 @@ class GrowthApp(QMainWindow):
             v_actual=m.v_actual if mistral_ok else None,
             i_set=m.i_set if mistral_ok else None,
             i_actual=m.i_actual if mistral_ok else None,
-            chamber_pressure_mbar=(
-                e.chamber_pressure_mbar if evap_ok else None
-            ),
+            chamber_pressure_mbar=_pressure,
             pyro_temp_std=pyro_temp_std,
             pyro_temp_n=pyro_temp_n,
             # Elog-direct fields (None outside elog mode — see
@@ -772,7 +774,7 @@ class GrowthApp(QMainWindow):
             pyro_temp,
             voltage=m.v_actual if mistral_ok else None,
             current=m.i_actual if mistral_ok else None,
-            pressure=e.chamber_pressure_mbar if evap_ok else None,
+            pressure=_pressure,
         )
 
     # --- Worker state fan-out to monitor -----------------------------------
