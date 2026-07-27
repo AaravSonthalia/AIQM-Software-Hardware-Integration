@@ -47,7 +47,13 @@ class CameraState:
     intensity: float = 0.0  # ROI mean intensity for oscillation tracking
     connected: bool = False
     error: str = ""
-    mode: str = ""  # "direct", "screengrab", or "dummy"
+    mode: str = ""  # "vimba", "screengrab", "screengrab_mss", or "dummy"
+    capture_backend: str = ""
+    captured_at_utc: str = ""
+    capture_sequence: int = 0
+    frame_age_ms: float = 0.0
+    source_hwnd: int = 0
+    captured_monotonic_ns: int = 0  # internal age calculation, not serialized
 
 
 @dataclass

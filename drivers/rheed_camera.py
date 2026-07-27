@@ -26,7 +26,33 @@ from typing import Optional
 
 import numpy as np
 
+from drivers.window_capture import CapturedFrame, WindowsGraphicsCapture
+
 log = logging.getLogger(__name__)
+
+
+def _configure_rheed_user32_argtypes() -> None:
+    """Declare 64-bit-safe signatures for RHEED-specific user32 calls."""
+    import sys
+
+    if sys.platform != "win32":
+        return
+    import ctypes
+    import ctypes.wintypes
+
+    from drivers.ocr import configure_user32_argtypes
+
+    configure_user32_argtypes()
+    user32 = ctypes.windll.user32
+    user32.GetWindowThreadProcessId.argtypes = [
+        ctypes.wintypes.HWND,
+        ctypes.POINTER(ctypes.wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+    user32.IsWindow.argtypes = [ctypes.wintypes.HWND]
+    user32.IsWindow.restype = ctypes.wintypes.BOOL
+    user32.IsIconic.argtypes = [ctypes.wintypes.HWND]
+    user32.IsIconic.restype = ctypes.wintypes.BOOL
 
 
 class FrameNotYetAvailableError(RuntimeError):
@@ -364,7 +390,7 @@ class VmbCamera(RheedCamera):
 
 class ScreenGrabCamera(RheedCamera):
     """
-    Captures frames from the kSA 400 window via screen grab.
+    Captures frames from the detached kSA Live Video window.
 
     Historically the primary path for ML classification because Classifier2
     was trained on kSA false-color screenshots. Now serves as a fallback
@@ -373,16 +399,11 @@ class ScreenGrabCamera(RheedCamera):
     fix that makes both paths produce equivalent L-channel input to the
     classifier.
 
-    Two capture paths, selected by ``sys.platform``:
-
-    * **win32** (Bulbasaur): finds the kSA Live Video window HWND via
-      ``ctypes.windll.user32``, grabs its rectangle with ``mss``, and
-      returns just that region. If no Live Video window is found, raises
-      RuntimeError rather than silently falling back to the main kSA
-      frame (which would feed the classifier the whole kSA UI).
-    * **cross-platform** (Mac dev / VNC): grabs the entire primary
-      monitor. Emits a one-shot warning so the grower knows this is
-      fallback behavior, not the intended production path.
+    The default ``wgc`` backend captures a detached top-level window by HWND,
+    independent of desktop z-order. It is Windows-only and fails closed if
+    the target closes, is minimized, or stops producing frames. ``mss`` is
+    retained only as an explicit legacy diagnostic backend and still reads
+    visible desktop pixels.
 
     Chrome cropping removes the kSA title bar / menu / toolbar (above)
     and status bar (below) so the classifier sees only the RHEED image
@@ -419,18 +440,91 @@ class ScreenGrabCamera(RheedCamera):
         crop_chrome: bool = True,
         chrome_top_px: int = 75,
         chrome_bottom_px: int = 30,
+        backend: str = "wgc",
+        first_frame_timeout_s: float = 5.0,
+        stale_timeout_s: float = 5.0,
+        capture_factory=None,
     ):
+        if backend not in {"wgc", "mss"}:
+            raise ValueError("backend must be 'wgc' or 'mss'")
         self._window_title = window_title
+        self._backend = backend
         self._connected = False
         self._capture_method: Optional[str] = None
         self._crop_chrome = crop_chrome
         self._chrome_top_px = chrome_top_px
         self._chrome_bottom_px = chrome_bottom_px
+        self._first_frame_timeout_s = first_frame_timeout_s
+        self._stale_timeout_s = stale_timeout_s
+        self._capture_factory = capture_factory
+        self._capture_session: Optional[WindowsGraphicsCapture] = None
+        self._last_capture: Optional[CapturedFrame] = None
         self._consecutive_fails = 0
         # One-shot warning gate for the cross-platform (whole-monitor) grab.
         # Set on first invocation so we log only once per session — repeat
         # logging at 1Hz would drown the log.
         self._warned_cross_platform = False
+
+    @classmethod
+    def legacy_mss(cls, **kwargs) -> "ScreenGrabCamera":
+        """Create the explicit legacy framebuffer-capture implementation."""
+        return cls(backend="mss", **kwargs)
+
+    @staticmethod
+    def _find_detached_live_video_window(
+        search_term: str = "Live Video",
+    ) -> int:
+        """Return only a visible, detached top-level Live Video HWND."""
+        import ctypes
+        import ctypes.wintypes
+
+        _configure_rheed_user32_argtypes()
+        search_lower = search_term.lower()
+        user32 = ctypes.windll.user32
+        main_pid = ctypes.wintypes.DWORD(0)
+        detached_hwnd = ctypes.c_void_p(0)
+
+        def _get_title(hwnd):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return ""
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            return buf.value
+
+        @ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+        )
+        def _find_main(hwnd, _lp):
+            title = _get_title(hwnd).lower()
+            if title.startswith("ksa 400"):
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(main_pid))
+                return False
+            return True
+
+        user32.EnumWindows(_find_main, 0)
+        if not main_pid.value:
+            return 0
+
+        @ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
+        )
+        def _find_detached(hwnd, _lp):
+            title = _get_title(hwnd).lower()
+            candidate_pid = ctypes.wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(candidate_pid))
+            if (
+                search_lower in title
+                and not title.startswith("ksa 400")
+                and user32.IsWindowVisible(hwnd)
+                and candidate_pid.value == main_pid.value
+            ):
+                detached_hwnd.value = hwnd
+                return False
+            return True
+
+        user32.EnumWindows(_find_detached, 0)
+        return int(detached_hwnd.value or 0)
 
     @staticmethod
     def _find_live_video_window(search_term: str = "Live Video") -> int:
@@ -449,6 +543,7 @@ class ScreenGrabCamera(RheedCamera):
         import ctypes
         import ctypes.wintypes
 
+        _configure_rheed_user32_argtypes()
         search_lower = search_term.lower()
         user32 = ctypes.windll.user32
 
@@ -498,7 +593,9 @@ class ScreenGrabCamera(RheedCamera):
                 return False
             return True
 
-        user32.EnumChildWindows(int(main_hwnd.value), _enum_children, 0)
+        user32.EnumChildWindows(
+            ctypes.wintypes.HWND(int(main_hwnd.value)), _enum_children, 0
+        )
 
         if child_hwnd.value:
             return int(child_hwnd.value)
@@ -516,13 +613,7 @@ class ScreenGrabCamera(RheedCamera):
         return 0
 
     def connect(self) -> None:
-        """Verify screen-capture dependencies are importable and mark connected.
-
-        The two capture paths (win32 vs cross-platform) share the same
-        dependency (``mss``); the historical platform split at ``connect()``
-        time was dead differentiation. The legitimate platform dispatch
-        lives in ``read_frame()`` where the paths actually differ.
-        """
+        """Start the selected capture backend and verify a first frame."""
         self._setup()
         self._connected = True
         self._consecutive_fails = 0
@@ -534,12 +625,58 @@ class ScreenGrabCamera(RheedCamera):
         )
 
     def _setup(self) -> None:
-        """Import mss (raise if missing) and record the capture method."""
+        """Initialize WGC or the explicitly requested legacy mss backend."""
+        import sys
+
+        if self._backend == "wgc":
+            if sys.platform != "win32" and self._capture_factory is None:
+                raise RuntimeError(
+                    "RHEED WGC mode requires Windows. Select dummy/vimba "
+                    "for development or screengrab_mss for legacy diagnostics."
+                )
+            hwnd = (
+                1
+                if self._capture_factory is not None and sys.platform != "win32"
+                else self._find_detached_live_video_window(self._window_title)
+            )
+            if not hwnd:
+                raise RuntimeError(
+                    "Detached kSA Live Video window not found. In kSA 400, "
+                    "disable 'Keep Live Video inside application', open Live "
+                    "Video as its own window, then reconnect."
+                )
+            if sys.platform == "win32":
+                import ctypes
+
+                _configure_rheed_user32_argtypes()
+                if ctypes.windll.user32.IsIconic(hwnd):
+                    raise RuntimeError(
+                        "Detached kSA Live Video window is minimized. Restore "
+                        "it before connecting WGC."
+                    )
+            session = WindowsGraphicsCapture(
+                hwnd,
+                first_frame_timeout_s=self._first_frame_timeout_s,
+                stale_timeout_s=self._stale_timeout_s,
+                capture_factory=self._capture_factory,
+            )
+            try:
+                first = session.start()
+            except Exception:
+                session.close()
+                raise
+            self._capture_session = session
+            self._last_capture = first.with_image(
+                self._crop_chrome_pixels(first.image)
+            )
+            self._capture_method = "wgc"
+            return
+
         try:
             import mss  # noqa: F401
         except ImportError as exc:
             raise ImportError(
-                "mss required for screen capture: pip install mss"
+                "mss required for legacy screen capture: pip install mss"
             ) from exc
         self._capture_method = "mss"
 
@@ -550,16 +687,71 @@ class ScreenGrabCamera(RheedCamera):
         import sys
 
         try:
-            if sys.platform == "win32":
-                frame = self._grab_win32()
+            if self._backend == "wgc":
+                self._assert_wgc_window_available()
+                if self._capture_session is None:
+                    raise RuntimeError("WGC capture session is not initialized.")
+                sample = self._capture_session.read_latest()
+                cropped = self._crop_chrome_pixels(sample.image)
+                self._last_capture = sample.with_image(cropped)
             else:
-                frame = self._grab_cross_platform()
-            cropped = self._crop_chrome_pixels(frame)
+                if sys.platform == "win32":
+                    frame = self._grab_win32()
+                    hwnd = self._find_live_video_window(self._window_title)
+                else:
+                    frame = self._grab_cross_platform()
+                    hwnd = 0
+                cropped = self._crop_chrome_pixels(frame)
+                self._last_capture = self._make_legacy_capture(cropped, hwnd)
         except RuntimeError:
             self._register_failure()
             raise
         self._consecutive_fails = 0
         return cropped
+
+    def _assert_wgc_window_available(self) -> None:
+        """Fail before returning a cached frame when the HWND is unavailable."""
+        import sys
+
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        _configure_rheed_user32_argtypes()
+        if self._capture_session is None:
+            raise RuntimeError("WGC capture session is not initialized.")
+        hwnd = self._capture_session.hwnd
+        if not ctypes.windll.user32.IsWindow(hwnd):
+            raise RuntimeError("Detached kSA Live Video window was closed.")
+        if ctypes.windll.user32.IsIconic(hwnd):
+            raise RuntimeError(
+                "Detached kSA Live Video window is minimized. RHEED capture "
+                "stopped; restore it and reconnect."
+            )
+
+    @staticmethod
+    def _make_legacy_capture(frame: np.ndarray, hwnd: int) -> CapturedFrame:
+        """Attach software-receipt provenance to an explicit mss frame."""
+        import time
+        from datetime import datetime, timezone
+
+        now_ns = time.monotonic_ns()
+        captured_utc = (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+        height, width = frame.shape[:2]
+        return CapturedFrame(
+            image=frame,
+            captured_at_utc=captured_utc,
+            captured_monotonic_ns=now_ns,
+            sequence=now_ns,
+            source_hwnd=int(hwnd),
+            width=width,
+            height=height,
+            backend="mss",
+        )
 
     def _register_failure(self) -> None:
         """Track consecutive failures — mark disconnected past the threshold.
@@ -601,6 +793,7 @@ class ScreenGrabCamera(RheedCamera):
         import ctypes.wintypes
         import mss
 
+        _configure_rheed_user32_argtypes()
         # Find the Live Video window (detached top-level or MDI child).
         # If _find_live_video_window returns 0, raise cleanly rather than
         # silently falling back to the main kSA frame.
@@ -666,11 +859,17 @@ class ScreenGrabCamera(RheedCamera):
             "name": "ScreenGrabCamera",
             "platform": sys.platform,
             "capture_method": self._capture_method or "not_connected",
+            "backend": self._backend,
             "window_title": self._window_title,
             "crop_chrome": self._crop_chrome,
             "chrome_top_px": self._chrome_top_px,
             "chrome_bottom_px": self._chrome_bottom_px,
         }
+
+    @property
+    def last_capture(self) -> Optional[CapturedFrame]:
+        """Latest returned frame and its atomic capture provenance."""
+        return self._last_capture
 
     def visualize_crop(self, frame: np.ndarray) -> np.ndarray:
         """Overlay the crop boundaries on a captured frame for calibration QA.
@@ -707,7 +906,11 @@ class ScreenGrabCamera(RheedCamera):
         return vis
 
     def disconnect(self) -> None:
+        if self._capture_session is not None:
+            self._capture_session.close()
+            self._capture_session = None
         self._connected = False
+        self._last_capture = None
         self._consecutive_fails = 0
         self._warned_cross_platform = False
 

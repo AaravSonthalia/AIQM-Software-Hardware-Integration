@@ -114,16 +114,22 @@ class GrowthLogger:
         # only frame_quality_pass=True rows, while UX audits may want
         # every entry.
         "frame_quality_pass",
+        "capture_backend", "captured_at_utc", "capture_sequence",
+        "frame_age_ms", "source_hwnd",
     ]
     AUTO_CAPTURE_FIELDS = [
         "timestamp", "elapsed_s", "event_idx",
         "change_score", "pyrometer_temp_C",
         "buffer_count", "buffer_dir",
         "event_state", "state_changed_at",
+        "capture_backend", "captured_at_utc", "capture_sequence",
+        "frame_age_ms", "source_hwnd",
     ]
     HEARTBEAT_FIELDS = [
         "timestamp", "elapsed_s", "heartbeat_idx",
         "pyrometer_temp_C", "frame_path",
+        "capture_backend", "captured_at_utc", "capture_sequence",
+        "frame_age_ms", "source_hwnd",
     ]
     SET_CHANGE_FIELDS = [
         "timestamp", "elapsed_s", "event_idx",
@@ -148,6 +154,8 @@ class GrowthLogger:
         # text queued at click time. Blank otherwise (single-tap case is
         # the primary path).
         "note",
+        "capture_backend", "captured_at_utc", "capture_sequence",
+        "frame_age_ms", "source_hwnd",
     ]
     # Live-Equalizer labels (Jul 10 2026 group-meeting workstream #4).
     # One row per Save click in the Live Equalizer window. The 5 recon_*
@@ -163,6 +171,8 @@ class GrowthLogger:
         "pyrometer_temp_C",
         "voltage_V", "current_A", "psu_source",
         "frame_path",
+        "capture_backend", "captured_at_utc", "capture_sequence",
+        "frame_age_ms", "source_hwnd",
     ]
     # Event labels written by the Events tab labeling form. The from/to
     # columns are reserved for the deferred reconstruction-transition
@@ -185,6 +195,21 @@ class GrowthLogger:
         "recon_rt13",
         "recon_HTR",
     ]
+
+    @staticmethod
+    def _capture_columns(capture_metadata: Optional[dict] = None) -> dict:
+        """Normalize optional camera provenance for CSV writers."""
+        metadata = capture_metadata or {}
+        frame_age = metadata.get("frame_age_ms", "")
+        if isinstance(frame_age, (float, int)):
+            frame_age = f"{float(frame_age):.3f}"
+        return {
+            "capture_backend": metadata.get("capture_backend", ""),
+            "captured_at_utc": metadata.get("captured_at_utc", ""),
+            "capture_sequence": metadata.get("capture_sequence", ""),
+            "frame_age_ms": frame_age,
+            "source_hwnd": metadata.get("source_hwnd", ""),
+        }
 
     def __init__(self, base_dir: str = "logs/growths"):
         self._base_dir = Path(base_dir)
@@ -466,6 +491,7 @@ class GrowthLogger:
         psu_source: str = "none",
         frame: Optional[np.ndarray] = None,
         note: str = "",
+        capture_metadata: Optional[dict] = None,
     ) -> int:
         """Append a grower-marked event to manual_events.csv.
 
@@ -531,6 +557,7 @@ class GrowthLogger:
             "psu_source": psu_source,
             "frame_path": frame_path,
             "note": note,
+            **self._capture_columns(capture_metadata),
         })
         self._manual_event_file.flush()
         return idx
@@ -544,6 +571,7 @@ class GrowthLogger:
         voltage_V: Optional[float] = None,
         current_A: Optional[float] = None,
         psu_source: str = "none",
+        capture_metadata: Optional[dict] = None,
     ) -> int:
         """Append a Live Equalizer label to live_labels.csv.
 
@@ -622,6 +650,7 @@ class GrowthLogger:
             ),
             "psu_source": psu_source,
             "frame_path": frame_path,
+            **self._capture_columns(capture_metadata),
         })
         self._live_label_file.flush()
         return idx
@@ -631,6 +660,7 @@ class GrowthLogger:
         elapsed_s: float,
         pyro_temp: Optional[float] = None,
         frame_path: str = "",
+        capture_metadata: Optional[dict] = None,
     ):
         """Append a row to heartbeat_log.csv. Pairs with save_heartbeat_frame."""
         if not self._heartbeat_writer:
@@ -643,6 +673,7 @@ class GrowthLogger:
                 f"{pyro_temp:.1f}" if pyro_temp is not None else ""
             ),
             "frame_path": frame_path,
+            **self._capture_columns(capture_metadata),
         })
         self._heartbeat_file.flush()
 
@@ -655,6 +686,7 @@ class GrowthLogger:
         buffer_count: int = 0,
         buffer_dir: str = "",
         event_state: str = EVENT_STATE_PENDING,
+        capture_metadata: Optional[dict] = None,
     ):
         """Append a row to auto_capture_events.csv for shadow-mode logging.
 
@@ -691,6 +723,7 @@ class GrowthLogger:
             "buffer_dir": buffer_dir,
             "event_state": event_state,
             "state_changed_at": state_changed_at,
+            **self._capture_columns(capture_metadata),
         })
         self._auto_capture_file.flush()
 
@@ -876,6 +909,7 @@ class GrowthLogger:
         self,
         event_idx: int,
         frames: list[np.ndarray],
+        capture_metadata: Optional[list[dict]] = None,
     ) -> tuple[int, str]:
         """Save the auto-capture context buffer for a flagged event.
 
@@ -900,6 +934,7 @@ class GrowthLogger:
 
         ts_tag = datetime.now().strftime("%H%M%S")
         saved = 0
+        manifest_rows: list[dict] = []
         for pos, frame in enumerate(frames):
             if check_frame_quality is not None:
                 qa = check_frame_quality(frame)
@@ -919,6 +954,33 @@ class GrowthLogger:
                     saved += 1
                 except ImportError:
                     break
+            metadata = (
+                capture_metadata[pos]
+                if capture_metadata is not None
+                and pos < len(capture_metadata)
+                else {}
+            )
+            manifest_rows.append({
+                "frame_path": fname,
+                **self._capture_columns(metadata),
+            })
+
+        if manifest_rows:
+            manifest_path = event_dir / "capture_manifest.csv"
+            with open(manifest_path, "w", newline="") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=[
+                        "frame_path",
+                        "capture_backend",
+                        "captured_at_utc",
+                        "capture_sequence",
+                        "frame_age_ms",
+                        "source_hwnd",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(manifest_rows)
 
         rel_dir = str(event_dir.relative_to(self._session_dir))
         return saved, rel_dir

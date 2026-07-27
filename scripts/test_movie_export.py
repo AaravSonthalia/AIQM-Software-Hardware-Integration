@@ -205,7 +205,9 @@ class MovieExportWorkerTests(unittest.TestCase):
 
     def test_worker_encodes_and_emits_finished_ok(self):
         with tempfile.TemporaryDirectory() as tmp:
-            session_dir, _ = _make_session_with_frames(tmp, n_frames=6)
+            # Use enough tiny frames to clear the exporter's >1 KiB sanity
+            # threshold across supported OpenCV/FFmpeg wheel builds.
+            session_dir, _ = _make_session_with_frames(tmp, n_frames=10)
             exporter = MovieExporter(session_dir)
             out_path = session_dir / DEFAULT_MOVIE_NAME
             worker = MovieExportWorker(exporter, out_path)
@@ -225,9 +227,9 @@ class MovieExportWorkerTests(unittest.TestCase):
 
             self.assertEqual(len(captured_path), 1)
             self.assertEqual(captured_path[0], str(out_path))
-            # 6 progress events fired (one per frame), delivered via
+            # 10 progress events fired (one per frame), delivered via
             # queued connection to the main thread.
-            self.assertGreaterEqual(len(captured_progress), 6)
+            self.assertGreaterEqual(len(captured_progress), 10)
 
     def test_worker_empty_session_emits_failed(self):
         with tempfile.TemporaryDirectory() as tmp:

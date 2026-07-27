@@ -118,6 +118,7 @@ class LiveEqualizerTab(QWidget):
         self._basis_error: Optional[str] = None
         self._current_target: Optional[np.ndarray] = None
         self._current_full_frame: Optional[np.ndarray] = None
+        self._current_capture_metadata: dict = {}
         self._sliders: dict[str, QSlider] = {}
         self._slider_value_labels: dict[str, QLabel] = {}
         self._classifier_value_labels: dict[str, QLabel] = {}
@@ -344,7 +345,9 @@ class LiveEqualizerTab(QWidget):
 
     # ----- Public methods (called by GrowthApp) ---------------------------
 
-    def update_camera_frame(self, frame: Optional[np.ndarray]):
+    def update_camera_frame(
+        self, frame: Optional[np.ndarray], capture_metadata: Optional[dict] = None,
+    ):
         """Update the 'Selected' pane with a new live camera frame.
 
         Frame is expected as ``(H, W, 3)`` uint8 RGB (post-palette-fix
@@ -366,6 +369,7 @@ class LiveEqualizerTab(QWidget):
         if self._paused:
             return
         self._current_full_frame = frame
+        self._current_capture_metadata = dict(capture_metadata or {})
         try:
             from PIL import Image
             from scripts.equalizer_ui import PROCESS_WH, DISPLAY_WH, array_to_pixmap
@@ -411,6 +415,20 @@ class LiveEqualizerTab(QWidget):
         data.
         """
         return self._current_full_frame
+
+    def get_current_capture_metadata(self) -> dict:
+        """Return metadata frozen alongside the displayed full frame."""
+        return dict(self._current_capture_metadata)
+
+    def clear_camera_frame(
+        self, message: str = "Waiting for live camera stream...",
+    ) -> None:
+        """Clear the selected-frame cache after an upstream capture failure."""
+        self._current_target = None
+        self._current_full_frame = None
+        self._current_capture_metadata = {}
+        self._selected_label.clear()
+        self._selected_label.setText(message)
 
     def set_save_enabled(self, enabled: bool):
         """Toggle the Save button — GrowthApp calls this on session state

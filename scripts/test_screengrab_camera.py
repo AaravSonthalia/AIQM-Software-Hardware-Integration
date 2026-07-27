@@ -32,7 +32,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from drivers.rheed_camera import ScreenGrabCamera  # noqa: E402
+from drivers.rheed_camera import (  # noqa: E402
+    ScreenGrabCamera,
+    _configure_rheed_user32_argtypes,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +49,7 @@ def test_construct_defaults() -> None:
     assert cam._crop_chrome is True
     assert cam._chrome_top_px == 75
     assert cam._chrome_bottom_px == 30
+    assert cam._backend == "wgc"
     assert not cam.connected
     assert cam._capture_method is None  # not set until connect()
     assert cam._consecutive_fails == 0
@@ -65,9 +69,15 @@ def test_construct_custom_params() -> None:
     assert cam._chrome_bottom_px == 50
 
 
+def test_user32_argtypes_configuration_is_safe() -> None:
+    """64-bit HWND declarations are idempotent and cross-platform safe."""
+    _configure_rheed_user32_argtypes()
+    _configure_rheed_user32_argtypes()
+
+
 def test_crop_chrome_pixels_typical() -> None:
     """Standard crop on a 500-row frame: output = 500 - 75 - 30 = 395 rows."""
-    cam = ScreenGrabCamera()
+    cam = ScreenGrabCamera(backend="mss")
     frame = np.zeros((500, 800, 3), dtype=np.uint8)
     out = cam._crop_chrome_pixels(frame)
     assert out.shape == (395, 800, 3), f"got {out.shape}"
@@ -133,7 +143,7 @@ def test_get_info_shape() -> None:
     info = cam.get_info()
     expected_keys = {
         "name", "platform", "capture_method", "window_title",
-        "crop_chrome", "chrome_top_px", "chrome_bottom_px",
+        "backend", "crop_chrome", "chrome_top_px", "chrome_bottom_px",
     }
     assert set(info) == expected_keys, f"unexpected keys: {set(info)}"
     assert info["name"] == "ScreenGrabCamera"
@@ -179,7 +189,7 @@ def test_visualize_crop_defensive_bounds_too_large() -> None:
 
 def test_read_frame_before_connect_raises() -> None:
     """read_frame before connect() → RuntimeError 'not connected'."""
-    cam = ScreenGrabCamera()
+    cam = ScreenGrabCamera(backend="mss")
     try:
         cam.read_frame()
     except RuntimeError as exc:
@@ -190,7 +200,7 @@ def test_read_frame_before_connect_raises() -> None:
 
 def test_disconnect_resets_state() -> None:
     """disconnect() clears connected + consecutive-fail + cross-platform warn."""
-    cam = ScreenGrabCamera()
+    cam = ScreenGrabCamera(backend="mss")
     # Manually flip flags to simulate an active session
     cam._connected = True
     cam._consecutive_fails = 3
@@ -205,7 +215,7 @@ def test_disconnect_resets_state() -> None:
 
 def test_consecutive_failure_marks_disconnected() -> None:
     """MAX_CONSECUTIVE_FAILS raises from read_frame flips connected to False."""
-    cam = ScreenGrabCamera()
+    cam = ScreenGrabCamera(backend="mss")
     cam._connected = True  # simulate a connected driver
 
     # Replace the grab method with one that always raises so read_frame's
@@ -229,7 +239,7 @@ def test_consecutive_failure_marks_disconnected() -> None:
 
 def test_consecutive_failure_counter_resets_on_success() -> None:
     """A successful read after N-1 failures resets the counter."""
-    cam = ScreenGrabCamera()
+    cam = ScreenGrabCamera(backend="mss")
     cam._connected = True
 
     # Alternate: N-1 failures, then one success, then N-1 more failures
@@ -275,6 +285,7 @@ def test_consecutive_failure_counter_resets_on_success() -> None:
 TESTS = [
     test_construct_defaults,
     test_construct_custom_params,
+    test_user32_argtypes_configuration_is_safe,
     test_crop_chrome_pixels_typical,
     test_crop_chrome_pixels_disabled,
     test_crop_chrome_pixels_defensive_tiny_frame,

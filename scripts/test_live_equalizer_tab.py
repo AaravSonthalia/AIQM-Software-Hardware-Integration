@@ -177,6 +177,30 @@ class CameraFrameRoutingTests(unittest.TestCase):
         # PROCESS_WH is (W, H); numpy shape is (H, W).
         self.assertEqual(target.shape, (PROCESS_WH[1], PROCESS_WH[0]))
 
+    def test_capture_metadata_is_cached_with_frame(self):
+        frame = _rgb_frame(color=120)
+        metadata = {
+            "capture_backend": "wgc",
+            "capture_sequence": 17,
+            "captured_at_utc": "2026-07-27T12:00:00.000Z",
+        }
+        self.tab.update_camera_frame(frame, metadata)
+        metadata["capture_sequence"] = 99
+        cached = self.tab.get_current_capture_metadata()
+        self.assertEqual(cached["capture_backend"], "wgc")
+        self.assertEqual(cached["capture_sequence"], 17)
+
+    def test_clear_camera_frame_removes_image_and_provenance(self):
+        self.tab.update_camera_frame(
+            _rgb_frame(color=120),
+            {"capture_backend": "wgc", "capture_sequence": 17},
+        )
+        self.tab.clear_camera_frame("RHEED unavailable")
+        self.assertIsNone(self.tab.get_current_full_frame())
+        self.assertIsNone(self.tab._current_target)
+        self.assertEqual(self.tab.get_current_capture_metadata(), {})
+        self.assertEqual(self.tab._selected_label.text(), "RHEED unavailable")
+
 
 class SliderMechanicsTests(unittest.TestCase):
     """Slider values, weight round-trip, reset."""
@@ -415,6 +439,8 @@ class LiveLabelSchemaTests(unittest.TestCase):
             "pyrometer_temp_C",
             "voltage_V", "current_A", "psu_source",
             "frame_path",
+            "capture_backend", "captured_at_utc", "capture_sequence",
+            "frame_age_ms", "source_hwnd",
         }
         self.assertEqual(set(GrowthLogger.LIVE_LABEL_FIELDS), expected)
 

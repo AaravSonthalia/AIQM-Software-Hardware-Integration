@@ -121,6 +121,73 @@ class CommitFieldsTests(unittest.TestCase):
         self.assertGreater(i_qual, i_path)
 
 
+class CaptureProvenanceTests(unittest.TestCase):
+    """RHEED image rows preserve the capture timestamp and source atomically."""
+
+    def test_heartbeat_writes_capture_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("CAPTURE_META")
+            metadata = {
+                "capture_backend": "wgc",
+                "captured_at_utc": "2026-07-27T12:00:00.123Z",
+                "capture_sequence": 42,
+                "frame_age_ms": 12.3456,
+                "source_hwnd": 9001,
+            }
+            logger.log_heartbeat(
+                elapsed_s=1.0,
+                frame_path="frames/heartbeat_001.bmp",
+                capture_metadata=metadata,
+            )
+            csv_path = logger.session_dir / "heartbeat_log.csv"
+            logger.end_session()
+            with open(csv_path, newline="") as stream:
+                row = next(csv.DictReader(stream))
+            self.assertEqual(row["capture_backend"], "wgc")
+            self.assertEqual(
+                row["captured_at_utc"], "2026-07-27T12:00:00.123Z",
+            )
+            self.assertEqual(row["capture_sequence"], "42")
+            self.assertEqual(row["frame_age_ms"], "12.346")
+            self.assertEqual(row["source_hwnd"], "9001")
+
+    def test_auto_capture_buffer_writes_per_frame_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("BUFFER_META")
+            metadata = [
+                {
+                    "capture_backend": "wgc",
+                    "captured_at_utc": f"2026-07-27T12:00:0{i}.000Z",
+                    "capture_sequence": 100 + i,
+                    "frame_age_ms": 10.0 + i,
+                    "source_hwnd": 9001,
+                }
+                for i in range(2)
+            ]
+            count, rel_dir = logger.save_auto_capture_buffer(
+                event_idx=1,
+                frames=[_good_frame(), _good_frame()],
+                capture_metadata=metadata,
+            )
+            event_dir = logger.session_dir / rel_dir
+            logger.end_session()
+
+            self.assertEqual(count, 2)
+            with open(event_dir / "capture_manifest.csv", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                [row["capture_sequence"] for row in rows],
+                ["100", "101"],
+            )
+            for row in rows:
+                self.assertTrue((event_dir / row["frame_path"]).exists())
+                self.assertEqual(row["capture_backend"], "wgc")
+                self.assertEqual(row["source_hwnd"], "9001")
+
+
 class UpdateEventLabelPartialUpdateTests(unittest.TestCase):
     """Jul 15 2026 additions: change_from and change_to are UI-populated
     via events_tab dropdowns. update_event_label's None-preserving
@@ -207,6 +274,8 @@ class ManualEventSchemaTests(unittest.TestCase):
             "pyrometer_temp_C",
             "voltage_V", "current_A", "psu_source",
             "frame_path", "note",
+            "capture_backend", "captured_at_utc", "capture_sequence",
+            "frame_age_ms", "source_hwnd",
         }
         self.assertEqual(set(GrowthLogger.MANUAL_EVENT_FIELDS), expected)
 

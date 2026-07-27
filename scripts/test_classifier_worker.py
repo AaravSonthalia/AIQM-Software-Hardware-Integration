@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -251,9 +252,15 @@ class SlotTests(unittest.TestCase):
     def test_slot_stores_latest_frame(self):
         w = ClassifierWorker(ai_repo_root="/nowhere")
         frame = _fake_frame()
-        w.on_rheed_state(CameraState(frame=frame, frame_number=7))
+        w.on_rheed_state(CameraState(
+            frame=frame,
+            frame_number=7,
+            capture_sequence=70,
+            captured_monotonic_ns=700,
+        ))
         self.assertIs(w._latest_frame, frame)
         self.assertEqual(w._latest_frame_number, 7)
+        self.assertEqual(w._latest_frame_key, ("capture", 70, 700))
 
     def test_slot_ignores_none_frame(self):
         w = ClassifierWorker(ai_repo_root="/nowhere")
@@ -382,6 +389,73 @@ class RunLoopTests(unittest.TestCase):
             self.assertTrue(_wait_for(lambda: bridge.calls >= 2))
             self.assertEqual(bridge.calls, 2)
         finally:
+            self._stop_and_wait(w)
+
+    def test_inflight_result_is_discarded_across_reconnect(self):
+        """A new capture identity must beat a reused worker frame number."""
+
+        class BlockingBridge(FakeBridge):
+            def __init__(self):
+                super().__init__()
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def classify(self, frame: np.ndarray) -> dict:
+                self.calls += 1
+                self.frames_seen.append(frame)
+                if self.calls == 1:
+                    self.started.set()
+                    self.release.wait(timeout=2.0)
+                winner = "1x1" if float(frame.mean()) == 0.0 else "Twinned (2x1)"
+                scores = {label: 0.0 for label in RECON_LABELS}
+                scores[winner] = 1.0
+                return {
+                    "classification_scores": scores,
+                    "quality": 0.9,
+                    "is_bad": False,
+                    "bad_confidence": 0.0,
+                }
+
+        bridge = BlockingBridge()
+        w, states = self._make_worker(bridge)
+        w.start()
+        try:
+            self.assertTrue(_wait_for(lambda: len(states) >= 2))
+            w.on_rheed_state(CameraState(
+                frame=np.zeros((5, 5, 3), dtype=np.uint8),
+                frame_number=1,
+                mode="screengrab",
+                capture_sequence=100,
+                captured_monotonic_ns=1000,
+            ))
+            self.assertTrue(bridge.started.wait(timeout=1.0))
+
+            # Reconnect starts a new camera worker at frame_number=1, but
+            # WGC provenance is globally unique. The old inference must not
+            # be emitted merely because the local frame number matches.
+            w.on_rheed_state(CameraState(
+                frame=np.ones((5, 5, 3), dtype=np.uint8),
+                frame_number=1,
+                mode="screengrab",
+                capture_sequence=101,
+                captured_monotonic_ns=2000,
+            ))
+            bridge.release.set()
+            self.assertTrue(_wait_for(lambda: bridge.calls >= 2))
+            self.assertTrue(_wait_for(
+                lambda: any(
+                    state.last_frame_number == 1
+                    and state.normalized_percent.get("Twinned (2x1)") == 100
+                    for state in states
+                )
+            ))
+            self.assertFalse(any(
+                state.last_frame_number == 1
+                and state.normalized_percent.get("1x1") == 100
+                for state in states
+            ))
+        finally:
+            bridge.release.set()
             self._stop_and_wait(w)
 
     def test_ema_smoothing_progresses(self):

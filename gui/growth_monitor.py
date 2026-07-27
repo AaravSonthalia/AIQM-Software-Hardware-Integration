@@ -306,6 +306,7 @@ class GrowthMonitor(QWidget):
 
     arm_requested = pyqtSignal()
     disarm_requested = pyqtSignal()
+    reconnect_rheed_requested = pyqtSignal()
     start_requested = pyqtSignal()
     stop_requested = pyqtSignal()
     open_rheed_trend_requested = pyqtSignal()
@@ -703,6 +704,23 @@ class GrowthMonitor(QWidget):
         )
         footer.addWidget(self.pause_auto_capture_btn, 0)
 
+        self.reconnect_rheed_btn = QPushButton("Reconnect RHEED")
+        self.reconnect_rheed_btn.setToolTip(
+            "Retry the detached kSA Live Video WGC connection without "
+            "ending the current growth session."
+        )
+        self.reconnect_rheed_btn.setStyleSheet(
+            "QPushButton { background-color: #7f1d1d; color: white; "
+            "border: 1px solid #ef4444; padding: 2px 10px; "
+            "font-size: 11px; font-weight: bold; }"
+            "QPushButton:disabled { background-color: #3f1d1d; color: #888; }"
+        )
+        self.reconnect_rheed_btn.clicked.connect(
+            self.reconnect_rheed_requested,
+        )
+        self.reconnect_rheed_btn.hide()
+        footer.addWidget(self.reconnect_rheed_btn, 0)
+
         _btn_style = (
             "QPushButton { background-color: #1a1a1a; color: #94a3b8; "
             "border: 1px solid #334155; padding: 2px 8px; font-size: 11px; }"
@@ -973,7 +991,17 @@ class GrowthMonitor(QWidget):
         config_form.addRow("Filename prefix:", self.config_prefix)
 
         self.config_camera_mode = QComboBox()
-        self.config_camera_mode.addItems(["dummy", "screengrab", "vimba"])
+        self.config_camera_mode.addItems(
+            ["dummy", "screengrab", "screengrab_mss", "vimba"]
+        )
+        self.config_camera_mode.setItemData(
+            1,
+            "Windows Graphics Capture of the detached kSA Live Video window.",
+        )
+        self.config_camera_mode.setItemData(
+            2,
+            "Legacy monitor-pixel capture; overlays can contaminate frames.",
+        )
         config_form.addRow("Camera mode:", self.config_camera_mode)
 
         self.config_pyrometer_mode = QComboBox()
@@ -1383,7 +1411,20 @@ class GrowthMonitor(QWidget):
             # not yet be constructed (early camera state emit races GUI
             # build).
             if hasattr(self, "live_equalizer_tab"):
-                self.live_equalizer_tab.update_camera_frame(state.frame)
+                self.live_equalizer_tab.update_camera_frame(
+                    state.frame, self.get_current_capture_metadata(),
+                )
+        else:
+            # Never retain a previously valid frame after a capture error.
+            # Heartbeat/manual/classifier paths all read this cache, so
+            # clearing it is the fail-closed boundary for image logging.
+            self._current_frame = None
+            self.rheed_image_label.clear()
+            self.rheed_image_label.setText("RHEED unavailable")
+            if hasattr(self, "live_equalizer_tab"):
+                self.live_equalizer_tab.clear_camera_frame(
+                    "RHEED unavailable",
+                )
 
     # Value-label style presets. Kept as constants so update_classifier_state
     # doesn't allocate style strings per emission (5-slider hot path at 2 Hz).
@@ -1589,6 +1630,17 @@ class GrowthMonitor(QWidget):
     # worker class-level constant isn't cheap to reach from a Qt slot
     # hot-path. Update both if the threshold moves.
     _OOD_TOOLTIP_THRESHOLD = 0.3
+
+    def set_classifier_capture_unavailable(self, message: str) -> None:
+        """Invalidate classifier output when its RHEED source is lost."""
+        state = ClassifierState(
+            loading=False,
+            ready=False,
+            error=message,
+        )
+        self.update_classifier_state(state)
+        if hasattr(self, "live_equalizer_tab"):
+            self.live_equalizer_tab.update_classifier_state(None)
 
     def set_classifier_disabled(self):
         """Show explicit "disabled" state — invoked from GrowthApp._on_arm
@@ -2171,6 +2223,27 @@ class GrowthMonitor(QWidget):
     def get_current_frame(self) -> Optional[np.ndarray]:
         return self._current_frame
 
+    def get_current_capture_metadata(self) -> dict:
+        """Return provenance paired with the currently cached camera frame."""
+        import time
+
+        state = self._latest_camera
+        if state is None or state.frame is None or not state.connected:
+            return {}
+        frame_age_ms = state.frame_age_ms
+        if state.captured_monotonic_ns:
+            frame_age_ms = max(
+                0.0,
+                (time.monotonic_ns() - state.captured_monotonic_ns) / 1_000_000,
+            )
+        return {
+            "capture_backend": state.capture_backend,
+            "captured_at_utc": state.captured_at_utc,
+            "capture_sequence": state.capture_sequence,
+            "frame_age_ms": frame_age_ms,
+            "source_hwnd": state.source_hwnd,
+        }
+
     def set_auto_capture_status(self, text: str):
         """Update the auto-capture footer label. Called by GrowthApp on
         each evaluated frame and on session start/stop."""
@@ -2205,6 +2278,20 @@ class GrowthMonitor(QWidget):
             # in the running state without the button stuck in "Resume".
             self.pause_auto_capture_btn.setChecked(False)
             self.pause_auto_capture_btn.setText("Pause Auto-Capture")
+
+    def is_auto_capture_paused(self) -> bool:
+        """Return the grower's explicit auto-capture pause selection."""
+        return self.pause_auto_capture_btn.isChecked()
+
+    def set_rheed_reconnect_required(
+        self, required: bool, *, in_progress: bool = False,
+    ) -> None:
+        """Show the in-session manual WGC reconnect control when needed."""
+        self.reconnect_rheed_btn.setVisible(required or in_progress)
+        self.reconnect_rheed_btn.setEnabled(required and not in_progress)
+        self.reconnect_rheed_btn.setText(
+            "Reconnecting RHEED\u2026" if in_progress else "Reconnect RHEED"
+        )
 
     def _on_pause_auto_capture_clicked(self):
         """Toggle handler — flips label text and emits the request signal."""
@@ -2247,6 +2334,7 @@ class GrowthMonitor(QWidget):
             d.value.setText("---")
         self.plasma_group.setVisible(False)
         self.rheed_image_label.clear()
+        self.reconnect_rheed_btn.hide()
         self.auto_capture_label.setText("Auto-capture: idle")
         # Force grower correction off before wiping slider state so the
         # next session starts on a clean classifier-driven display, and

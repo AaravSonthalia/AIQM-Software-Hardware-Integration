@@ -209,6 +209,9 @@ class GrowthApp(QMainWindow):
         # Connect monitor signals → app handlers
         self.monitor.arm_requested.connect(self._on_arm)
         self.monitor.disarm_requested.connect(self._on_disarm)
+        self.monitor.reconnect_rheed_requested.connect(
+            self._on_reconnect_rheed,
+        )
         self.monitor.start_requested.connect(self._on_start)
         self.monitor.stop_requested.connect(self._on_stop)
         self.monitor.commit_requested.connect(self._on_commit)
@@ -284,12 +287,14 @@ class GrowthApp(QMainWindow):
         mistral_mode = self.monitor.config_mistral_mode.currentText()
         evap_mode = self.monitor.config_evap_mode.currentText()
 
+        new_camera_worker = False
         if not self.camera_worker or not self.camera_worker.isRunning():
             self.camera_worker = RheedCameraWorker(
                 mode=camera_mode, poll_interval=1.0,
             )
             self.camera_worker.state_updated.connect(self._on_camera_state)
             self.camera_worker.start()
+            new_camera_worker = True
 
         # Live RHEED classifier — reads frames from the camera worker via a
         # DirectConnection slot (mutex-protected write in sender's thread,
@@ -327,6 +332,14 @@ class GrowthApp(QMainWindow):
             # Explicit "disabled" signal to the monitor so the sliders
             # show a clear message instead of just staying at "idle".
             self.monitor.set_classifier_disabled()
+        elif new_camera_worker and self.classifier_worker.isRunning():
+            # A fail-closed WGC worker can be re-armed while the classifier
+            # thread is still alive. Wire the replacement camera worker to
+            # that existing classifier instance.
+            self.camera_worker.state_updated.connect(
+                self.classifier_worker.on_rheed_state,
+                Qt.ConnectionType.DirectConnection,
+            )
 
         if not self.pyrometer_worker or not self.pyrometer_worker.isRunning():
             exactus_port = self.monitor.config_exactus_port.text().strip() or "COM4"
@@ -378,6 +391,41 @@ class GrowthApp(QMainWindow):
         self.monitor.reset_displays()
         self.monitor.set_state("idle")
         self.statusBar().showMessage("Disarmed \u2014 idle")
+
+    @pyqtSlot()
+    def _on_reconnect_rheed(self):
+        """Reconnect only WGC while preserving the current ARM/session state."""
+        if self.monitor._state == "idle":
+            self.statusBar().showMessage(
+                "ARM the monitor before reconnecting RHEED.",
+                5000,
+            )
+            return
+        if self.monitor.config_camera_mode.currentText() != "screengrab":
+            self.statusBar().showMessage(
+                "In-session reconnect is restricted to WGC screengrab mode.",
+                5000,
+            )
+            return
+
+        self.monitor.set_rheed_reconnect_required(
+            False, in_progress=True,
+        )
+        if self.camera_worker is not None and self.camera_worker.isRunning():
+            self._stop_worker(self.camera_worker)
+        self.camera_worker = RheedCameraWorker(
+            mode="screengrab", poll_interval=1.0,
+        )
+        self.camera_worker.state_updated.connect(self._on_camera_state)
+        if self.classifier_worker and self.classifier_worker.isRunning():
+            self.camera_worker.state_updated.connect(
+                self.classifier_worker.on_rheed_state,
+                Qt.ConnectionType.DirectConnection,
+            )
+        self.camera_worker.start()
+        self.statusBar().showMessage(
+            "Reconnecting detached kSA Live Video...", 5000,
+        )
 
     # --- START / STOP ------------------------------------------------------
 
@@ -536,9 +584,11 @@ class GrowthApp(QMainWindow):
         # Save frame if available
         frame = self.monitor.get_current_frame()
         if frame is not None:
+            capture_metadata = self.monitor.get_current_capture_metadata()
             ts = entry.get("timestamp", "").replace(":", "").split(".")[0][-6:]
             path, quality_pass = self.growth_log.save_frame(frame, ts)
             entry["frame_path"] = path
+            entry.update(capture_metadata)
             # quality_pass may be None if the quality-gate module isn't
             # importable; propagate that as blank so the CSV column stays
             # unambiguous ("" ≠ True ≠ False).
@@ -569,6 +619,7 @@ class GrowthApp(QMainWindow):
         button gating and the logger's record_manual_event contract.
         """
         frame = self.monitor.get_current_frame()
+        capture_metadata = self.monitor.get_current_capture_metadata()
         self.growth_log.record_manual_event(
             elapsed_s=payload.get("elapsed_s", 0.0),
             pyro_temp=payload.get("pyro_temp"),
@@ -577,6 +628,7 @@ class GrowthApp(QMainWindow):
             psu_source=payload.get("psu_source", "none"),
             frame=frame,
             note=payload.get("note", ""),
+            capture_metadata=capture_metadata,
         )
         self.statusBar().showMessage("Event marked", 2000)
 
@@ -604,6 +656,9 @@ class GrowthApp(QMainWindow):
             return
 
         frame = self.monitor.live_equalizer_tab.get_current_full_frame()
+        capture_metadata = (
+            self.monitor.live_equalizer_tab.get_current_capture_metadata()
+        )
 
         # PSU snapshot — identical priority to _on_manual_event: mistral
         # first (current O-MBE topology), direct-read next.
@@ -635,6 +690,7 @@ class GrowthApp(QMainWindow):
             voltage_V=voltage_v,
             current_A=current_a,
             psu_source=psu_source,
+            capture_metadata=capture_metadata,
         )
         if idx > 0:
             self.statusBar().showMessage(
@@ -823,10 +879,62 @@ class GrowthApp(QMainWindow):
         self.monitor.update_camera_state(state)
         self.rheed_intensity_window.on_camera_state(state)
 
+        if (
+            state.mode == "screengrab"
+            and not state.connected
+            and state.error
+        ):
+            # WGC is deliberately fail-closed. Stop all image-producing
+            # automation; sensor logging may continue so the session record
+            # still shows when the camera source was lost.
+            self._heartbeat_timer.stop()
+            self.auto_capture_engine.enabled = False
+            self.auto_capture_engine.reset()
+            self.monitor.set_rheed_reconnect_required(True)
+            self.monitor.live_equalizer_tab.set_save_enabled(False)
+            self.monitor.set_classifier_capture_unavailable(
+                "RHEED capture unavailable; classification stopped",
+            )
+            self.monitor.set_auto_capture_status(
+                "Auto-capture: stopped (RHEED WGC unavailable)"
+            )
+            self.statusBar().showMessage(
+                f"RHEED WGC stopped: {state.error} Reconnect to resume.",
+                10000,
+            )
+        elif (
+            state.mode == "screengrab"
+            and state.connected
+            and state.frame is not None
+        ):
+            # The operator restored the detached window and explicitly
+            # reconnected. Hide the retry control only after a fresh frame.
+            self.monitor.set_rheed_reconnect_required(False)
+            if self.growth_log.active and not self._heartbeat_timer.isActive():
+                # Resume image automation only after a fresh frame. Do not
+                # compare it with a pre-loss reference or undo an explicit
+                # grower pause.
+                self._heartbeat_timer.start()
+                self.monitor.live_equalizer_tab.set_save_enabled(True)
+                self.auto_capture_engine.reset()
+                if self.monitor.is_auto_capture_paused():
+                    self.auto_capture_engine.enabled = False
+                    self.monitor.set_auto_capture_status(
+                        "Auto-capture: PAUSED (RHEED WGC restored)"
+                    )
+                else:
+                    self.auto_capture_engine.enabled = True
+                    self.monitor.set_auto_capture_status(
+                        "Auto-capture: armed (warmup after WGC reconnect)"
+                    )
+
         # Feed the auto-capture engine. Engine internally guards on `enabled`,
         # so this is a no-op outside an active session.
         if state.frame is not None and state.connected:
-            self.auto_capture_engine.evaluate(state.frame)
+            self.auto_capture_engine.evaluate(
+                state.frame,
+                self.monitor.get_current_capture_metadata(),
+            )
             if self.auto_capture_engine.enabled:
                 self.monitor.set_auto_capture_status(
                     f"Auto-capture: armed | "
@@ -847,6 +955,7 @@ class GrowthApp(QMainWindow):
         frame = self.monitor.get_current_frame()
         if frame is None:
             return
+        capture_metadata = self.monitor.get_current_capture_metadata()
         path = self.growth_log.save_heartbeat_frame(frame)
         if not path:
             return  # Quality gate rejected, or save failed
@@ -859,6 +968,7 @@ class GrowthApp(QMainWindow):
             elapsed_s=self.monitor.get_elapsed_seconds(),
             pyro_temp=pyro_temp,
             frame_path=path,
+            capture_metadata=capture_metadata,
         )
         # Bump the Monitor-tab footer counter only after a successful
         # save — a quality-gated skip must not inflate the display,
@@ -885,10 +995,13 @@ class GrowthApp(QMainWindow):
             if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
             else None
         )
-        context_frames = self.auto_capture_engine.get_recent_frames()
+        context_captures = self.auto_capture_engine.get_recent_captures()
         buffer_count, buffer_dir = self.growth_log.save_auto_capture_buffer(
             event_idx=self._auto_capture_event_count,
-            frames=context_frames,
+            frames=[frame for frame, _metadata in context_captures],
+            capture_metadata=[
+                metadata for _frame, metadata in context_captures
+            ],
         )
         # Empty-buffer events have nothing to review — quality gate rejected
         # all 20 frames. Mark as auto_skipped at log time so the CSV row
@@ -905,6 +1018,7 @@ class GrowthApp(QMainWindow):
             buffer_count=buffer_count,
             buffer_dir=buffer_dir,
             event_state=initial_state,
+            capture_metadata=self.monitor.get_current_capture_metadata(),
         )
         # Snapshot the latest classifier state into the event directory.
         # Gives Justin's team a per-event training pair — visual context

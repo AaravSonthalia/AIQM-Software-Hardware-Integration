@@ -3,6 +3,8 @@ Background worker threads for instrument communication.
 """
 
 import time
+from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -96,7 +98,7 @@ class PowerSupplyWorker(QThread):
         except Exception as e:
             state.connected = False
             state.error = str(e)
-            self.state_updated.emit(state)
+            self.state_updated.emit(replace(state))
             return
 
         # Main polling loop
@@ -314,7 +316,11 @@ class RheedCameraWorker(QThread):
 
     def run(self):
         """Main worker loop — connect camera and emit frames."""
-        state = CameraState(mode=self.mode)
+        backend = {
+            "screengrab": "wgc",
+            "screengrab_mss": "mss",
+        }.get(self.mode, self.mode)
+        state = CameraState(mode=self.mode, capture_backend=backend)
 
         # Create camera driver based on mode
         try:
@@ -350,12 +356,39 @@ class RheedCameraWorker(QThread):
                 state.intensity = _frame_luminance(frame)
                 state.connected = True
                 state.error = ""
+                capture = getattr(self._camera, "last_capture", None)
+                if capture is not None:
+                    state.capture_backend = capture.backend
+                    state.captured_at_utc = capture.captured_at_utc
+                    state.capture_sequence = capture.sequence
+                    state.frame_age_ms = capture.age_ms()
+                    state.source_hwnd = capture.source_hwnd
+                    state.captured_monotonic_ns = capture.captured_monotonic_ns
+                else:
+                    state.capture_backend = self.mode
+                    state.captured_at_utc = (
+                        datetime.now(timezone.utc)
+                        .isoformat(timespec="milliseconds")
+                        .replace("+00:00", "Z")
+                    )
+                    state.capture_sequence = frame_count
+                    state.frame_age_ms = 0.0
+                    state.source_hwnd = 0
+                    state.captured_monotonic_ns = time.monotonic_ns()
 
             except Exception as e:
                 state.error = str(e)
                 state.frame = None
+                if self.mode == "screengrab":
+                    state.connected = False
+                    self.state_updated.emit(replace(state))
+                    self.running = False
+                    break
 
-            self.state_updated.emit(state)
+            # CameraState is a Python object carried through a queued Qt
+            # signal. Emit a fresh dataclass snapshot so the next worker
+            # iteration cannot mutate image provenance before the GUI reads it.
+            self.state_updated.emit(replace(state))
             time.sleep(self.poll_interval)
 
         # Cleanup
@@ -373,6 +406,9 @@ class RheedCameraWorker(QThread):
         elif self.mode == "screengrab":
             from drivers.rheed_camera import ScreenGrabCamera
             return ScreenGrabCamera()
+        elif self.mode == "screengrab_mss":
+            from drivers.rheed_camera import ScreenGrabCamera
+            return ScreenGrabCamera.legacy_mss()
         else:
             from drivers.rheed_camera import DummyCamera
             return DummyCamera()
@@ -734,11 +770,13 @@ class ClassifierWorker(QThread):
         self._frame_mutex = QMutex()
         self._latest_frame: Optional[np.ndarray] = None
         self._latest_frame_number = -1
+        self._latest_frame_key: Optional[tuple] = None
 
         # Per-cycle state carried across iterations.
         self._smoothed: dict[str, float] = {}   # float internal for EMA math
         self._consecutive_failures = 0
         self._last_classified_frame_number = -1
+        self._last_classified_frame_key: Optional[tuple] = None
         # Latches True on first non-OOD classification; never resets within
         # a single worker lifetime (recreate the worker to reset).
         self._has_confident_data = False
@@ -753,12 +791,34 @@ class ClassifierWorker(QThread):
         Fast attribute swap; no I/O, no inference. Silently overwrites any
         prior unclassified frame (drop-old semantics).
         """
-        if camera_state.frame is None:
-            return
         self._frame_mutex.lock()
         try:
-            self._latest_frame = camera_state.frame
-            self._latest_frame_number = camera_state.frame_number
+            if camera_state.frame is None:
+                self._latest_frame = None
+                self._latest_frame_number = -1
+                self._latest_frame_key = None
+            else:
+                self._latest_frame = camera_state.frame
+                self._latest_frame_number = camera_state.frame_number
+                if camera_state.captured_monotonic_ns:
+                    self._latest_frame_key = (
+                        "capture",
+                        camera_state.capture_sequence,
+                        camera_state.captured_monotonic_ns,
+                    )
+                elif camera_state.capture_sequence:
+                    self._latest_frame_key = (
+                        "sequence",
+                        camera_state.mode,
+                        camera_state.capture_sequence,
+                    )
+                else:
+                    # Compatibility for direct unit-test states and older
+                    # camera sources that expose only a worker-local number.
+                    self._latest_frame_key = (
+                        "frame_number",
+                        camera_state.frame_number,
+                    )
         finally:
             self._frame_mutex.unlock()
 
@@ -812,11 +872,12 @@ class ClassifierWorker(QThread):
             try:
                 frame = self._latest_frame
                 frame_number = self._latest_frame_number
+                frame_key = self._latest_frame_key
             finally:
                 self._frame_mutex.unlock()
 
             # Skip if no frame yet, or same frame we already classified
-            if frame is None or frame_number == self._last_classified_frame_number:
+            if frame is None or frame_key == self._last_classified_frame_key:
                 time.sleep(self.POLL_INTERVAL_S)
                 continue
 
@@ -837,7 +898,23 @@ class ClassifierWorker(QThread):
                 time.sleep(self.POLL_INTERVAL_S)
                 continue
 
+            # Capture may fail closed while inference is running. Discard a
+            # result whose source frame was cleared or superseded so no stale
+            # classification reaches the GUI or session logs.
+            self._frame_mutex.lock()
+            try:
+                source_still_current = (
+                    self._latest_frame is not None
+                    and self._latest_frame_key == frame_key
+                )
+            finally:
+                self._frame_mutex.unlock()
+            if not source_still_current:
+                time.sleep(self.POLL_INTERVAL_S)
+                continue
+
             self._last_classified_frame_number = frame_number
+            self._last_classified_frame_key = frame_key
 
             # Normalize via Equalizer recipe (clip → sum → divide → uniform fallback)
             scores = result.get("classification_scores", {}) or {}
