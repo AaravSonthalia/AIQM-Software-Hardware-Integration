@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""Observe an O-MBE ``sensor_log.csv`` and summarize timing provenance.
+
+The probe is deliberately passive: it never imports an instrument driver and
+never changes GUI or hardware state. By default it records the rows appended
+during a one-hour window, then writes a machine-readable JSON summary and a
+Markdown report. ``--no-wait`` analyzes all rows already present, which is
+useful for regression tests and post-session analysis.
+
+The GUI sensor log is a ~1 Hz latest-state snapshot. A faster worker can advance
+its sequence more than once between rows, so the report calls its interval a
+"sequence-normalized estimate" and reports skipped intermediate samples.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import hashlib
+import json
+import math
+import statistics
+import subprocess
+import time
+from pathlib import Path
+from typing import Iterable, Optional
+
+
+INSTRUMENTS = {
+    "pyrometer": {
+        "values": ["pyrometer_temp_C"],
+    },
+    "mistral": {
+        "values": [
+            "mistral_v_set_V",
+            "mistral_v_actual_V",
+            "mistral_i_set_A",
+            "mistral_i_actual_A",
+        ],
+    },
+    "evap": {
+        "values": [
+            "chamber_pressure_mbar",
+            "substrate_temp_pv_C",
+            "substrate_temp_setpoint_C",
+            "cell_HTEC2_pv_C",
+            "cell_Y_pv_C",
+            "cell_Sr_pv_C",
+            "cell_Eu_pv_C",
+            "cell_Er_pv_C",
+            "plasma_dc_bias_V",
+            "plasma_forward_W",
+            "plasma_reflected_W",
+        ],
+    },
+}
+
+
+def _parse_float(value: object) -> Optional[float]:
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _parse_int(value: object) -> Optional[int]:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_utc(value: object) -> Optional[dt.datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _percentile(values: list[float], percentile: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * percentile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] + fraction * (ordered[upper] - ordered[lower])
+
+
+def _stats(values: Iterable[float]) -> dict[str, Optional[float] | int]:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    return {
+        "count": len(finite),
+        "min": min(finite) if finite else None,
+        "mean": statistics.fmean(finite) if finite else None,
+        "p50": _percentile(finite, 0.50),
+        "p95": _percentile(finite, 0.95),
+        "p99": _percentile(finite, 0.99),
+        "max": max(finite) if finite else None,
+    }
+
+
+def _read_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    if not path.exists():
+        return [], []
+    with path.open(newline="", encoding="utf-8-sig") as stream:
+        reader = csv.DictReader(stream)
+        return list(reader.fieldnames or []), list(reader)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_commit(repo_root: Path) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return completed.stdout.strip() or "unknown"
+
+
+def summarize_instrument(
+    rows: list[dict[str, str]],
+    prefix: str,
+    value_fields: list[str],
+) -> dict:
+    received_field = f"{prefix}_received_at_utc"
+    source_field = f"{prefix}_source_at_utc"
+    sequence_field = f"{prefix}_sample_sequence"
+    age_field = f"{prefix}_age_ms"
+    duration_field = f"{prefix}_read_duration_ms"
+
+    missing_provenance = 0
+    value_missing = 0
+    reused = 0
+    unobserved_intermediate = 0
+    sequence_resets = 0
+    ages: list[float] = []
+    intervals: list[float] = []
+    durations: list[float] = []
+    source_offsets: list[float] = []
+    source_intervals: list[float] = []
+    reused_source_timestamps = 0
+    unique_samples = 0
+    previous_pair: Optional[tuple[int, str]] = None
+    previous_sequence: Optional[int] = None
+    previous_received: Optional[dt.datetime] = None
+    previous_source: Optional[dt.datetime] = None
+
+    for row in rows:
+        sequence = _parse_int(row.get(sequence_field))
+        received_text = str(row.get(received_field, "")).strip()
+        received = _parse_utc(received_text)
+        if sequence is None or sequence <= 0 or received is None:
+            missing_provenance += 1
+        if not any(str(row.get(field, "")).strip() for field in value_fields):
+            value_missing += 1
+
+        age = _parse_float(row.get(age_field))
+        if age is not None:
+            ages.append(age)
+
+        if sequence is None or sequence <= 0 or received is None:
+            continue
+        pair = (sequence, received_text)
+        if pair == previous_pair:
+            reused += 1
+            continue
+
+        unique_samples += 1
+        duration = _parse_float(row.get(duration_field))
+        if duration is not None:
+            durations.append(duration)
+
+        source = _parse_utc(row.get(source_field))
+        if source is not None:
+            source_offsets.append((received - source).total_seconds() * 1000.0)
+            if previous_source is not None:
+                source_delta = (source - previous_source).total_seconds()
+                if source_delta > 0:
+                    source_intervals.append(source_delta)
+                elif source_delta == 0:
+                    reused_source_timestamps += 1
+            previous_source = source
+
+        if previous_sequence is not None and previous_received is not None:
+            sequence_delta = sequence - previous_sequence
+            elapsed_s = (received - previous_received).total_seconds()
+            if sequence_delta > 0 and elapsed_s >= 0:
+                # Logger snapshots may skip worker emissions. Dividing by the
+                # sequence advance estimates the mean interval across that gap.
+                intervals.append(elapsed_s / sequence_delta)
+                unobserved_intermediate += max(0, sequence_delta - 1)
+            elif sequence_delta <= 0:
+                sequence_resets += 1
+
+        previous_pair = pair
+        previous_sequence = sequence
+        previous_received = received
+
+    row_count = len(rows)
+
+    def _rate(count: int) -> Optional[float]:
+        return 100.0 * count / row_count if row_count else None
+
+    return {
+        "row_count": row_count,
+        "unique_observed_samples": unique_samples,
+        "missing_provenance_rows": missing_provenance,
+        "missing_provenance_percent": _rate(missing_provenance),
+        "value_missing_rows": value_missing,
+        "value_missing_percent": _rate(value_missing),
+        "reused_sequence_rows": reused,
+        "reused_sequence_percent": _rate(reused),
+        "unobserved_intermediate_samples": unobserved_intermediate,
+        "sequence_resets": sequence_resets,
+        "sequence_normalized_interval_s": _stats(intervals),
+        "read_duration_ms": _stats(durations),
+        "logged_age_ms": _stats(ages),
+        "source_to_receive_offset_ms": _stats(source_offsets),
+        "source_update_interval_s": _stats(source_intervals),
+        "reused_source_timestamp_rows": reused_source_timestamps,
+    }
+
+
+def build_summary(
+    sensor_log: Path,
+    rows: list[dict[str, str]],
+    fieldnames: list[str],
+    metadata: dict,
+    capture: dict,
+    repo_root: Path,
+) -> dict:
+    instruments = {
+        prefix: summarize_instrument(rows, prefix, config["values"])
+        for prefix, config in INSTRUMENTS.items()
+    }
+    expected_fields = {
+        f"{prefix}_{suffix}"
+        for prefix in INSTRUMENTS
+        for suffix in (
+            "source_at_utc",
+            "received_at_utc",
+            "sample_sequence",
+            "age_ms",
+            "read_duration_ms",
+        )
+    }
+    return {
+        "schema_version": 1,
+        "generated_at_utc": dt.datetime.now(
+            dt.timezone.utc,
+        ).isoformat(timespec="seconds"),
+        "source": {
+            "sensor_log": str(sensor_log.resolve()),
+            "sha256": _file_sha256(sensor_log),
+            "timing_columns_present": expected_fields.issubset(fieldnames),
+            "missing_timing_columns": sorted(expected_fields - set(fieldnames)),
+            "analyzed_row_count": len(rows),
+        },
+        "software": {
+            "git_commit": _git_commit(repo_root),
+        },
+        "capture": capture,
+        "metadata": metadata,
+        "instruments": instruments,
+        "interpretation": {
+            "pass_fail_threshold_applied": False,
+            "interval_definition": (
+                "elapsed receive time divided by sample-sequence advance "
+                "between observed sensor-log snapshots"
+            ),
+            "missing_provenance_definition": (
+                "row lacks a positive sequence or parseable received_at_utc"
+            ),
+            "value_missing_definition": (
+                "all configured value columns for the instrument are blank"
+            ),
+        },
+    }
+
+
+def _fmt(value: object, places: int = 3) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, float):
+        return f"{value:.{places}f}"
+    return str(value)
+
+
+def render_markdown(summary: dict) -> str:
+    source = summary["source"]
+    capture = summary["capture"]
+    metadata = summary["metadata"]
+    lines = [
+        "# O-MBE Timing Observability Report",
+        "",
+        "This report is descriptive. No synchronization or pass/fail threshold "
+        "has been assumed.",
+        "",
+        "## Run metadata",
+        "",
+        f"- Git commit: `{summary['software']['git_commit']}`",
+        f"- Probe start (UTC): `{capture['started_at_utc']}`",
+        f"- Probe end (UTC): `{capture['ended_at_utc']}`",
+        f"- Requested duration: `{capture['requested_duration_s']} s`",
+        f"- Analyzed rows: `{source['analyzed_row_count']}`",
+        f"- Sensor log: `{source['sensor_log']}`",
+        f"- Sensor log SHA-256: `{source['sha256']}`",
+        f"- Timing columns present: `{source['timing_columns_present']}`",
+        f"- Operator: `{metadata.get('operator') or 'not recorded'}`",
+        f"- Windows/DPI: `{metadata.get('windows_dpi') or 'not recorded'}`",
+        f"- GUI modes: `{metadata.get('gui_modes') or 'not recorded'}`",
+        f"- Window titles: `{metadata.get('window_titles') or 'not recorded'}`",
+        f"- Sampling settings: "
+        f"`{metadata.get('sampling_settings') or 'not recorded'}`",
+        f"- Software versions: "
+        f"`{metadata.get('software_versions') or 'not recorded'}`",
+        f"- Notes: `{metadata.get('notes') or 'none'}`",
+        "",
+    ]
+    if source["missing_timing_columns"]:
+        lines.extend([
+            "## Schema warning",
+            "",
+            "The input is missing timing columns: "
+            + ", ".join(f"`{name}`" for name in source["missing_timing_columns"])
+            + ". Timing metrics may be unavailable.",
+            "",
+        ])
+
+    lines.extend([
+        "## Timing results",
+        "",
+        "| Instrument | Unique samples | Missing provenance | Value missing | "
+        "Reused rows | Unobserved intermediate | Interval p50/p95/p99 (s) | "
+        "Read p50/p95/p99 (ms) | Age p50/p95/p99 (ms) | "
+        "Source offset p50/p95/p99 (ms) | "
+        "Source update p50/p95/p99 (s) | Reused source rows |",
+        "|---|---:|---:|---:|---:|---:|---|---|---|---|---|---:|",
+    ])
+    for name, result in summary["instruments"].items():
+        interval = result["sequence_normalized_interval_s"]
+        duration = result["read_duration_ms"]
+        age = result["logged_age_ms"]
+        offset = result["source_to_receive_offset_ms"]
+        source_interval = result["source_update_interval_s"]
+        lines.append(
+            f"| {name} "
+            f"| {result['unique_observed_samples']} "
+            f"| {result['missing_provenance_rows']} "
+            f"({_fmt(result['missing_provenance_percent'], 2)}%) "
+            f"| {result['value_missing_rows']} "
+            f"({_fmt(result['value_missing_percent'], 2)}%) "
+            f"| {result['reused_sequence_rows']} "
+            f"| {result['unobserved_intermediate_samples']} "
+            f"| {_fmt(interval['p50'])} / {_fmt(interval['p95'])} / "
+            f"{_fmt(interval['p99'])} "
+            f"| {_fmt(duration['p50'])} / {_fmt(duration['p95'])} / "
+            f"{_fmt(duration['p99'])} "
+            f"| {_fmt(age['p50'])} / {_fmt(age['p95'])} / "
+            f"{_fmt(age['p99'])} "
+            f"| {_fmt(offset['p50'])} / {_fmt(offset['p95'])} / "
+            f"{_fmt(offset['p99'])} "
+            f"| {_fmt(source_interval['p50'])} / "
+            f"{_fmt(source_interval['p95'])} / "
+            f"{_fmt(source_interval['p99'])} "
+            f"| {result['reused_source_timestamp_rows']} |"
+        )
+
+    lines.extend([
+        "",
+        "## Interpretation notes",
+        "",
+        "- Intervals are sequence-normalized estimates from ~1 Hz logger "
+        "snapshots; intermediate worker emissions are not individually stored.",
+        "- `logged_age_ms` uses the process monotonic clock and is not affected "
+        "by wall-clock or timezone adjustments.",
+        "- Elog source offset is signed `received_at_utc - source_at_utc`. It "
+        "does not prove when each underlying instrument completed a measurement.",
+        "- Elog source-update intervals use changes in the embedded record "
+        "timestamp; repeated timestamps are counted separately.",
+        "- Blank source offsets are expected for pyrometer, MISTRAL, OCR, and "
+        "dummy modes because those sources expose no source timestamp.",
+        "",
+        "## Operator observations",
+        "",
+        "- Unexpected pauses/errors:",
+        "- Window or mode changes:",
+        "- Follow-up measurements:",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def wait_for_rows(
+    path: Path,
+    duration_s: float,
+    poll_s: float,
+) -> tuple[int, dict]:
+    started = dt.datetime.now(dt.timezone.utc)
+    deadline = time.monotonic() + duration_s
+    _, initial_rows = _read_rows(path)
+    initial_count = len(initial_rows)
+    next_progress = time.monotonic() + 60.0
+
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        time.sleep(min(poll_s, max(0.0, remaining)))
+        if time.monotonic() >= next_progress:
+            _, current_rows = _read_rows(path)
+            print(
+                f"probe progress: {max(0, len(current_rows) - initial_count)} "
+                f"new rows, {max(0.0, deadline - time.monotonic()):.0f} s left",
+                flush=True,
+            )
+            next_progress = time.monotonic() + 60.0
+
+    ended = dt.datetime.now(dt.timezone.utc)
+    return initial_count, {
+        "mode": "wait",
+        "started_at_utc": started.isoformat(timespec="seconds"),
+        "ended_at_utc": ended.isoformat(timespec="seconds"),
+        "requested_duration_s": duration_s,
+        "initial_row_count": initial_count,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("sensor_log", type=Path)
+    parser.add_argument(
+        "--duration-seconds",
+        type=float,
+        default=3600.0,
+        help="Observation window; default: 3600 (one hour)",
+    )
+    parser.add_argument("--poll-seconds", type=float, default=5.0)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Analyze all existing rows immediately",
+    )
+    parser.add_argument("--operator", default="")
+    parser.add_argument("--windows-dpi", default="")
+    parser.add_argument("--gui-modes", default="")
+    parser.add_argument("--window-titles", default="")
+    parser.add_argument("--sampling-settings", default="")
+    parser.add_argument("--software-versions", default="")
+    parser.add_argument("--notes", default="")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.duration_seconds < 0:
+        raise SystemExit("--duration-seconds must be non-negative")
+    if args.poll_seconds <= 0:
+        raise SystemExit("--poll-seconds must be positive")
+
+    sensor_log = args.sensor_log.resolve()
+    repo_root = Path(__file__).resolve().parent.parent
+    output_dir = args.output_dir
+    if output_dir is None:
+        tag = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = sensor_log.parent / f"timing_probe_{tag}"
+    output_dir.mkdir(parents=True, exist_ok=False)
+
+    if args.no_wait:
+        now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        initial_count = 0
+        capture = {
+            "mode": "no-wait",
+            "started_at_utc": now,
+            "ended_at_utc": now,
+            "requested_duration_s": 0.0,
+            "initial_row_count": 0,
+        }
+    else:
+        print(
+            f"passively observing {sensor_log} for "
+            f"{args.duration_seconds:.0f} s",
+            flush=True,
+        )
+        initial_count, capture = wait_for_rows(
+            sensor_log, args.duration_seconds, args.poll_seconds,
+        )
+
+    fieldnames, all_rows = _read_rows(sensor_log)
+    if not sensor_log.exists():
+        raise SystemExit(f"sensor log does not exist: {sensor_log}")
+    rows = all_rows[initial_count:]
+    capture["final_row_count"] = len(all_rows)
+
+    metadata = {
+        "operator": args.operator,
+        "windows_dpi": args.windows_dpi,
+        "gui_modes": args.gui_modes,
+        "window_titles": args.window_titles,
+        "sampling_settings": args.sampling_settings,
+        "software_versions": args.software_versions,
+        "notes": args.notes,
+    }
+    summary = build_summary(
+        sensor_log,
+        rows,
+        fieldnames,
+        metadata,
+        capture,
+        repo_root,
+    )
+
+    json_path = output_dir / "timing_summary.json"
+    report_path = output_dir / "timing_report.md"
+    json_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    report_path.write_text(render_markdown(summary), encoding="utf-8")
+    print(f"summary: {json_path}", flush=True)
+    print(f"report:  {report_path}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
