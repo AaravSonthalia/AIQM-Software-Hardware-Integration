@@ -76,8 +76,15 @@ class PyrometerState:
     error: str = ""
     device_info: str = ""
     mode: str = ""  # "modbus", "screengrab", or "dummy"
-    # Software acquisition provenance. Native source time stays blank when the
-    # driver exposes only a value; age is refreshed when the cache is logged.
+    # Read-only sample provenance. UTC fields are ISO-8601 strings; the
+    # monotonic timestamp is process-local and is used only to calculate age.
+    source_at_utc: Optional[str] = None
+    received_at_utc: Optional[str] = None
+    sample_sequence: int = 0
+    read_duration_ms: Optional[float] = None
+    received_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
 
 
 @dataclass
@@ -96,6 +103,15 @@ class MistralState:
     # shutter_open/shutter_closed, ebvm_*, ion_gauge_*_P, pirani_*_P,
     # turbo*_rpm, service_mode. None in all other modes.
     ads_cells: Optional[dict] = None
+    # ``source_at_utc`` is reserved for a future hardware/source timestamp;
+    # current MISTRAL modes expose only the Python receive timestamp.
+    source_at_utc: Optional[str] = None
+    received_at_utc: Optional[str] = None
+    sample_sequence: int = 0
+    read_duration_ms: Optional[float] = None
+    received_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
 
 
 @dataclass
@@ -131,6 +147,15 @@ class EvapControlState:
     connected: bool = False
     error: str = ""
     mode: str = ""  # "screengrab", "elog", or "dummy"
+    # Elog mode populates ``source_at_utc`` from the LabVIEW record. OCR and
+    # dummy modes have no source clock and leave it None.
+    source_at_utc: Optional[str] = None
+    received_at_utc: Optional[str] = None
+    sample_sequence: int = 0
+    read_duration_ms: Optional[float] = None
+    received_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
 
 
 @dataclass

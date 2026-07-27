@@ -12,6 +12,31 @@ import numpy as np
 from PyQt6.QtCore import QMutex, QThread, pyqtSignal
 
 
+def _utc_iso_now() -> str:
+    """Return a timezone-explicit UTC receive timestamp."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _mark_sample_received(
+    state,
+    read_started_ns: int,
+    source_at_utc: Optional[str] = None,
+) -> None:
+    """Attach provenance after one poll returns without raising.
+
+    A failed read does not call this helper, so its state retains the previous
+    sequence/timestamp and downstream ``age_ms`` increases naturally.
+    """
+    received_ns = time.monotonic_ns()
+    state.source_at_utc = source_at_utc
+    state.received_at_utc = _utc_iso_now()
+    state.sample_sequence += 1
+    state.read_duration_ms = max(
+        0.0, (received_ns - read_started_ns) / 1_000_000.0,
+    )
+    state.received_monotonic_ns = received_ns
+
+
 def _frame_luminance(frame: np.ndarray) -> float:
     """Grayscale-equivalent mean intensity from a camera frame.
 
@@ -486,12 +511,12 @@ class PyrometerWorker(QThread):
             else:
                 state.device_info = self.mode
 
-            self.state_updated.emit(state)
+            self.state_updated.emit(replace(state))
 
         except Exception as e:
             state.connected = False
             state.error = str(e)
-            self.state_updated.emit(state)
+            self.state_updated.emit(replace(state))
             return
 
         while self.running:
@@ -499,6 +524,7 @@ class PyrometerWorker(QThread):
             # emitted state carries a mean ± std rather than a single
             # noisy point estimate. Polybot-inspired statistical
             # consistency without a second analysis pass.
+            read_started_ns = time.monotonic_ns()
             readings: list[float] = []
             for _ in range(self.samples_per_poll):
                 try:
@@ -521,7 +547,12 @@ class PyrometerWorker(QThread):
                 except Exception:
                     pass
 
-            self.state_updated.emit(state)
+            if readings:
+                _mark_sample_received(state, read_started_ns)
+            # PyQt queues custom Python objects by reference. Emit a fresh
+            # dataclass so the next poll cannot mutate timing provenance
+            # before the GUI/logger consumes this sample.
+            self.state_updated.emit(replace(state))
             time.sleep(self.poll_interval)
 
         # Cleanup
@@ -583,11 +614,12 @@ class MistralWorker(QThread):
                 except Exception as e:
                     state.connected = False
                     state.error = str(e)
-                    self.state_updated.emit(state)
+                    self.state_updated.emit(replace(state))
                     time.sleep(self.poll_interval)
                     continue
 
             try:
+                read_started_ns = time.monotonic_ns()
                 vals = self._driver.read()
                 state.v_set = vals.get("v_set")
                 state.v_actual = vals.get("v_actual")
@@ -599,10 +631,11 @@ class MistralWorker(QThread):
                 state.ads_cells = vals if self.mode == "ads" else None
                 state.connected = True
                 state.error = ""
+                _mark_sample_received(state, read_started_ns)
             except Exception as e:
                 state.error = str(e)
 
-            self.state_updated.emit(state)
+            self.state_updated.emit(replace(state))
             time.sleep(self.poll_interval)
 
         if self._driver is not None:
@@ -679,11 +712,12 @@ class EvapControlWorker(QThread):
                 except Exception as e:
                     state.connected = False
                     state.error = str(e)
-                    self.state_updated.emit(state)
+                    self.state_updated.emit(replace(state))
                     time.sleep(self.poll_interval)
                     continue
 
             try:
+                read_started_ns = time.monotonic_ns()
                 vals = self._driver.read()
                 # Pressure: populated by both screengrab and elog modes.
                 state.chamber_pressure_mbar = vals.get("chamber_pressure_mbar")
@@ -703,10 +737,17 @@ class EvapControlWorker(QThread):
                 state.plasma_reflected_W = vals.get("plasma_reflected_W")
                 state.connected = True
                 state.error = ""
+                _mark_sample_received(
+                    state,
+                    read_started_ns,
+                    source_at_utc=getattr(
+                        self._driver, "last_source_at_utc", None,
+                    ),
+                )
             except Exception as e:
                 state.error = str(e)
 
-            self.state_updated.emit(state)
+            self.state_updated.emit(replace(state))
             time.sleep(self.poll_interval)
 
         if self._driver is not None:

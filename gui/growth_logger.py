@@ -131,6 +131,16 @@ class GrowthLogger:
         # Beckhoff PLC's PIDProgram.Cell{i}_pidTDK.ActualTemperature.
         "cell1_T_C", "cell2_T_C", "cell3_T_C", "cell4_T_C",
         "cell5_T_C", "cell6_T_C", "cell7_T_C",
+        # Read-only timing provenance. Appended to preserve every legacy
+        # column name and position for existing consumers.
+        "pyrometer_source_at_utc", "pyrometer_received_at_utc",
+        "pyrometer_sample_sequence", "pyrometer_age_ms",
+        "pyrometer_read_duration_ms",
+        "mistral_source_at_utc", "mistral_received_at_utc",
+        "mistral_sample_sequence", "mistral_age_ms",
+        "mistral_read_duration_ms",
+        "evap_source_at_utc", "evap_received_at_utc",
+        "evap_sample_sequence", "evap_age_ms", "evap_read_duration_ms",
     ]
     COMMIT_FIELDS = [
         "timestamp", "time_display", "elapsed_s", "sample_id", "grower",
@@ -2044,6 +2054,17 @@ class GrowthLogger:
         # ADS-mode extensions (Jul 23 2026 — MistralWorker mode="ads").
         # Full read() dict from MistralAdsClient; None in O-MBE sessions.
         ads_cells=None,
+        # Per-instrument timing provenance. Optional so callers using the
+        # pre-observability API continue to produce valid rows.
+        pyrometer_source_at_utc=None, pyrometer_received_at_utc=None,
+        pyrometer_sample_sequence=None, pyrometer_age_ms=None,
+        pyrometer_read_duration_ms=None,
+        mistral_source_at_utc=None, mistral_received_at_utc=None,
+        mistral_sample_sequence=None, mistral_age_ms=None,
+        mistral_read_duration_ms=None,
+        evap_source_at_utc=None, evap_received_at_utc=None,
+        evap_sample_sequence=None, evap_age_ms=None,
+        evap_read_duration_ms=None,
     ):
         """Append a row to sensor_log.csv. All values may be None.
 
@@ -2095,6 +2116,34 @@ class GrowthLogger:
                 )
                 for i in range(1, 8)
             },
+            "pyrometer_source_at_utc": pyrometer_source_at_utc or "",
+            "pyrometer_received_at_utc": pyrometer_received_at_utc or "",
+            "pyrometer_sample_sequence": (
+                pyrometer_sample_sequence
+                if pyrometer_sample_sequence is not None else ""
+            ),
+            "pyrometer_age_ms": _f(pyrometer_age_ms, 3),
+            "pyrometer_read_duration_ms": _f(
+                pyrometer_read_duration_ms, 3,
+            ),
+            "mistral_source_at_utc": mistral_source_at_utc or "",
+            "mistral_received_at_utc": mistral_received_at_utc or "",
+            "mistral_sample_sequence": (
+                mistral_sample_sequence
+                if mistral_sample_sequence is not None else ""
+            ),
+            "mistral_age_ms": _f(mistral_age_ms, 3),
+            "mistral_read_duration_ms": _f(
+                mistral_read_duration_ms, 3,
+            ),
+            "evap_source_at_utc": evap_source_at_utc or "",
+            "evap_received_at_utc": evap_received_at_utc or "",
+            "evap_sample_sequence": (
+                evap_sample_sequence
+                if evap_sample_sequence is not None else ""
+            ),
+            "evap_age_ms": _f(evap_age_ms, 3),
+            "evap_read_duration_ms": _f(evap_read_duration_ms, 3),
         })
         self._sensor_file.flush()
         self._sensor_row_counter += 1

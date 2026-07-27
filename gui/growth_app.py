@@ -78,6 +78,35 @@ AUTO_CAPTURE_COOLDOWN_S = 10.0
 AUTO_CAPTURE_ADAPTIVE_SIGMA = 3.0
 AUTO_CAPTURE_ADAPTIVE_FLOOR = 0.5
 
+
+def _sample_timing_snapshot(state, logged_monotonic_ns: Optional[int] = None):
+    """Copy one state's provenance and calculate its current monotonic age."""
+    if state is None:
+        return {
+            "source": None,
+            "received": None,
+            "sequence": None,
+            "age_ms": None,
+            "read_duration_ms": None,
+        }
+    if logged_monotonic_ns is None:
+        logged_monotonic_ns = time.monotonic_ns()
+    received_ns = state.received_monotonic_ns
+    age_ms = None
+    if received_ns is not None:
+        age_ms = max(
+            0.0,
+            (logged_monotonic_ns - received_ns) / 1_000_000.0,
+        )
+    return {
+        "source": state.source_at_utc,
+        "received": state.received_at_utc,
+        "sequence": state.sample_sequence,
+        "age_ms": age_ms,
+        "read_duration_ms": state.read_duration_ms,
+    }
+
+
 # Heartbeat dense-capture: every N seconds during a session, save the
 # latest RHEED frame regardless of detector flags. Per the May 21 joint
 # decision and Yuxin's CS-side "background data" request, capture as
@@ -1968,6 +1997,10 @@ class GrowthApp(QMainWindow):
         _evap_p = e.chamber_pressure_mbar if evap_ok else None
         _ads_p  = ads_cells.get("ion_gauge_1_P") if ads_cells else None
         _pressure = _evap_p if _evap_p is not None else _ads_p
+        logged_monotonic_ns = time.monotonic_ns()
+        pyro_timing = _sample_timing_snapshot(pyro, logged_monotonic_ns)
+        mistral_timing = _sample_timing_snapshot(m, logged_monotonic_ns)
+        evap_timing = _sample_timing_snapshot(e, logged_monotonic_ns)
         self.growth_log.log_sensors(
             pyro_temp,
             self.monitor.get_elapsed_seconds(),
@@ -1995,6 +2028,21 @@ class GrowthApp(QMainWindow):
             plasma_forward_W=e.plasma_forward_W if evap_ok else None,
             plasma_reflected_W=e.plasma_reflected_W if evap_ok else None,
             ads_cells=ads_cells,
+            pyrometer_source_at_utc=pyro_timing["source"],
+            pyrometer_received_at_utc=pyro_timing["received"],
+            pyrometer_sample_sequence=pyro_timing["sequence"],
+            pyrometer_age_ms=pyro_timing["age_ms"],
+            pyrometer_read_duration_ms=pyro_timing["read_duration_ms"],
+            mistral_source_at_utc=mistral_timing["source"],
+            mistral_received_at_utc=mistral_timing["received"],
+            mistral_sample_sequence=mistral_timing["sequence"],
+            mistral_age_ms=mistral_timing["age_ms"],
+            mistral_read_duration_ms=mistral_timing["read_duration_ms"],
+            evap_source_at_utc=evap_timing["source"],
+            evap_received_at_utc=evap_timing["received"],
+            evap_sample_sequence=evap_timing["sequence"],
+            evap_age_ms=evap_timing["age_ms"],
+            evap_read_duration_ms=evap_timing["read_duration_ms"],
         )
 
         from datetime import datetime
