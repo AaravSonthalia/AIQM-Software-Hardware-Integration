@@ -8,6 +8,23 @@ from typing import Optional
 import numpy as np
 from PyQt6.QtCore import QMutex, QThread, pyqtSignal
 
+
+def _frame_luminance(frame: np.ndarray) -> float:
+    """Grayscale-equivalent mean intensity from a camera frame.
+
+    Handles both 2-D (H, W) raw and 3-D (H, W, 3) RGB frames.
+    Uses ITU-R BT.601 luminance weights for RGB so the result is
+    consistent regardless of whether the BGW palette was applied.
+    Green-channel-only mean is biased: BGW saturates G=255 across
+    the upper half of the LUT (indices 128-255), hiding R/B variation.
+    """
+    if frame.ndim == 2:
+        return float(frame.mean())
+    r = frame[:, :, 0].astype(np.float32)
+    g = frame[:, :, 1].astype(np.float32)
+    b = frame[:, :, 2].astype(np.float32)
+    return float((0.299 * r + 0.587 * g + 0.114 * b).mean())
+
 from gui.state import (
     CameraState, ClassifierState, EvapControlState, MistralState, PowerSupplyState,
     PyrometerState, TemperatureState,
@@ -330,6 +347,7 @@ class RheedCameraWorker(QThread):
                 state.frame = frame
                 state.frame_number = frame_count
                 state.height, state.width = frame.shape[:2]
+                state.intensity = _frame_luminance(frame)
                 state.connected = True
                 state.error = ""
 

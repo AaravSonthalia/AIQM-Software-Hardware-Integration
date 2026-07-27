@@ -38,6 +38,8 @@ from gui.movie_export import (
     MovieExporter,
     MovieExportWorker,
 )
+from gui.rheed_intensity_window import RheedIntensityWindow
+from gui.pyrometer_window import PyrometerWindow
 
 
 # Tuned against Rahim's 2022_02_04 STO trajectory.
@@ -253,6 +255,25 @@ class GrowthApp(QMainWindow):
             self.monitor.events_tab.on_decision_made,
         )
 
+        # Floating trend windows — growers can open and drag to a second
+        # monitor. Fed through _on_camera_state/_on_pyrometer_state (not
+        # directly from workers) so they survive worker recreation on
+        # session restart without needing reconnection.
+        self.rheed_intensity_window = RheedIntensityWindow()
+        self.pyrometer_window = PyrometerWindow()
+        self.monitor.open_rheed_trend_requested.connect(
+            lambda: (
+                self.rheed_intensity_window.show(),
+                self.rheed_intensity_window.raise_(),
+            )
+        )
+        self.monitor.open_temp_plot_requested.connect(
+            lambda: (
+                self.pyrometer_window.show(),
+                self.pyrometer_window.raise_(),
+            )
+        )
+
     # --- ARM / DISARM ------------------------------------------------------
 
     @pyqtSlot()
@@ -373,6 +394,11 @@ class GrowthApp(QMainWindow):
 
         sample_id = self.monitor.sample_id_input.text().strip() or "unnamed"
         self.growth_log.start_session(sample_id)
+
+        # Clear trend window histories so a new growth starts fresh —
+        # without this, a second growth inherits the first growth's trace.
+        self.rheed_intensity_window.reset()
+        self.pyrometer_window.reset()
 
         # Point the events tab at this session's logger so backfill
         # (handles GUI-restart-mid-session), the live append-on-signal,
@@ -795,6 +821,7 @@ class GrowthApp(QMainWindow):
     @pyqtSlot(CameraState)
     def _on_camera_state(self, state: CameraState):
         self.monitor.update_camera_state(state)
+        self.rheed_intensity_window.on_camera_state(state)
 
         # Feed the auto-capture engine. Engine internally guards on `enabled`,
         # so this is a no-op outside an active session.
@@ -1005,6 +1032,7 @@ class GrowthApp(QMainWindow):
     @pyqtSlot(PyrometerState)
     def _on_pyrometer_state(self, state: PyrometerState):
         self.monitor.update_pyrometer_state(state)
+        self.pyrometer_window.on_pyrometer_state(state)
 
     @pyqtSlot(MistralState)
     def _on_mistral_state(self, state: MistralState):

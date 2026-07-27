@@ -489,10 +489,45 @@ def test_trigger_backoff_after_consecutive_fails() -> None:
 # Runner
 # ---------------------------------------------------------------------------
 
+def test_frame_luminance_2d_frame() -> None:
+    """_frame_luminance returns mean pixel value for a 2-D (H, W) frame."""
+    from gui.workers import _frame_luminance
+    frame = np.array([[0, 128, 255]], dtype=np.uint8)
+    result = _frame_luminance(frame)
+    assert isinstance(result, float)
+    assert abs(result - (0 + 128 + 255) / 3) < 0.5
+
+
+def test_frame_luminance_rgb_bt601_weights() -> None:
+    """_frame_luminance uses BT.601 weights, not green-channel-only mean.
+
+    Pure green pixel: G-only mean = 200; BT.601 = 0.587 * 200 = 117.4.
+    """
+    from gui.workers import _frame_luminance
+    frame = np.array([[[0, 200, 0]]], dtype=np.uint8)
+    lum = _frame_luminance(frame)
+    assert abs(lum - 0.587 * 200) < 0.5, f"Expected ~{0.587*200:.1f}, got {lum:.2f}"
+    assert lum != 200.0, "Should differ from green-channel-only mean"
+
+
+def test_frame_luminance_rgb_includes_r_and_b() -> None:
+    """_frame_luminance accounts for all three channels (BGW upper-ramp case)."""
+    from gui.workers import _frame_luminance
+    white = np.array([[[255, 255, 255]]], dtype=np.uint8)
+    assert abs(_frame_luminance(white) - 255.0) < 0.5
+    # BGW LUT[200]: R=145, G=255, B=145
+    frame = np.array([[[145, 255, 145]]], dtype=np.uint8)
+    expected = 0.299 * 145 + 0.587 * 255 + 0.114 * 145
+    assert abs(_frame_luminance(frame) - expected) < 0.5
+
+
 TESTS = [
     test_palette_intensity_in_all_channels,
     test_palette_bgw_output,
     test_normalization_fixed_denominator,
+    test_frame_luminance_2d_frame,
+    test_frame_luminance_rgb_bt601_weights,
+    test_frame_luminance_rgb_includes_r_and_b,
     test_connect_then_read_frame,
     test_connect_no_cameras_raises,
     test_connect_import_error_raises_early,

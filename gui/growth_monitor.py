@@ -308,6 +308,8 @@ class GrowthMonitor(QWidget):
     disarm_requested = pyqtSignal()
     start_requested = pyqtSignal()
     stop_requested = pyqtSignal()
+    open_rheed_trend_requested = pyqtSignal()
+    open_temp_plot_requested = pyqtSignal()
     commit_requested = pyqtSignal(dict)
     # Grower-marked event (Jul 10 2026 group-meeting design shift). Payload:
     #   pyro_temp:  Optional[float]   — °C from _latest_pyro
@@ -700,6 +702,24 @@ class GrowthMonitor(QWidget):
             self._on_pause_auto_capture_clicked,
         )
         footer.addWidget(self.pause_auto_capture_btn, 0)
+
+        _btn_style = (
+            "QPushButton { background-color: #1a1a1a; color: #94a3b8; "
+            "border: 1px solid #334155; padding: 2px 8px; font-size: 11px; }"
+            "QPushButton:hover { color: #e2e8f0; border-color: #475569; }"
+        )
+        self.btn_rheed_trend = QPushButton("RHEED Trend ↗")
+        self.btn_rheed_trend.setFixedWidth(120)
+        self.btn_rheed_trend.setStyleSheet(_btn_style)
+        self.btn_rheed_trend.clicked.connect(self.open_rheed_trend_requested)
+        footer.addWidget(self.btn_rheed_trend, 0)
+
+        self.btn_temp_plot = QPushButton("Temp Plot ↗")
+        self.btn_temp_plot.setFixedWidth(100)
+        self.btn_temp_plot.setStyleSheet(_btn_style)
+        self.btn_temp_plot.clicked.connect(self.open_temp_plot_requested)
+        footer.addWidget(self.btn_temp_plot, 0)
+
         layout.addLayout(footer)
 
         self._tabs.addTab(tab, "Monitor")
