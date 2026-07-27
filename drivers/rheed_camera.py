@@ -82,10 +82,11 @@ class VmbCamera(RheedCamera):
     """
 
     # Time to wait in connect() for the streaming thread to become ready
-    # (or fail). 10s is generous — Manta G-033B on Bulbasaur typically
-    # completes VmbSystem + camera open + start_streaming in <2s. Tunable
-    # if a slower camera shows up.
-    CONNECT_TIMEOUT_S = 10.0
+    # (or fail). Generous 45s to accommodate slow GigE discovery on
+    # machines with multiple Vimba transport-layer providers registered
+    # (e.g. old Vimba + Vimba X both installed → get_all_cameras() walks
+    # every interface, adding 15-20s). Camera open itself is <2s.
+    CONNECT_TIMEOUT_S = 45.0
 
     # Time to wait in disconnect() for the streaming thread to exit.
     # 5s covers the worst case where TriggerSoftware.run() is mid-call.
