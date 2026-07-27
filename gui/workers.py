@@ -349,7 +349,7 @@ class RheedCameraWorker(QThread):
 
     def _create_camera(self):
         """Factory method — import and instantiate camera driver."""
-        if self.mode == "direct":
+        if self.mode in ("vimba", "direct"):
             from drivers.rheed_camera import VmbCamera
             return VmbCamera()
         elif self.mode == "screengrab":

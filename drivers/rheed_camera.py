@@ -65,8 +65,11 @@ class VmbCamera(RheedCamera):
     Direct access to an Allied Vision camera (Manta G-033B) via the vmbpy SDK.
 
     Requires an exclusive camera lock — cannot run while kSA 400 holds the
-    camera. Frames are monochrome; intensity is placed in the green channel
-    to match the convention used by the rest of the GUI.
+    camera. Frames are palette-mapped to kSA's BGW false-color LUT via
+    ``gui.ksa_palette.KSA_BGW_PALETTE`` (byte-verified against 200 training
+    BMPs) so direct-Vimba output is visually and distributionally identical
+    to kSA screengrab training data. Pass ``apply_palette=False`` for plain
+    ``(I, I, I)`` grayscale output.
 
     Acquisition uses a **streaming-callback** pattern, not per-call triggering.
     With ``TriggerMode='On'`` the camera produces frames only into an active
@@ -103,6 +106,7 @@ class VmbCamera(RheedCamera):
         camera_index: int = 0,
         trigger_hz: float = 1.0,
         bit_depth: int = 12,
+        apply_palette: bool = True,
     ):
         self._camera_index = camera_index
         self._trigger_hz = trigger_hz
@@ -114,6 +118,7 @@ class VmbCamera(RheedCamera):
         # scale and produce synthetic change scores between frames whose
         # raw pixel values are identical but max intensity differs.
         self._max_value = (1 << bit_depth) - 1
+        self._apply_palette = apply_palette
         self._connected = False
 
         # Streaming state. The stream thread owns every vmbpy call for a
@@ -288,19 +293,19 @@ class VmbCamera(RheedCamera):
         with identical raw pixels but different peak intensity, injecting
         synthetic change scores into the std-of-|diff| detector.
 
-        **Monochrome mapping**: the raw intensity is written into ALL THREE
-        RGB channels so ``L = 0.299·R + 0.587·G + 0.114·B = intensity``.
-        Historically this driver wrote the intensity only into the green
-        channel, which capped Classifier2's L input at 150 instead of 255
-        (Classifier2 does .convert('L') internally — the model is grayscale).
-        See ``docs/ksa_palette_classifier_input.md`` (May 22 2026).
+        When ``apply_palette=True`` (default) the uint8 intensity is passed
+        through the kSA BGW LUT from ``gui.ksa_palette`` so frames look and
+        classify identically to kSA screengrab training data. When False,
+        intensity is written into all three channels ``(I, I, I)``.
         """
         if img.dtype != np.uint8:
             img = (
                 img.astype(np.float32) / self._max_value * 255.0
             ).clip(0, 255).astype(np.uint8)
         if img.ndim == 2:
-            # (I, I, I) — matches ScreenGrabCamera's BGW-averaged L values.
+            if self._apply_palette:
+                from gui.ksa_palette import KSA_BGW_PALETTE  # noqa: PLC0415
+                return KSA_BGW_PALETTE[img]
             return np.stack([img, img, img], axis=-1)
         return img
 

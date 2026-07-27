@@ -953,7 +953,7 @@ class GrowthMonitor(QWidget):
         config_form.addRow("Filename prefix:", self.config_prefix)
 
         self.config_camera_mode = QComboBox()
-        self.config_camera_mode.addItems(["dummy", "screengrab", "direct"])
+        self.config_camera_mode.addItems(["dummy", "screengrab", "vimba"])
         config_form.addRow("Camera mode:", self.config_camera_mode)
 
         self.config_pyrometer_mode = QComboBox()

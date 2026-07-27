@@ -185,28 +185,47 @@ def uninstall_fake_vmbpy() -> None:
 # ---------------------------------------------------------------------------
 
 def test_palette_intensity_in_all_channels() -> None:
-    """_to_rgb_uint8 writes intensity into R, G, AND B so PIL L equals intensity."""
-    # Pure static test — doesn't need the fake SDK.
+    """With apply_palette=False, _to_rgb_uint8 writes intensity into R, G, B (I,I,I)."""
     from drivers.rheed_camera import VmbCamera
-    cam = VmbCamera()
+    cam = VmbCamera(apply_palette=False)
     mono = np.array([[0, 128, 255]], dtype=np.uint8)
     rgb = cam._to_rgb_uint8(mono)
     assert rgb.shape == (1, 3, 3), f"expected (1, 3, 3), got {rgb.shape}"
-    # All three channels equal the input
     assert (rgb[:, :, 0] == mono).all(), f"R != intensity: {rgb[:, :, 0]}"
     assert (rgb[:, :, 1] == mono).all(), f"G != intensity: {rgb[:, :, 1]}"
     assert (rgb[:, :, 2] == mono).all(), f"B != intensity: {rgb[:, :, 2]}"
-    # PIL L conversion: 0.299R + 0.587G + 0.114B — should equal intensity
     L = 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
     assert (np.round(L).astype(np.uint8) == mono).all(), (
         f"L != intensity: L={L.round().astype(int).tolist()} vs {mono.tolist()}"
     )
 
 
+def test_palette_bgw_output() -> None:
+    """With apply_palette=True (default), _to_rgb_uint8 maps intensity through the kSA BGW LUT."""
+    from drivers.rheed_camera import VmbCamera
+    cam = VmbCamera(apply_palette=True)
+    # value 64 → Black→Green ramp (indices 0-127): R=0, B=0, G>0
+    low = np.array([[64]], dtype=np.uint8)
+    rgb_low = cam._to_rgb_uint8(low)
+    assert rgb_low.shape == (1, 1, 3), f"expected (1, 1, 3), got {rgb_low.shape}"
+    assert rgb_low[0, 0, 0] == 0, f"R=0 expected in Black→Green ramp, got {rgb_low[0, 0, 0]}"
+    assert rgb_low[0, 0, 2] == 0, f"B=0 expected in Black→Green ramp, got {rgb_low[0, 0, 2]}"
+    assert rgb_low[0, 0, 1] > 0, f"G>0 expected at value 64, got {rgb_low[0, 0, 1]}"
+    # value 200 → Green→White ramp (indices 128-255): R>0, G=255, B>0
+    high = np.array([[200]], dtype=np.uint8)
+    rgb_high = cam._to_rgb_uint8(high)
+    assert all(rgb_high[0, 0, c] > 0 for c in range(3)), (
+        f"All channels >0 expected in Green→White ramp, got {rgb_high[0, 0]}"
+    )
+    assert rgb_high[0, 0, 1] == 255, (
+        f"G=255 expected in Green→White ramp, got {rgb_high[0, 0, 1]}"
+    )
+
+
 def test_normalization_fixed_denominator() -> None:
     """12-bit uint16 input normalizes with /(2^12 - 1), not per-frame max."""
     from drivers.rheed_camera import VmbCamera
-    cam = VmbCamera(bit_depth=12)
+    cam = VmbCamera(bit_depth=12, apply_palette=False)
     # Two frames with different peak values but the same raw pixel value at [0, 0]
     frame_low = np.array([[2048]], dtype=np.uint16)
     frame_high = np.array([[[2048, 4095]]], dtype=np.uint16).reshape(1, 2)
@@ -472,6 +491,7 @@ def test_trigger_backoff_after_consecutive_fails() -> None:
 
 TESTS = [
     test_palette_intensity_in_all_channels,
+    test_palette_bgw_output,
     test_normalization_fixed_denominator,
     test_connect_then_read_frame,
     test_connect_no_cameras_raises,
