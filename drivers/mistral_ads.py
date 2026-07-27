@@ -1,17 +1,18 @@
 """
-MISTRAL PSU direct-read via Beckhoff TwinCAT ADS — Ch-MBE only.
+MISTRAL PSU direct-read via Beckhoff TwinCAT ADS — per-chamber config.
 
-Discovered Jul 22 2026: on Ch-MBE, MistralGui is a TwinCAT ADS client
-talking to a Beckhoff PLC at NetID 10.0.42.112.1.1 via the local
-TCATSysSrv service. This is architecturally different from Bulbasaur
-(Kestrel JSON-RPC) — same MistralGui.exe, different backend per chamber.
+Discovered Jul 22 2026 on Ch-MBE (NetID 10.0.42.112.1.1, 7 cells).
+Extended Jul 27 2026 to O-MBE / Bulbasaur (NetID 10.0.42.111.1.1, 6 cells)
+after the Kestrel JSON-RPC discovery on Bulbasaur exhausted every
+introspection path and we bypassed it via direct pyads to the same
+underlying Beckhoff PLC that MistralGui talks to through the gateway.
 
-Two ADS ports:
+Two ADS ports (TwinCAT convention):
   - Port 851 = main PLC: pumps, valves, pressure gauges
-  - Port 852 = PID program: effusion cells (Cell1-7), shutters, EBVM
+  - Port 852 = PID program: effusion cells, shutters, EBVM
 
-Full PLC symbol table: C:\\YangLab10 Gui\\VS\\Win32\\ModelDescription.xml
-(read Jul 22 2026). 81/82 variables confirmed readable on a live chamber.
+Full PLC symbol table on Ch-MBE: C:\\YangLab10 Gui\\VS\\Win32\\ModelDescription.xml
+Full PLC symbol table on Bulbasaur: C:\\Program Files\\Scienta Omicron\\MistralGui\\ModelDescription.xml
 
 Interface
 ---------
@@ -22,6 +23,12 @@ Interface
   - ``connected``      — property
   - ``hwnd``           — property (always 0; no window)
 
+Per-chamber config (see ``drivers/config.py``):
+  - ``netid``       — PLC AmsNetId (Ch-MBE: 10.0.42.112.1.1, Bulbasaur: 10.0.42.111.1.1)
+  - ``port_main``   — usually 851
+  - ``port_pid``    — usually 852
+  - ``cell_count``  — number of PID cells (Ch-MBE: 7, Bulbasaur: 6)
+
 ``read()`` output keys
 -----------------------
 Standard keys (consumed by existing ``MistralWorker``):
@@ -29,17 +36,26 @@ Standard keys (consumed by existing ``MistralWorker``):
 
   v_actual = Cell1 measured voltage (manipulator PSU)
   i_actual = Cell1 measured current
-  v_set / i_set = None (ADS exposes temperature setpoints, not V/I setpoints)
+  v_set    = Cell1 programmed voltage setpoint (populated Jul 27 2026,
+             previously None; sourced from cell1_prog_V)
+  i_set    = Cell1 programmed current setpoint (sourced from cell1_prog_A)
 
-Extended keys (available for future ``AdsWorker`` / per-cell logging):
-  cell{1..7}_T      — actual temperature (°C)
-  cell{1..7}_T_set  — setpoint temperature (°C)
-  cell{1..7}_V      — measured voltage (V)
-  cell{1..7}_I      — measured current (A)
-  cell{1..7}_power  — PID output power (%)
-  cell{1..7}_state  — PID state (int enum)
-  cell{1..7}_shutter_open   — bool
-  cell{1..7}_shutter_closed — bool
+Extended keys (per cell 1..cell_count):
+  cell{i}_T                — actual temperature (°C)
+  cell{i}_T_set            — setpoint temperature (°C)
+  cell{i}_active_setpoint  — ramp active setpoint (°C) — added Jul 27 2026
+  cell{i}_V                — measured voltage (V)
+  cell{i}_I                — measured current (A)
+  cell{i}_prog_V           — programmed voltage compliance (V) — added Jul 27 2026
+  cell{i}_prog_A           — programmed current setpoint (A) — added Jul 27 2026
+  cell{i}_power            — PID output power (appears to be watts based on
+                             Jul 27 cross-check: V×I ≈ OutputPower for active
+                             cells; not confirmed via vendor docs)
+  cell{i}_state            — PID state (int enum)
+  cell{i}_shutter_open     — bool
+  cell{i}_shutter_closed   — bool
+
+System keys:
   ebvm_shutter_open   — bool
   ebvm_shutter_closed — bool
   ebvm_coolant        — coolant flow
@@ -53,8 +69,12 @@ Extended keys (available for future ``AdsWorker`` / per-cell logging):
 
 READ-ONLY INVARIANT:
   Only ``Connection.read_by_name`` is ever called.
-  ``write_by_name`` is never imported or called. See test_ads_read.py for
-  the full variable whitelist and safety rationale.
+  ``write_by_name`` is never imported or called. Handles like
+  ``Main.ValveUserCommand*``, ``PIDProgram.Cell{N}_Voltage``, and
+  ``PIDProgram.Cell{N}_Current`` are write handles that would actuate
+  hardware — this driver reads only the corresponding ``Programmed*``
+  and ``Measured*`` observability handles instead. See test_ads_read.py
+  for the full variable whitelist and safety rationale.
 """
 
 from __future__ import annotations
@@ -106,10 +126,12 @@ class MistralAdsClient:
         netid: str = DEFAULT_NETID,
         port_main: int = PORT_MAIN,
         port_pid: int = PORT_PID,
+        cell_count: int = 7,
     ):
         self._netid = netid
         self._port_main = port_main
         self._port_pid = port_pid
+        self._cell_count = cell_count
         self._plc_main = None
         self._plc_pid = None
         self._connected = False
@@ -211,17 +233,20 @@ class MistralAdsClient:
         result["turbo1_rpm"]      = _read(pm, "TurboProgram.pump1.spdRPM",              pyads.PLCTYPE_UINT)
         result["turbo2_rpm"]      = _read(pm, "TurboProgram.pump2.spdRPM",              pyads.PLCTYPE_UINT)
 
-        # --- Cells 1..7 (port 852) ---
-        for i in range(1, 8):
+        # --- Cells 1..cell_count (port 852) ---
+        for i in range(1, self._cell_count + 1):
             px = f"PIDProgram.Cell{i}"
-            result[f"cell{i}_T"]             = _read(pp, f"{px}_pidTDK.ActualTemperature",           pyads.PLCTYPE_LREAL)
-            result[f"cell{i}_T_set"]         = _read(pp, f"{px}_SetPoint",                           pyads.PLCTYPE_LREAL)
-            result[f"cell{i}_V"]             = _read(pp, f"{px}_pidTDK.powerSupply.MeasuredVoltage",  pyads.PLCTYPE_LREAL)
-            result[f"cell{i}_I"]             = _read(pp, f"{px}_pidTDK.powerSupply.MeasuredCurrent",  pyads.PLCTYPE_LREAL)
-            result[f"cell{i}_power"]         = _read(pp, f"{px}_pidTDK.OutputPower",                  pyads.PLCTYPE_LREAL)
-            result[f"cell{i}_state"]         = _read(pp, f"{px}_State",                               pyads.PLCTYPE_INT)
-            result[f"cell{i}_shutter_open"]  = _read(pp, f"{px}_Shutter.StatusOpen",                  pyads.PLCTYPE_BOOL)
-            result[f"cell{i}_shutter_closed"]= _read(pp, f"{px}_Shutter.StatusClosed",                pyads.PLCTYPE_BOOL)
+            result[f"cell{i}_T"]                = _read(pp, f"{px}_pidTDK.ActualTemperature",           pyads.PLCTYPE_LREAL)
+            result[f"cell{i}_T_set"]            = _read(pp, f"{px}_SetPoint",                           pyads.PLCTYPE_LREAL)
+            result[f"cell{i}_active_setpoint"]  = _read(pp, f"{px}_pidTDK.ActiveSetPoint",              pyads.PLCTYPE_LREAL)
+            result[f"cell{i}_V"]                = _read(pp, f"{px}_pidTDK.powerSupply.MeasuredVoltage",  pyads.PLCTYPE_LREAL)
+            result[f"cell{i}_I"]                = _read(pp, f"{px}_pidTDK.powerSupply.MeasuredCurrent",  pyads.PLCTYPE_LREAL)
+            result[f"cell{i}_prog_V"]           = _read(pp, f"{px}_pidTDK.powerSupply.ProgrammedVoltage", pyads.PLCTYPE_LREAL)
+            result[f"cell{i}_prog_A"]           = _read(pp, f"{px}_pidTDK.powerSupply.ProgrammedCurrent", pyads.PLCTYPE_LREAL)
+            result[f"cell{i}_power"]            = _read(pp, f"{px}_pidTDK.OutputPower",                  pyads.PLCTYPE_LREAL)
+            result[f"cell{i}_state"]            = _read(pp, f"{px}_State",                               pyads.PLCTYPE_INT)
+            result[f"cell{i}_shutter_open"]     = _read(pp, f"{px}_Shutter.StatusOpen",                  pyads.PLCTYPE_BOOL)
+            result[f"cell{i}_shutter_closed"]   = _read(pp, f"{px}_Shutter.StatusClosed",                pyads.PLCTYPE_BOOL)
 
         # --- EBVM (port 852) ---
         result["ebvm_shutter_open"]   = _read(pp, "PIDProgram.EBVM_Shutter.StatusOpen",   pyads.PLCTYPE_BOOL)
@@ -229,8 +254,11 @@ class MistralAdsClient:
         result["ebvm_coolant"]        = _read(pp, "PIDProgram.EBVM_FlowMeter.Flow",       pyads.PLCTYPE_LREAL)
 
         # --- Standard 4-key mapping (Cell1 = manipulator = substrate heater) ---
-        # v_set / i_set left None: ADS has temperature setpoints, not V/I setpoints.
+        # v_set / i_set populated Jul 27 2026 from Cell1 programmed values
+        # (previously None because we hadn't yet read ProgrammedVoltage/Current).
         result["v_actual"] = result.get("cell1_V")
         result["i_actual"] = result.get("cell1_I")
+        result["v_set"]    = result.get("cell1_prog_V")
+        result["i_set"]    = result.get("cell1_prog_A")
 
         return result

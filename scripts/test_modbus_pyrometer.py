@@ -308,10 +308,16 @@ def test_read_before_connect_raises() -> None:
 
 
 def test_read_response_missing_registers_attr() -> None:
-    """A response object without .registers → clean RuntimeError, not AttributeError."""
+    """A response without .registers → clean RuntimeError with Exactus-mode hint.
+
+    Regression guard for Jul 27 2026 error-message improvement: when the
+    probe is in Exactus streaming mode, pymodbus returns responses with
+    no registers. The driver should surface the recovery hint (port
+    the smoke script's diagnostic) instead of a bare "Modbus read error".
+    """
     try:
         driver, fake = _connect_driver()
-        # No registers attr = malformed response
+        # No registers attr = malformed response (Exactus-mode symptom)
         fake.read_queue.append(FakeReadResponse(registers=None))
         try:
             driver.read_temperature()
@@ -321,7 +327,61 @@ def test_read_response_missing_registers_attr() -> None:
                 "missing .registers"
             )
         except RuntimeError as exc:
-            assert "modbus read error" in str(exc).lower(), f"unexpected: {exc}"
+            msg = str(exc)
+            assert "empty register response" in msg.lower(), \
+                f"missing empty-response signal: {exc}"
+            assert "exactus protocol mode" in msg.lower(), \
+                f"missing Exactus-mode hint: {exc}"
+            assert "power-cycle" in msg.lower(), \
+                f"missing recovery instruction: {exc}"
+            return
+        raise AssertionError("expected RuntimeError")
+    finally:
+        FakeModbusSerialClient._last_instance = None
+        uninstall_fake_pymodbus()
+
+
+def test_read_empty_registers_list_signals_exactus_mode() -> None:
+    """A response with .registers=[] → Exactus-mode hint (same class of failure)."""
+    try:
+        driver, fake = _connect_driver()
+        fake.read_queue.append(FakeReadResponse(registers=[]))
+        try:
+            driver.read_temperature()
+        except RuntimeError as exc:
+            msg = str(exc)
+            assert "empty register response" in msg.lower(), \
+                f"missing empty-response signal: {exc}"
+            assert "exactus protocol mode" in msg.lower(), \
+                f"missing Exactus-mode hint: {exc}"
+            return
+        raise AssertionError("expected RuntimeError")
+    finally:
+        FakeModbusSerialClient._last_instance = None
+        uninstall_fake_pymodbus()
+
+
+def test_read_short_response_reports_count_mismatch() -> None:
+    """A response with 1 reg when 2 are needed → 'response has 1 regs, needs 2'.
+
+    Distinguishes the count-mismatch case from the empty-response case so
+    the operator knows the probe IS responding (just with wrong length),
+    not silent (Exactus mode).
+    """
+    try:
+        driver, fake = _connect_driver()
+        # Short response — 1 reg but read_temperature() needs 2 for float32
+        # Use is_error=True so _resp_ok returns False and we hit the branch.
+        fake.read_queue.append(FakeReadResponse(registers=[42], is_error=True))
+        try:
+            driver.read_temperature()
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            assert "needs 2" in msg, f"missing 'needs 2' in message: {exc}"
+            assert "1 regs" in msg, f"missing observed count: {exc}"
+            # Must NOT surface the Exactus hint — that's a different failure mode
+            assert "exactus" not in msg, \
+                f"count-mismatch case should not blame Exactus mode: {exc}"
             return
         raise AssertionError("expected RuntimeError")
     finally:
@@ -495,6 +555,8 @@ TESTS = [
     test_read_temperature_plausibility_rejects_out_of_range,
     test_read_before_connect_raises,
     test_read_response_missing_registers_attr,
+    test_read_empty_registers_list_signals_exactus_mode,
+    test_read_short_response_reports_count_mismatch,
     test_set_rate_range_check_rejects_negative,
     test_set_rate_range_check_rejects_over_max,
     test_set_rate_happy_path_writes_and_verifies,

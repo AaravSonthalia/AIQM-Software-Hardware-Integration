@@ -62,17 +62,24 @@ def _make_pyads_mock(cell_T: float = 75.0, cell_V: float = 12.5, cell_I: float =
             "PIDProgram.EBVM_Shutter.StatusClosed": True,
             "PIDProgram.EBVM_FlowMeter.Flow": 1.5,
         }
+        # Generate 7 cells' values regardless of client cell_count — the
+        # client's own loop determines how many actually get read. This
+        # matches lab reality: the PLC symbol table has whatever cells
+        # exist, and the client just doesn't iterate past cell_count.
         for i in range(1, 8):
             px = f"PIDProgram.Cell{i}"
             values.update({
-                f"{px}_pidTDK.ActualTemperature":          cT + i,
-                f"{px}_SetPoint":                          cT + i + 5,
-                f"{px}_pidTDK.powerSupply.MeasuredVoltage": cV + i * 0.1,
-                f"{px}_pidTDK.powerSupply.MeasuredCurrent": cI + i * 0.01,
-                f"{px}_pidTDK.OutputPower":                 50.0 + i,
-                f"{px}_State":                              2,
-                f"{px}_Shutter.StatusOpen":                 (i == 1),
-                f"{px}_Shutter.StatusClosed":               (i != 1),
+                f"{px}_pidTDK.ActualTemperature":            cT + i,
+                f"{px}_SetPoint":                            cT + i + 5,
+                f"{px}_pidTDK.ActiveSetPoint":               cT + i + 3,
+                f"{px}_pidTDK.powerSupply.MeasuredVoltage":  cV + i * 0.1,
+                f"{px}_pidTDK.powerSupply.MeasuredCurrent":  cI + i * 0.01,
+                f"{px}_pidTDK.powerSupply.ProgrammedVoltage": 60.0 + i,
+                f"{px}_pidTDK.powerSupply.ProgrammedCurrent": 5.0 + i * 0.5,
+                f"{px}_pidTDK.OutputPower":                  50.0 + i,
+                f"{px}_State":                               2,
+                f"{px}_Shutter.StatusOpen":                  (i == 1),
+                f"{px}_Shutter.StatusClosed":                (i != 1),
             })
         return values
 
@@ -179,20 +186,41 @@ class TestMistralAdsClientRead(unittest.TestCase):
         self.assertAlmostEqual(result["v_actual"], 12.6, places=5)
         self.assertAlmostEqual(result["i_actual"], 3.21, places=5)
 
-    def test_v_set_i_set_are_none(self):
+    def test_v_set_i_set_map_from_cell1_programmed(self):
+        # v_set/i_set now populate from Cell1 programmed values (Jul 27 2026).
+        # Mock sets Cell1 ProgrammedVoltage=61.0, ProgrammedCurrent=5.5.
         client = self._connected_client()
         result = client.read()
-        self.assertIsNone(result["v_set"])
-        self.assertIsNone(result["i_set"])
+        self.assertEqual(result["v_set"], result["cell1_prog_V"])
+        self.assertEqual(result["i_set"], result["cell1_prog_A"])
+        self.assertAlmostEqual(result["v_set"], 61.0, places=5)
+        self.assertAlmostEqual(result["i_set"], 5.5, places=5)
 
     def test_extended_cell_keys_present(self):
+        # All historical keys + the 3 Jul 27 additions
+        # (active_setpoint, prog_V, prog_A). Regression guard: DO NOT
+        # rename these keys without updating growth_logger + growth_monitor.
         client = self._connected_client()
         result = client.read()
         for i in range(1, 8):
-            for suffix in ("T", "T_set", "V", "I", "power", "state",
-                           "shutter_open", "shutter_closed"):
+            for suffix in (
+                "T", "T_set", "active_setpoint",
+                "V", "I", "prog_V", "prog_A",
+                "power", "state", "shutter_open", "shutter_closed",
+            ):
                 key = f"cell{i}_{suffix}"
                 self.assertIn(key, result, f"extended key missing: {key}")
+
+    def test_new_jul27_keys_have_correct_values(self):
+        client = self._connected_client()
+        result = client.read()
+        # Cell 3 mock values from _make_pyads_mock:
+        # ActiveSetPoint = cT + 3 + 3 = 75 + 3 + 3 = 81.0
+        # ProgrammedVoltage = 60 + 3 = 63.0
+        # ProgrammedCurrent = 5 + 3*0.5 = 6.5
+        self.assertAlmostEqual(result["cell3_active_setpoint"], 81.0, places=5)
+        self.assertAlmostEqual(result["cell3_prog_V"], 63.0, places=5)
+        self.assertAlmostEqual(result["cell3_prog_A"], 6.5, places=5)
 
     def test_pressure_keys_present(self):
         client = self._connected_client(pressure=5.0e-9)
@@ -228,23 +256,99 @@ class TestMistralAdsClientRead(unittest.TestCase):
         self.assertIsNotNone(result.get("v_actual"))
 
 
+class TestMistralAdsClientChamberConfig(unittest.TestCase):
+    """Verify per-chamber cell_count / netid / port configuration."""
+
+    def test_init_stores_config(self):
+        c = MistralAdsClient(
+            netid="1.2.3.4.1.1", port_main=101, port_pid=102, cell_count=3,
+        )
+        self.assertEqual(c._netid, "1.2.3.4.1.1")
+        self.assertEqual(c._port_main, 101)
+        self.assertEqual(c._port_pid, 102)
+        self.assertEqual(c._cell_count, 3)
+
+    def test_default_cell_count_is_7(self):
+        # Backward compat: existing callers that construct without
+        # cell_count should still get the Ch-MBE 7-cell behavior.
+        c = MistralAdsClient()
+        self.assertEqual(c._cell_count, 7)
+
+    def test_read_with_cell_count_6_bulbasaur(self):
+        # Bulbasaur-style: 6 cells configured, so cell7 keys must not
+        # appear in the read() output even though the mock has cell7 values.
+        mock_pyads = _make_pyads_mock()
+        client = MistralAdsClient(netid="10.0.42.111.1.1", cell_count=6)
+        with patch.dict("sys.modules", {"pyads": mock_pyads}):
+            client.connect()
+        sys.modules["pyads"] = mock_pyads
+        try:
+            result = client.read()
+        finally:
+            sys.modules.pop("pyads", None)
+
+        # Cells 1-6 present
+        for i in range(1, 7):
+            for suffix in ("T", "T_set", "active_setpoint",
+                           "V", "I", "prog_V", "prog_A", "power"):
+                self.assertIn(f"cell{i}_{suffix}", result,
+                              f"missing cell{i}_{suffix}")
+        # Cell 7 absent (client only iterated 1..6)
+        for suffix in ("T", "T_set", "active_setpoint",
+                       "V", "I", "prog_V", "prog_A", "power"):
+            self.assertNotIn(f"cell7_{suffix}", result,
+                             f"cell7_{suffix} should be absent for cell_count=6")
+
+    def test_read_with_cell_count_3(self):
+        # Sanity check with an arbitrary small count.
+        mock_pyads = _make_pyads_mock()
+        client = MistralAdsClient(cell_count=3)
+        with patch.dict("sys.modules", {"pyads": mock_pyads}):
+            client.connect()
+        sys.modules["pyads"] = mock_pyads
+        try:
+            result = client.read()
+        finally:
+            sys.modules.pop("pyads", None)
+
+        for i in (1, 2, 3):
+            self.assertIn(f"cell{i}_T", result)
+        for i in (4, 5, 6, 7):
+            self.assertNotIn(f"cell{i}_T", result)
+
+
 class TestMistralAdsWorkerIntegration(unittest.TestCase):
     """Verify MistralWorker._create_driver() returns MistralAdsClient for mode='ads'."""
 
-    def test_worker_creates_ads_client(self):
+    def test_worker_creates_ads_client_with_chamber_config(self):
         # Minimal PyQt stub so workers.py can be imported without a display
         try:
             from gui.workers import MistralWorker
+            from drivers.config import OXIDE_MBE
         except Exception:
             self.skipTest("PyQt6 not available in this env")
 
         mock_pyads = _make_pyads_mock()
         with patch.dict("sys.modules", {"pyads": mock_pyads}):
-            worker = MistralWorker(mode="ads")
+            worker = MistralWorker(mode="ads", chamber_config=OXIDE_MBE)
             driver = worker._create_driver()
 
         from drivers.mistral_ads import MistralAdsClient
         self.assertIsInstance(driver, MistralAdsClient)
+        # Verify chamber config flowed through
+        self.assertEqual(driver._netid, OXIDE_MBE.ads_netid)
+        self.assertEqual(driver._cell_count, OXIDE_MBE.ads_cell_count)
+
+    def test_worker_ads_mode_without_config_raises(self):
+        try:
+            from gui.workers import MistralWorker
+        except Exception:
+            self.skipTest("PyQt6 not available in this env")
+
+        worker = MistralWorker(mode="ads", chamber_config=None)
+        with self.assertRaises(RuntimeError) as ctx:
+            worker._create_driver()
+        self.assertIn("chamber_config", str(ctx.exception))
 
 
 if __name__ == "__main__":
@@ -254,6 +358,7 @@ if __name__ == "__main__":
     for cls in (
         TestMistralAdsClientLifecycle,
         TestMistralAdsClientRead,
+        TestMistralAdsClientChamberConfig,
         TestMistralAdsWorkerIntegration,
     ):
         suite.addTests(loader.loadTestsFromTestCase(cls))

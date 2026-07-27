@@ -79,6 +79,20 @@ class MBESystemConfig:
     camera_index: int = 0
     camera_fps: float = 1.0
 
+    # MISTRAL ADS backend config — per-chamber Beckhoff PLC endpoint.
+    # Empty ads_netid disables the "ads" MistralWorker mode for the chamber.
+    # ads_port_main / ads_port_pid follow the TwinCAT convention: 851 for
+    # PLC Task 1 (Main.*), 852 for PLC Task 2 (PIDProgram.*).
+    # ads_display_confirmed gates whether the existing _cell_displays
+    # widgets get populated from ADS Cell{i}_T. Set False when the
+    # cell_display uses material labels whose Cell{N} → material mapping
+    # is not yet confirmed — ADS data still flows to CSV in that case.
+    ads_netid: str = ""
+    ads_port_main: int = 851
+    ads_port_pid: int = 852
+    ads_cell_count: int = 7
+    ads_display_confirmed: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Pre-configured systems
@@ -87,7 +101,9 @@ class MBESystemConfig:
 OXIDE_MBE = MBESystemConfig(
     name="Oxide MBE",
     chamber_id="ombe",
-    mistral_mode_default="screengrab",
+    # ads mode validated Jul 27 2026 (direct pyads to PLC 10.0.42.111.1.1).
+    # screengrab still available as fallback via the sidebar dropdown.
+    mistral_mode_default="ads",
     evap_mode_default="elog",
     # evap_log_dir left empty — ElogReader auto-detects the Bulbasaur path
     cell_display=[
@@ -107,6 +123,14 @@ OXIDE_MBE = MBESystemConfig(
         r"C:\Users\Lab10\Desktop\Automated RHEED Image Acquisition"
         r"\Acquiring Images Via Python Script Tests\Stream Images"
     ),
+    # ADS: 6 cells on Bulbasaur (Cell7 raises symbol-not-found).
+    # ads_display_confirmed=False because cell_display uses material
+    # labels (Sr, Eu, Er, etc.) and the ADS Cell{N} → material mapping
+    # is still unconfirmed — ADS data flows to CSV only until Jiangang
+    # confirms the physical wiring.
+    ads_netid="10.0.42.111.1.1",
+    ads_cell_count=6,
+    ads_display_confirmed=False,
 )
 
 CHALCOGENIDE_MBE = MBESystemConfig(
@@ -134,6 +158,13 @@ CHALCOGENIDE_MBE = MBESystemConfig(
     temperasure_exe=r"C:\Users\Omicron\Desktop\TemperaSure.exe",
     single_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     stream_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
+    # ADS: 7 cells on Ch-MBE (Task #191 validated Jul 22 2026).
+    # ads_display_confirmed=True because cell_display uses numeric
+    # labels aligned with ADS Cell{N} (Cell1=Substrate, Cell2-7 by
+    # number). Existing widget-populate behavior preserved.
+    ads_netid="10.0.42.112.1.1",
+    ads_cell_count=7,
+    ads_display_confirmed=True,
 )
 
 # Available system configurations. "oxide" and "chalcogenide" are legacy

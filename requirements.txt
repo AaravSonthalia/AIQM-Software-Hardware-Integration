@@ -3,5 +3,7 @@ numpy
 matplotlib
 scikit-learn
 Pillow
-# Windows-only (Ch-MBE Beckhoff TwinCAT ADS direct-read):
-# pyads
+# Windows-only (MISTRAL Beckhoff TwinCAT ADS direct-read for both chambers —
+# Ch-MBE per Task #191, Bulbasaur/O-MBE validated Jul 27 2026). Needs TwinCAT
+# System Service running on the host (pip install alone is not sufficient).
+pyads; platform_system == "Windows"

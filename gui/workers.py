@@ -508,10 +508,21 @@ class MistralWorker(QThread):
 
     state_updated = pyqtSignal(MistralState)
 
-    def __init__(self, mode: str = "screengrab", poll_interval: float = 1.0):
+    def __init__(
+        self,
+        mode: str = "screengrab",
+        poll_interval: float = 1.0,
+        chamber_config=None,
+    ):
         super().__init__()
         self.mode = mode
         self.poll_interval = poll_interval
+        # chamber_config: MBESystemConfig (from drivers.config). Required
+        # when mode="ads" — supplies per-chamber netid / ports / cell_count
+        # for MistralAdsClient. Explicit passing (not get_active_config()
+        # lookup) so worker instances stay coupled only to the config they
+        # were given, not to env vars.
+        self._chamber_config = chamber_config
         # True from __init__ to close the stop()-before-run race
         # (see PowerSupplyWorker for the full comment).
         self.running = True
@@ -541,8 +552,10 @@ class MistralWorker(QThread):
                 state.i_set = vals.get("i_set")
                 state.i_actual = vals.get("i_actual")
                 # ads_cells: full extended read() dict when mode="ads"
-                # (Ch-MBE Beckhoff TwinCAT ADS). Includes cell{1..7}_T,
-                # ion gauge pressure, turbo RPM, etc. None in other modes.
+                # (Beckhoff TwinCAT ADS, both chambers). Includes per-cell
+                # T / T_set / active_setpoint / V / I / prog_V / prog_A / power
+                # / state / shutter_* plus ion gauge, turbo, service_mode.
+                # None in other modes.
                 state.ads_cells = vals if self.mode == "ads" else None
                 state.connected = True
                 state.error = ""
@@ -581,16 +594,26 @@ class MistralWorker(QThread):
             from drivers.mistral_jsonrpc import MistralJsonRpcClient
             return MistralJsonRpcClient()
         elif self.mode == "ads":
-            # Beckhoff TwinCAT ADS direct-read — Ch-MBE only.
-            # Discovered Jul 22 2026: MistralGui on Ch-MBE is an ADS client
-            # to a Beckhoff PLC (not the Kestrel JSON-RPC backend that
-            # Bulbasaur uses). pyads reads Cell1-7 T/V/I via two ports
-            # (851 = main PLC, 852 = PID program). v_actual = Cell1_V
-            # (manipulator); i_actual = Cell1_I. v_set / i_set = None
-            # (ADS exposes temperature setpoints, not V/I setpoints).
-            # READ ONLY — write_by_name is never called.
+            # Beckhoff TwinCAT ADS direct-read — per-chamber config.
+            # Ch-MBE validated Jul 22 2026 (Task #191, netId 10.0.42.112.1.1,
+            # 7 cells). Bulbasaur/O-MBE validated Jul 27 2026 via direct pyads
+            # to netId 10.0.42.111.1.1 with 6 cells, bypassing Bulbasaur's
+            # Kestrel JSON-RPC gateway which exposes zero introspection.
+            # v_actual/v_set = Cell1_V / Cell1_prog_V (manipulator); similar
+            # for current. READ ONLY — write_by_name is never called.
             from drivers.mistral_ads import MistralAdsClient
-            return MistralAdsClient()
+            if self._chamber_config is None:
+                raise RuntimeError(
+                    "MistralWorker mode='ads' requires chamber_config "
+                    "(pass it via __init__ from GrowthApp)"
+                )
+            cfg = self._chamber_config
+            return MistralAdsClient(
+                netid=cfg.ads_netid,
+                port_main=cfg.ads_port_main,
+                port_pid=cfg.ads_port_pid,
+                cell_count=cfg.ads_cell_count,
+            )
         else:
             from drivers.mistral import DummyMistralGui
             return DummyMistralGui()

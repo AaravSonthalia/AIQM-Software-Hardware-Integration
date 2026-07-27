@@ -342,7 +342,9 @@ class GrowthApp(QMainWindow):
 
         if not self.mistral_worker or not self.mistral_worker.isRunning():
             self.mistral_worker = MistralWorker(
-                mode=mistral_mode, poll_interval=1.0,
+                mode=mistral_mode,
+                poll_interval=1.0,
+                chamber_config=self._chamber_config,
             )
             self.mistral_worker.state_updated.connect(self._on_mistral_state)
             self.mistral_worker.start()

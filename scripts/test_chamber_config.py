@@ -74,7 +74,10 @@ class TestGetActiveConfig(unittest.TestCase):
 class TestOmbConfig(unittest.TestCase):
 
     def test_mistral_mode_default(self):
-        self.assertEqual(OXIDE_MBE.mistral_mode_default, "screengrab")
+        # Switched from "screengrab" to "ads" Jul 27 2026 after
+        # direct pyads to Bulbasaur PLC validated. Fallback modes
+        # still selectable via the sidebar dropdown.
+        self.assertEqual(OXIDE_MBE.mistral_mode_default, "ads")
 
     def test_evap_mode_default(self):
         self.assertEqual(OXIDE_MBE.evap_mode_default, "elog")
@@ -90,6 +93,20 @@ class TestOmbConfig(unittest.TestCase):
     def test_cell_labels_not_empty(self):
         for cell in OXIDE_MBE.cell_display:
             self.assertTrue(cell["label"])
+
+    def test_ombe_ads_config(self):
+        # Bulbasaur PLC per Jul 27 2026 lab validation.
+        self.assertEqual(OXIDE_MBE.ads_netid, "10.0.42.111.1.1")
+        self.assertEqual(OXIDE_MBE.ads_port_main, 851)
+        self.assertEqual(OXIDE_MBE.ads_port_pid, 852)
+        self.assertEqual(OXIDE_MBE.ads_cell_count, 6)
+
+    def test_ombe_ads_display_not_confirmed(self):
+        # cell_display uses material labels (Sr, Eu, Er, HTEC2, Y);
+        # ADS Cell{N} → material mapping is not yet confirmed by growers,
+        # so widgets should NOT be populated from ADS. Data still flows
+        # to CSV via update_mistral_state → sensor_log.
+        self.assertFalse(OXIDE_MBE.ads_display_confirmed)
 
 
 class TestChMbeConfig(unittest.TestCase):
@@ -114,6 +131,18 @@ class TestChMbeConfig(unittest.TestCase):
     def test_cell_labels_not_empty(self):
         for cell in CHALCOGENIDE_MBE.cell_display:
             self.assertTrue(cell["label"])
+
+    def test_chmbe_ads_config(self):
+        # Ch-MBE PLC per Jul 22 2026 discovery (Task #191).
+        self.assertEqual(CHALCOGENIDE_MBE.ads_netid, "10.0.42.112.1.1")
+        self.assertEqual(CHALCOGENIDE_MBE.ads_port_main, 851)
+        self.assertEqual(CHALCOGENIDE_MBE.ads_port_pid, 852)
+        self.assertEqual(CHALCOGENIDE_MBE.ads_cell_count, 7)
+
+    def test_chmbe_ads_display_confirmed(self):
+        # cell_display uses numeric labels (Cell1..Cell7) aligned with
+        # ADS Cell{N}, so widget-populate-from-ADS is safe.
+        self.assertTrue(CHALCOGENIDE_MBE.ads_display_confirmed)
 
 
 class TestSystems(unittest.TestCase):

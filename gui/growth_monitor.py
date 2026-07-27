@@ -1301,12 +1301,22 @@ class GrowthMonitor(QWidget):
             self.current_display.set_value(state.i_actual)
         else:
             self.current_display.value.setText("---")
-        # ADS extended cell temps (Ch-MBE mode="ads").
-        # Overrides the elog-based update in update_evap_state() for cells
-        # whose state_field is None (all Ch-MBE cells). No-op on O-MBE
-        # where ads_cells is None.
-        if state.ads_cells:
+        # ADS extended cell temps (mode="ads").
+        # Populates _cell_displays widgets only when the chamber's
+        # `ads_display_confirmed` flag is True (Ch-MBE — cell_display
+        # uses numeric labels aligned with ADS Cell{N}). On O-MBE the
+        # flag is False because cell_display uses material labels
+        # (Sr, Eu, Er, etc.) whose Cell{N} → material mapping is
+        # still unconfirmed — writing ADS Cell{N} into a widget labeled
+        # "Sr" would silently mis-display. ADS data still flows to CSV
+        # via update_mistral_state → sensor_log.
+        # A follow-up will add a dedicated MISTRAL PSU-state panel that
+        # shows all `ads_cell_count` cells by number, decoupled from
+        # _cell_displays.
+        if state.ads_cells and self._cfg.ads_display_confirmed:
             for i, display in enumerate(self._cell_displays, start=1):
+                if i > self._cfg.ads_cell_count:
+                    break   # skip cells that don't exist on this PLC
                 t = state.ads_cells.get(f"cell{i}_T")
                 if t is None:
                     display.value.setText("---")
@@ -2216,16 +2226,27 @@ class GrowthMonitor(QWidget):
 
     def get_session_metadata(self) -> dict:
         """Return session metadata for growth log export."""
-        return {
+        mistral_mode = self.config_mistral_mode.currentText()
+        metadata = {
             "date": datetime.now().strftime("%Y-%m-%d"),
             "grower": self.grower_input.text(),
             "sample_id": self.sample_id_input.text(),
             "chamber_id": self._cfg.chamber_id,
             "camera_mode": self.config_camera_mode.currentText(),
-            "mistral_mode": self.config_mistral_mode.currentText(),
+            "mistral_mode": mistral_mode,
             "evap_mode": self.config_evap_mode.currentText(),
             "pyrometer_mode": self.config_pyrometer_mode.currentText(),
         }
+        # ADS profile provenance — record the exact PLC endpoint + cell
+        # count that produced this session's sensor log. Makes old CSVs
+        # auditable: a reader can look at session_metadata.json and know
+        # which chamber/PLC/schema the cell{N}_* columns came from.
+        if mistral_mode == "ads":
+            metadata["mistral_ads_netid"]      = self._cfg.ads_netid
+            metadata["mistral_ads_cell_count"] = self._cfg.ads_cell_count
+            metadata["mistral_ads_port_main"]  = self._cfg.ads_port_main
+            metadata["mistral_ads_port_pid"]   = self._cfg.ads_port_pid
+        return metadata
 
     # ----- Reset -----------------------------------------------------------
 

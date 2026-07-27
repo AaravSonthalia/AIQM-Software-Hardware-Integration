@@ -322,11 +322,29 @@ class ModbusPyrometer(TemperatureSensor):
             and len(rr.registers) >= need
         )
 
+    # Diagnostic message for "empty register response" — surfaced when
+    # the probe is in Exactus streaming mode rather than Modbus RTU.
+    # Ported Jul 27 2026 from scripts/pyrometer_modbus_smoke.py after
+    # the Bulbasaur lab session; the smoke script's helpful message
+    # made the failure mode diagnosable, the driver's bare error did not.
+    _EMPTY_RESPONSE_HINT = (
+        " Probe is likely in Exactus Protocol mode rather than Modbus RTU. "
+        "Recovery: physical power-cycle the probe (~10s off, 10s boot), "
+        "or use ExactusSerialPyrometer instead."
+    )
+
     def _read_f32(self, addr: int, word_swap: bool = False) -> float:
         rr = self._read_holding(addr, 2)
         if not self._resp_ok(rr, 2):
+            regs = getattr(rr, "registers", None)
+            if not regs:
+                raise RuntimeError(
+                    f"Modbus read at 0x{addr:04X}: empty register response."
+                    + self._EMPTY_RESPONSE_HINT
+                )
             raise RuntimeError(
-                f"Modbus read error at 0x{addr:04X} (needs 2 regs)"
+                f"Modbus read at 0x{addr:04X}: response has {len(regs)} regs, "
+                "needs 2"
             )
         hi, lo = rr.registers[:2]
         if word_swap:
@@ -336,13 +354,31 @@ class ModbusPyrometer(TemperatureSensor):
     def _read_u16(self, addr: int) -> int:
         rr = self._read_holding(addr, 1)
         if not self._resp_ok(rr, 1):
-            raise RuntimeError(f"Modbus read error at 0x{addr:04X}")
+            regs = getattr(rr, "registers", None)
+            if not regs:
+                raise RuntimeError(
+                    f"Modbus read at 0x{addr:04X}: empty register response."
+                    + self._EMPTY_RESPONSE_HINT
+                )
+            raise RuntimeError(
+                f"Modbus read at 0x{addr:04X}: response has {len(regs)} regs, "
+                "needs 1"
+            )
         return rr.registers[0]
 
     def _read_ascii(self, addr: int, n_regs: int) -> str:
         rr = self._read_holding(addr, n_regs)
         if not self._resp_ok(rr, n_regs):
-            raise RuntimeError(f"Modbus read error at 0x{addr:04X}")
+            regs = getattr(rr, "registers", None)
+            if not regs:
+                raise RuntimeError(
+                    f"Modbus read at 0x{addr:04X}: empty register response."
+                    + self._EMPTY_RESPONSE_HINT
+                )
+            raise RuntimeError(
+                f"Modbus read at 0x{addr:04X}: response has {len(regs)} regs, "
+                f"needs {n_regs}"
+            )
         return _regs_to_ascii(rr.registers)
 
 

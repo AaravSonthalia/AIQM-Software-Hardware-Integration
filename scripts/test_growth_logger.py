@@ -219,6 +219,100 @@ class ManualEventSchemaTests(unittest.TestCase):
         self.assertEqual(GrowthLogger.MANUAL_EVENT_FIELDS[2], "event_idx")
 
 
+class AdsSensorSchemaTests(unittest.TestCase):
+    """Tests for the Jul 27 2026 ADS union schema in SENSOR_FIELDS.
+
+    Verifies that the 8-column-per-cell union schema (T/T_set/active_setpoint/
+    V/I/prog_V/prog_A/power) is present for cells 1-7, that Bulbasaur-shape
+    ads_cells (only cells 1-6 keyed) populates cell1-6 and leaves cell7 blank,
+    and that non-ADS mode leaves all cell columns blank. Also confirms the
+    historical `cell{i}_T_C` column name is preserved verbatim.
+    """
+
+    ADS_CELL_SUFFIXES = (
+        "T_C", "T_set_C", "active_setpoint_C",
+        "V", "I", "prog_V", "prog_A", "power_W",
+    )
+
+    def test_schema_has_all_56_cell_columns(self):
+        for i in range(1, 8):
+            for sfx in self.ADS_CELL_SUFFIXES:
+                col = f"cell{i}_{sfx}"
+                self.assertIn(col, GrowthLogger.SENSOR_FIELDS,
+                              f"missing column: {col}")
+
+    def test_historical_cell_T_C_columns_preserved(self):
+        # Regression guard: downstream analysis may depend on these names.
+        for i in range(1, 8):
+            self.assertIn(f"cell{i}_T_C", GrowthLogger.SENSOR_FIELDS)
+
+    def test_bulbasaur_shape_populates_cells_1_to_6_blanks_cell7(self):
+        # Simulate a Bulbasaur MistralAdsClient(cell_count=6).read() dict:
+        # 8 keys per cell for cells 1-6, no cell7 keys.
+        ads_cells = {}
+        for i in range(1, 7):
+            ads_cells[f"cell{i}_T"] = 100.0 + i
+            ads_cells[f"cell{i}_T_set"] = 105.0 + i
+            ads_cells[f"cell{i}_active_setpoint"] = 103.0 + i
+            ads_cells[f"cell{i}_V"] = 1.0 + i * 0.1
+            ads_cells[f"cell{i}_I"] = 2.0 + i * 0.01
+            ads_cells[f"cell{i}_prog_V"] = 60.0 + i
+            ads_cells[f"cell{i}_prog_A"] = 5.0 + i * 0.5
+            ads_cells[f"cell{i}_power"] = 9.0 + i
+
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("TEST_ADS_BULBASAUR")
+            logger.log_sensors(
+                pyro_temp=None, elapsed_s=1.0,
+                ads_cells=ads_cells,
+            )
+            logger.end_session()
+
+            csv_path = logger.session_dir / "sensor_log.csv"
+            with open(csv_path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        # Cells 1-6 populated (non-empty strings)
+        for i in range(1, 7):
+            for sfx in self.ADS_CELL_SUFFIXES:
+                col = f"cell{i}_{sfx}"
+                self.assertNotEqual(
+                    row[col], "",
+                    f"cell{i} column {col} should be populated",
+                )
+        # Cell 7 blank across all 8 columns
+        for sfx in self.ADS_CELL_SUFFIXES:
+            col = f"cell7_{sfx}"
+            self.assertEqual(row[col], "",
+                             f"cell7 column {col} should be blank on Bulbasaur")
+
+    def test_non_ads_mode_leaves_all_cell_columns_blank(self):
+        # Non-ADS mode passes ads_cells=None; every cell column should be
+        # blank in the CSV.
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("TEST_NO_ADS")
+            logger.log_sensors(
+                pyro_temp=None, elapsed_s=1.0,
+                ads_cells=None,
+            )
+            logger.end_session()
+
+            csv_path = logger.session_dir / "sensor_log.csv"
+            with open(csv_path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        row = rows[0]
+        for i in range(1, 8):
+            for sfx in self.ADS_CELL_SUFFIXES:
+                col = f"cell{i}_{sfx}"
+                self.assertEqual(row[col], "",
+                                 f"column {col} should be blank when ads_cells=None")
+
+
 class ManualEventLifecycleTests(unittest.TestCase):
     """File-lifecycle tests: manual_events.csv opens on start_session,
     closes on end_session, and has the correct header."""
