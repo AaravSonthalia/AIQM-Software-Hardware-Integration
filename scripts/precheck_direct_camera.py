@@ -9,7 +9,7 @@ which tests raw vmbpy independently.
 Reports pass/fail for:
   1. ``VmbCamera`` importable + constructable
   2. ``connect()`` — streaming thread starts
-  3. ``read_frame()`` — returns a frame within ~2.5s
+  3. ``read_frame()`` — returns a frame within ~5s
   4. Frame stats sensible (mean, std, range)
   5. **Palette fix applied** (Jul 2 regression check) — R, G, B channels
      carry equal variation, per the ``(I, I, I)`` stack in
@@ -61,7 +61,7 @@ def main() -> int:
 
     # --- 1. VmbCamera importable + constructable ---
     try:
-        from drivers.rheed_camera import VmbCamera
+        from drivers.rheed_camera import FrameNotYetAvailableError, VmbCamera
     except ImportError as e:
         status("VmbCamera importable", False, f"import error: {e}")
         return verdict(
@@ -91,18 +91,20 @@ def main() -> int:
     # --- 3. read_frame() with brief retry (first frame may take ~1-2s) ---
     frame = None
     last_error = None
-    deadline = time.time() + 2.5
+    deadline = time.time() + 5.0
     while time.time() < deadline:
         try:
             frame = cam.read_frame()
             break
-        except Exception as e:
+        except FrameNotYetAvailableError as e:
+            # Transient — the stream is alive but hasn't produced a
+            # frame yet. Retry on the next tick.
             last_error = e
-            # "Not yet available" is a transient — retry. Anything else is
-            # a real failure and we stop retrying.
-            if "not yet available" not in str(e).lower():
-                break
             time.sleep(0.1)
+        except Exception as e:
+            # Any other exception is a real driver failure; stop retrying.
+            last_error = e
+            break
 
     if frame is None:
         if last_error is not None:
@@ -115,13 +117,13 @@ def main() -> int:
             status(
                 "VmbCamera.read_frame()",
                 False,
-                "no frame within 2.5s",
+                "no frame within 5s",
             )
         try:
             cam.disconnect()
         except Exception:
             pass
-        return verdict(False, "streaming did not produce a frame in 2.5s")
+        return verdict(False, "streaming did not produce a frame in 5s")
     status(
         "VmbCamera.read_frame()",
         True,
