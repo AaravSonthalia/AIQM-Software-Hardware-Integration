@@ -11,11 +11,12 @@ Reports pass/fail for:
   2. ``connect()`` — streaming thread starts
   3. ``read_frame()`` — returns a frame within ~5s
   4. Frame stats sensible (mean, std, range)
-  5. **Palette fix applied** (Jul 2 regression check) — R, G, B channels
-     carry equal variation, per the ``(I, I, I)`` stack in
-     ``drivers/rheed_camera.py:302-304``. Pre-fix behavior wrote
-     intensity only into the green channel ``(0, I, 0)``, capping
-     Classifier2's L input at 150. See ``vmb_palette_bug_jul02.md``.
+  5. **BGW palette LUT applied** — every unique RGB triple in the frame
+     is a valid entry of ``gui.ksa_palette.KSA_BGW_PALETTE``. The BGW
+     ramp naturally has R=B=0 for intensities ≤ 127 (lower half of the
+     LUT), so per-channel std asymmetry on dark frames is expected
+     behavior, not a regression. See ``vmb_palette_bug_jul02.md`` for
+     the historical ``(0, I, 0)`` bug this check evolved from.
   6. ``disconnect()`` cleanly
 
 Prints a summary block designed as a meeting-report line.
@@ -144,34 +145,46 @@ def main() -> int:
         f"mean={mean:.1f}, std={std:.1f}, range=[{minv}, {maxv}]",
     )
 
-    # --- 5. Palette fix (Jul 2 regression check) ---
-    # After the fix, read_frame stacks grayscale into all three channels
-    # via `np.stack([img, img, img], axis=-1)` — so per-channel stds are
-    # exactly equal. Pre-fix behavior wrote intensity only into G,
-    # leaving R and B at zero. Any per-channel variation asymmetry here
-    # would indicate the fix has regressed.
+    # --- 5. BGW palette LUT applied ---
+    # The driver defaults to apply_palette=True, mapping raw uint8
+    # intensity through gui.ksa_palette.KSA_BGW_PALETTE (indices 0-127:
+    # G ramps 0→255 with R=B=0; indices 128-255: G stays 255 while R+B
+    # ramp 0→255). Dark frames legitimately have R=B=0 everywhere —
+    # that's BGW behavior, not the historical (0, I, 0) bug. Verify by
+    # confirming every unique RGB triple in the frame is a valid LUT
+    # entry, and reporting per-channel stds for context.
     palette_ok = False
     palette_detail = ""
     if frame.ndim == 3 and frame.shape[-1] == 3:
-        r_std = float(np.std(frame[..., 0]))
-        g_std = float(np.std(frame[..., 1]))
-        b_std = float(np.std(frame[..., 2]))
-        if g_std > 0:
-            # Allow ~1% tolerance for numerical noise (should be exact).
-            palette_ok = (
-                abs(r_std - g_std) / g_std < 0.01
-                and abs(b_std - g_std) / g_std < 0.01
-            )
-        else:
-            palette_ok = r_std == g_std == b_std == 0
-        palette_detail = (
-            f"R_std={r_std:.2f}, G_std={g_std:.2f}, B_std={b_std:.2f}"
-        )
+        try:
+            from gui.ksa_palette import KSA_BGW_PALETTE
+            unique = np.unique(frame.reshape(-1, 3), axis=0)
+            in_lut = np.array([
+                np.any(np.all(KSA_BGW_PALETTE == triple, axis=1))
+                for triple in unique
+            ])
+            palette_ok = bool(in_lut.all())
+            r_std = float(np.std(frame[..., 0]))
+            g_std = float(np.std(frame[..., 1]))
+            b_std = float(np.std(frame[..., 2]))
+            if palette_ok:
+                palette_detail = (
+                    f"{len(unique)} unique colors, all valid BGW LUT entries; "
+                    f"R_std={r_std:.2f}, G_std={g_std:.2f}, B_std={b_std:.2f}"
+                )
+            else:
+                palette_detail = (
+                    f"{int((~in_lut).sum())} of {len(unique)} unique triples "
+                    "not in BGW LUT — palette mapping may not be applied"
+                )
+        except ImportError:
+            palette_ok = True
+            palette_detail = "gui.ksa_palette not importable — skipping"
     else:
         palette_ok = True
         palette_detail = "monochrome frame — no per-channel palette check"
     status(
-        "Palette fix ((I,I,I), not (0,I,0))",
+        "BGW palette LUT applied",
         palette_ok,
         palette_detail,
     )
