@@ -393,17 +393,32 @@ def _probe_modbus_read(client, addr: int, count: int, device_id: int) -> dict:
     result = {"response": False, "registers": None, "error": ""}
     # pymodbus renamed the device-ID kwarg between versions (unit → slave
     # → device_id); match the driver's compat pattern.
+    #
+    # Wrap the whole call chain in a broad except so pymodbus runtime
+    # exceptions (ModbusIOException on timeout, connection errors, etc.)
+    # are recorded in result["error"] instead of crashing the caller.
+    # Without this outer catch, a single silent-device probe explodes
+    # phase_modbus_probe on the first baud attempt and the operator
+    # never sees the verdict block. Confirmed on Bulbasaur 2026-07-28
+    # against a non-responding pyrometer at COM4.
     rr = None
-    for kw in ("device_id", "slave", "unit"):
-        try:
-            rr = client.read_holding_registers(addr, count, **{kw: device_id})
-            break
-        except TypeError:
-            continue
-    if rr is None:
-        rr = client.read_holding_registers(
-            address=addr, count=count, device_id=device_id,
-        )
+    try:
+        for kw in ("device_id", "slave", "unit"):
+            try:
+                rr = client.read_holding_registers(
+                    addr, count, **{kw: device_id}
+                )
+                break
+            except TypeError:
+                # Wrong kwarg name for this pymodbus version — try next.
+                continue
+        if rr is None:
+            rr = client.read_holding_registers(
+                address=addr, count=count, device_id=device_id,
+            )
+    except Exception as exc:  # noqa: BLE001 — see comment above
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
     if hasattr(rr, "isError") and rr.isError():
         result["error"] = f"Modbus error: {rr}"
     elif not hasattr(rr, "registers") or len(rr.registers) < count:

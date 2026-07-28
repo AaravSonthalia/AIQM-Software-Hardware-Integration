@@ -88,6 +88,30 @@ class ReadOnlySafetyTests(unittest.TestCase):
                 f"Expected SAFETY in error for 0x{reg:04X}, got: {ctx.exception}",
             )
 
+    def test_probe_captures_pymodbus_exception_gracefully(self):
+        """pymodbus runtime exceptions (e.g. ModbusIOException on timeout)
+        must be captured into result['error'] and NOT propagate up.
+
+        Regression: Bulbasaur run 2026-07-28 crashed with an unhandled
+        ModbusIOException on a silent device, aborting phase_modbus_probe
+        before the operator saw the verdict block.
+        """
+        class TimingOutClient:
+            """Mimics pymodbus raising ModbusIOException on a silent device."""
+            def read_holding_registers(self, *_args, **_kwargs):
+                raise RuntimeError(
+                    "Modbus Error: [Input/Output] No response received "
+                    "after 3 retries"
+                )
+        # Use a non-forbidden address (REG_VER 0x1300) so we exercise the
+        # actual read path, not the SAFETY short-circuit.
+        result = _probe_modbus_read(TimingOutClient(), 0x1300, 1, device_id=1)
+        self.assertFalse(result["response"])
+        self.assertIn("RuntimeError", result["error"])
+        self.assertIn("No response received", result["error"])
+        # And the caller receives a dict, not an exception
+        self.assertIsInstance(result, dict)
+
 
 # ---------------------------------------------------------------------------
 # Verdict logic — given the raw phase outputs, does the state classifier
