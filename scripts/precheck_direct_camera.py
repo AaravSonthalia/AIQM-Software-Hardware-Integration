@@ -3,7 +3,7 @@
 Structured GO/NO-GO output for the Vimba direct-camera path — tests
 OUR ``VmbCamera`` wrapper (not just raw vmbpy), so a green result here
 implies the exact code path Growth Monitor uses when
-``camera_mode="direct"``. Complements ``scripts/vimba_camera_smoke.py``,
+``camera_mode="vimba"``. Complements ``scripts/vimba_camera_smoke.py``,
 which tests raw vmbpy independently.
 
 Reports pass/fail for:
