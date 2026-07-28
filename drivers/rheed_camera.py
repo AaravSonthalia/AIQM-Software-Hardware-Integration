@@ -39,6 +39,18 @@ class FrameNotYetAvailableError(RuntimeError):
     """
 
 
+class _AccessDenialError(Exception):
+    """Internal: signals that a VmbCamera open attempt hit access denial.
+
+    Wraps a vmbpy.VmbCameraError raised at set_access_mode() or __enter__().
+    Only the outer `_stream_loop` catches this — it's what tells the
+    auto-mode orchestrator "the SDK refused the open" vs "something else
+    broke inside the streaming session." Downstream VmbPy errors (feature
+    config, streaming) propagate raw to the outer except handler and land
+    in _stream_error unchanged.
+    """
+
+
 class RheedCamera(ABC):
     """Abstract RHEED frame source."""
 
@@ -64,8 +76,24 @@ class VmbCamera(RheedCamera):
     """
     Direct access to an Allied Vision camera (Manta G-033B) via the vmbpy SDK.
 
-    Requires an exclusive camera lock — cannot run while kSA 400 holds the
-    camera. Frames are palette-mapped to kSA's BGW false-color LUT via
+    Two-mode access via ``access_mode``:
+
+    * ``"full"`` (or successful ``"auto"``): exclusive control. Driver
+      configures the trigger pipeline and software-triggers at
+      ``trigger_hz``. Cannot coexist with kSA 400 holding the camera.
+    * ``"read"`` (or ``"auto"`` after Full is denied): passive consumer.
+      Another process (typically kSA + Vimba multicast) owns acquisition;
+      the driver just subscribes to the stream. Requires camera multicast
+      enabled in the persistent user set (see Task #187).
+
+    In ``"auto"`` mode the driver tries Full first; if the SDK refuses
+    (kSA holds the exclusive lock), it retries once with Read. Once the
+    active access mode is negotiated at connect time it is frozen — no
+    auto-upgrade Read→Full mid-session (a "helpful" upgrade while growers
+    are actively using kSA in Full would silently steal their stream).
+    A fresh ``disconnect()`` + ``connect()`` cycle re-tries Full first.
+
+    Frames are palette-mapped to kSA's BGW false-color LUT via
     ``gui.ksa_palette.KSA_BGW_PALETTE`` (byte-verified against 200 training
     BMPs) so direct-Vimba output is visually and distributionally identical
     to kSA screengrab training data. Pass ``apply_palette=False`` for plain
@@ -76,9 +104,10 @@ class VmbCamera(RheedCamera):
     streaming pipeline — a bare ``get_frame()`` registers no consumer, so
     every call times out (confirmed on Bulbasaur, May 8 2026). Instead a
     background thread opens the camera, starts streaming with a frame handler,
-    and software-triggers at ``trigger_hz``. The handler keeps the single most
-    recent frame in a thread-safe slot; ``read_frame()`` returns a copy of it,
-    so the poll-based ``RheedCameraWorker`` consumes this driver unchanged.
+    and (in Full mode) software-triggers at ``trigger_hz``. The handler keeps
+    the single most recent frame in a thread-safe slot; ``read_frame()``
+    returns a copy of it, so the poll-based ``RheedCameraWorker`` consumes
+    this driver unchanged regardless of the negotiated access mode.
     """
 
     # Time to wait in connect() for the streaming thread to become ready
@@ -102,13 +131,23 @@ class VmbCamera(RheedCamera):
     # without spinning the CPU.
     TRIGGER_BACKOFF_S = 2.0
 
+    # Valid access_mode values. Kept as a class-level constant so tests
+    # can introspect the accepted set without importing the module twice.
+    _ACCESS_MODE_CHOICES = ("auto", "full", "read")
+
     def __init__(
         self,
         camera_index: int = 0,
         trigger_hz: float = 1.0,
         bit_depth: int = 12,
         apply_palette: bool = True,
+        access_mode: str = "auto",
     ):
+        if access_mode not in self._ACCESS_MODE_CHOICES:
+            raise ValueError(
+                f"access_mode must be one of {self._ACCESS_MODE_CHOICES}, "
+                f"got {access_mode!r}"
+            )
         self._camera_index = camera_index
         self._trigger_hz = trigger_hz
         self._bit_depth = bit_depth
@@ -120,6 +159,13 @@ class VmbCamera(RheedCamera):
         # raw pixel values are identical but max intensity differs.
         self._max_value = (1 << bit_depth) - 1
         self._apply_palette = apply_palette
+        # User-requested access mode (validated above). "auto" triggers
+        # Full-first-then-Read-fallback in _stream_loop; "full"/"read"
+        # skip the fallback and just try that mode once.
+        self._requested_access_mode = access_mode
+        # Negotiated access mode after a successful open, populated by
+        # _run_one_session. "" before connect / after disconnect.
+        self._active_access_mode = ""
         self._connected = False
 
         # Streaming state. The stream thread owns every vmbpy call for a
@@ -189,76 +235,207 @@ class VmbCamera(RheedCamera):
     def _stream_loop(self) -> None:
         """Background thread — owns every vmbpy call for one connect cycle.
 
-        Opens VmbSystem + camera, configures the software trigger, starts
-        streaming with _frame_handler, then triggers at trigger_hz until
-        disconnect() sets _stop_event. Keeping all vmbpy calls on this one
-        thread respects the SDK's thread affinity; the ``with`` blocks
-        release the camera even on error, so kSA — or a reconnect — can
-        re-acquire it.
+        Opens VmbSystem + camera, then delegates to `_run_one_session`
+        which negotiates the access mode (set_access_mode + __enter__),
+        gate-configures the trigger pipeline, starts streaming, and runs
+        the trigger/idle loop until disconnect() sets _stop_event. Keeping
+        all vmbpy calls on this one thread respects the SDK's thread
+        affinity; each attempt's own `with cam:` block releases the camera
+        even on error, so kSA — or a reconnect — can re-acquire it.
 
-        Trigger failures don't kill the loop — a bounded consecutive-fail
-        counter forces a short backoff so a transient (network hiccup,
-        kSA cycling the port) has room to recover without spinning the CPU.
+        Auto mode: try Full first; on _AccessDenialError, retry Read.
+        If Read also fails, raise a combined RuntimeError naming both
+        failure modes without over-pointing at any single root cause.
+        Explicit "full"/"read" modes don't retry — the sentinel error is
+        unwrapped so the caller sees a normal RuntimeError.
+
+        Trigger failures inside a session don't kill the loop — a bounded
+        consecutive-fail counter in _trigger_and_idle_loop forces a short
+        backoff so a transient (network hiccup, kSA cycling the port) has
+        room to recover without spinning the CPU.
         """
         try:
-            from vmbpy import VmbSystem
+            import vmbpy
 
-            with VmbSystem.get_instance() as vmb:
+            with vmbpy.VmbSystem.get_instance() as vmb:
                 cams = vmb.get_all_cameras()
                 if not cams:
                     raise RuntimeError(
-                        "No Allied Vision cameras found — confirm kSA 400 is "
-                        "fully closed (it holds the camera exclusively)."
+                        "No Allied Vision cameras found — confirm the "
+                        "camera is powered on and reachable to Vimba "
+                        "(kSA-open coexistence still requires the camera "
+                        "itself to be visible to the SDK)."
                     )
-                with cams[self._camera_index] as cam:
-                    # Software trigger → deterministic, controlled frame rate.
-                    cam.TriggerSource.set("Software")
-                    cam.TriggerSelector.set("FrameStart")
-                    cam.TriggerMode.set("On")
-                    cam.AcquisitionMode.set("Continuous")
+                cam = cams[self._camera_index]
 
-                    cam.start_streaming(self._frame_handler)
+                if self._requested_access_mode == "auto":
                     try:
-                        # connect() unblocks here — the pipeline is live.
-                        self._ready_event.set()
-                        period = 1.0 / self._trigger_hz
-                        consecutive_trigger_fails = 0
-                        while not self._stop_event.is_set():
-                            try:
-                                cam.TriggerSoftware.run()
-                                consecutive_trigger_fails = 0
-                            except Exception as exc:  # noqa: BLE001
-                                consecutive_trigger_fails += 1
-                                with self._error_lock:
-                                    self._last_frame_error = (
-                                        f"TriggerSoftware.run: {exc}"
-                                    )
-                                if (
-                                    consecutive_trigger_fails
-                                    >= self.MAX_CONSECUTIVE_TRIGGER_FAILS
-                                ):
-                                    log.warning(
-                                        "VmbCamera: %d consecutive trigger fails; "
-                                        "backing off %.1fs before retry",
-                                        consecutive_trigger_fails,
-                                        self.TRIGGER_BACKOFF_S,
-                                    )
-                                    self._stop_event.wait(self.TRIGGER_BACKOFF_S)
-                                    consecutive_trigger_fails = 0
-                                    continue
-                            # Interruptible pacing — disconnect() wakes this
-                            # at once instead of after a full period.
-                            self._stop_event.wait(period)
-                    finally:
-                        cam.stop_streaming()
+                        self._run_one_session(cam, "full")
+                    except _AccessDenialError as full_err:
+                        log.info(
+                            "VmbCamera: Full mode denied (%s); "
+                            "retrying with Read.", full_err,
+                        )
+                        try:
+                            self._run_one_session(cam, "read")
+                        except _AccessDenialError as read_err:
+                            raise RuntimeError(
+                                "Full denied; Read also failed. Check "
+                                "kSA state, camera permitted access "
+                                "modes, Vimba X multicast/read-sharing "
+                                "config, and Task #187. "
+                                f"Full: {full_err} | Read: {read_err}"
+                            ) from read_err
+                else:
+                    try:
+                        self._run_one_session(cam, self._requested_access_mode)
+                    except _AccessDenialError as e:
+                        # Explicit mode: no fallback. Unwrap the sentinel
+                        # so the caller sees a normal RuntimeError, not
+                        # the internal marker class.
+                        raise RuntimeError(str(e)) from e.__cause__
         except Exception as exc:
             with self._error_lock:
                 self._stream_error = exc
             log.error("VmbCamera stream loop exited on error: %s", exc)
         finally:
             self._connected = False
+            self._active_access_mode = ""
             # Unblock connect() even if setup failed before the set() above.
             self._ready_event.set()
+
+    def _run_one_session(self, cam, mode: str) -> None:
+        """Set access mode, open, configure, stream, close cleanly.
+
+        Self-contained per-attempt lifecycle: `with cam:` scopes the entire
+        open→configure→stream→close cycle. Only VmbCameraErrors from
+        `set_access_mode` or `__enter__` are wrapped in _AccessDenialError
+        (the outer orchestrator's fallback signal); any other exception,
+        including VmbCameraErrors from feature config or streaming,
+        propagates raw to the outer error handler and lands in _stream_error.
+
+        The `past_open` flag distinguishes __enter__ failure from later
+        VmbCameraErrors — see constraint 7 of the plan.
+        """
+        import vmbpy
+        access_enum = getattr(vmbpy.AccessMode, mode.capitalize())
+
+        try:
+            cam.set_access_mode(access_enum)
+        except vmbpy.VmbCameraError as e:
+            raise _AccessDenialError(
+                f"AccessMode.{mode.capitalize()} denied at "
+                f"set_access_mode: {e}"
+            ) from e
+
+        past_open = False
+        try:
+            with cam:
+                past_open = True
+                # Gate every feature write on the writable bit (constraint 3).
+                # In Full mode: writable=True → set() fires as before.
+                # In Read mode: writable=False → skip with an INFO log.
+                self._set_if_writable(cam, "TriggerSource", "Software", mode)
+                self._set_if_writable(cam, "TriggerSelector", "FrameStart", mode)
+                self._set_if_writable(cam, "TriggerMode", "On", mode)
+                self._set_if_writable(cam, "AcquisitionMode", "Continuous", mode)
+
+                cam.start_streaming(self._frame_handler)
+                try:
+                    # connect() unblocks here — the pipeline is live.
+                    self._active_access_mode = mode
+                    self._ready_event.set()
+                    log.info(
+                        "VmbCamera connected in AccessMode.%s "
+                        "(camera_index=%d, trigger_hz=%.2f)",
+                        mode.capitalize(), self._camera_index, self._trigger_hz,
+                    )
+                    self._trigger_and_idle_loop(cam, mode)
+                finally:
+                    cam.stop_streaming()
+        except vmbpy.VmbCameraError as e:
+            if not past_open:
+                raise _AccessDenialError(
+                    f"AccessMode.{mode.capitalize()} denied at "
+                    f"__enter__: {e}"
+                ) from e
+            raise
+
+    def _set_if_writable(self, cam, feature_name: str, value, mode: str) -> None:
+        """Set a camera feature only if `feature.get_access_mode()[1]` is True.
+
+        Discovery-driven — the driver asks the SDK, not the driver's own
+        assumptions about what Read forbids. If `get_access_mode()` itself
+        raises (undocumented SDK behavior):
+
+        * Full mode: propagate the exception. Silently skipping required
+          trigger config would leave the camera in an unusable state.
+        * Read mode: log at INFO and skip. The driver is intentionally
+          passive; a probe failure is bounded and non-fatal.
+        """
+        feature = getattr(cam, feature_name)
+        try:
+            _readable, writable = feature.get_access_mode()
+        except Exception as exc:  # noqa: BLE001
+            if mode == "full":
+                raise
+            log.info(
+                "VmbCamera[Read]: %s.get_access_mode() raised (%s); "
+                "skipping set() — driver stays passive.",
+                feature_name, exc,
+            )
+            return
+        if not writable:
+            log.info(
+                "VmbCamera[%s]: skipping %s.set(%r) — read-only in this mode",
+                mode.capitalize(), feature_name, value,
+            )
+            return
+        feature.set(value)
+
+    def _trigger_and_idle_loop(self, cam, mode: str) -> None:
+        """Per-mode trigger/idle loop; exits when `_stop_event` is set.
+
+        * Full mode: software-triggers at trigger_hz. Bounded consecutive-
+          fail counter forces a short backoff so a transient (network
+          hiccup, kSA cycling the port) has room to recover without
+          spinning the CPU. If TriggerSoftware.run() raises unexpectedly
+          the real error is recorded through `_last_frame_error` — we
+          do NOT silently degrade to a passive loop.
+        * Read mode: pure idle wait. Frames arrive from whoever holds
+          Full (kSA, typically) plus Vimba multicast; the driver never
+          triggers. No `TriggerSoftware.run()` call at all.
+        """
+        period = 1.0 / self._trigger_hz
+        consecutive_trigger_fails = 0
+        while not self._stop_event.is_set():
+            if mode == "full":
+                try:
+                    cam.TriggerSoftware.run()
+                    consecutive_trigger_fails = 0
+                except Exception as exc:  # noqa: BLE001
+                    consecutive_trigger_fails += 1
+                    with self._error_lock:
+                        self._last_frame_error = (
+                            f"TriggerSoftware.run: {exc}"
+                        )
+                    if (
+                        consecutive_trigger_fails
+                        >= self.MAX_CONSECUTIVE_TRIGGER_FAILS
+                    ):
+                        log.warning(
+                            "VmbCamera: %d consecutive trigger fails; "
+                            "backing off %.1fs before retry",
+                            consecutive_trigger_fails,
+                            self.TRIGGER_BACKOFF_S,
+                        )
+                        self._stop_event.wait(self.TRIGGER_BACKOFF_S)
+                        consecutive_trigger_fails = 0
+                        continue
+            # Interruptible pacing — disconnect() wakes this at once
+            # instead of after a full period. In Read mode this is the
+            # only thing the loop does; frames flow via the callback.
+            self._stop_event.wait(period)
 
     def _frame_handler(self, cam, _stream, frame) -> None:
         """vmbpy streaming callback — runs on the SDK's handler thread.
@@ -338,6 +515,14 @@ class VmbCamera(RheedCamera):
         with self._frame_lock:
             latest = self._latest_frame
         if latest is None:
+            if self._active_access_mode == "read":
+                raise FrameNotYetAvailableError(
+                    "Connected in AccessMode.Read; no frame arrived yet. "
+                    "Frames flow only if another consumer (e.g. kSA Live "
+                    "Video) is triggering, camera multicast is enabled "
+                    "(Vimba X Viewer → user set), and external triggering "
+                    "is producing frames."
+                )
             raise FrameNotYetAvailableError(
                 "Vimba camera is streaming but no frame has arrived yet — "
                 "expected within one trigger period after connect."
@@ -361,6 +546,18 @@ class VmbCamera(RheedCamera):
     @property
     def connected(self) -> bool:
         return self._connected
+
+    @property
+    def access_mode(self) -> str:
+        """The negotiated AccessMode after a successful open.
+
+        Returns "full" or "read" while streaming, "" before connect or
+        after disconnect. Useful for diagnostics and for the precheck
+        script (`scripts/precheck_direct_camera.py`) to report which
+        mode was actually granted when the driver was constructed with
+        `access_mode="auto"`.
+        """
+        return self._active_access_mode
 
 
 class ScreenGrabCamera(RheedCamera):

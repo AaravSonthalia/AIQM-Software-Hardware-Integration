@@ -49,14 +49,58 @@ class FakeFrame:
         return self._img
 
 
-class FakeSettable:
-    """Camera setting proxy — captures which values were set for assertions."""
+class FakeVmbCameraError(Exception):
+    """Mimics vmbpy.VmbCameraError for access-mode denial tests.
 
-    def __init__(self):
+    The driver's `_run_one_session` catches `vmbpy.VmbCameraError` at both
+    `set_access_mode` and `__enter__` and wraps it in `_AccessDenialError`.
+    This fake is what the driver's `except` clause sees under test.
+    """
+
+
+class FakeAccessMode:
+    """Mimics vmbpy.AccessMode with `Full` / `Read` attributes.
+
+    Values are string sentinels so tests can assert on which mode the
+    driver requested (`cam.set_access_mode(vmbpy.AccessMode.Full)`
+    resolves to the string `"AccessMode.Full"` on the fake, easy to log
+    and inspect).
+    """
+    Full = "AccessMode.Full"
+    Read = "AccessMode.Read"
+
+
+class FakeSettable:
+    """Camera setting proxy — captures which values were set for assertions.
+
+    Supports the writable-bit gate the driver uses in Read mode:
+    `get_access_mode() -> (readable, writable)`. Default `(True, True)`
+    preserves the existing pre-eccba75 behavior, so historical tests still
+    fire their `.set()` calls unchanged. Optional `get_access_mode_raises`
+    injects an exception at the probe boundary to test constraint 3's
+    "propagate in Full, skip in Read" rule.
+    """
+
+    def __init__(
+        self,
+        readable: bool = True,
+        writable: bool = True,
+        get_access_mode_raises: Exception | None = None,
+    ):
         self.value: object = None
+        self.set_call_count = 0
+        self._readable = readable
+        self._writable = writable
+        self._get_access_mode_raises = get_access_mode_raises
 
     def set(self, value) -> None:  # noqa: A003
         self.value = value
+        self.set_call_count += 1
+
+    def get_access_mode(self) -> tuple[bool, bool]:
+        if self._get_access_mode_raises is not None:
+            raise self._get_access_mode_raises
+        return (self._readable, self._writable)
 
 
 class FakeTriggerSoftware:
@@ -88,13 +132,35 @@ class FakeTriggerSoftware:
 
 
 class FakeCamera:
-    """Fake vmbpy Camera — context-manager entry + streaming lifecycle."""
+    """Fake vmbpy Camera — context-manager entry + streaming lifecycle.
 
-    def __init__(self):
-        self.TriggerSource = FakeSettable()
-        self.TriggerSelector = FakeSettable()
-        self.TriggerMode = FakeSettable()
-        self.AcquisitionMode = FakeSettable()
+    Supports three independent access-denial injection flags per constraint 2
+    of the plan:
+
+    * `refuse_full_on_set_access_mode` — `set_access_mode(Full)` raises
+      FakeVmbCameraError (proves the driver catches at that boundary).
+    * `refuse_full_on_enter` — `__enter__` raises FakeVmbCameraError when
+      the last set mode was Full.
+    * `refuse_read_on_enter` — `__enter__` raises FakeVmbCameraError when
+      the last set mode was Read (proves the "both modes failed" combined
+      error path).
+
+    `last_set_access_mode` records the most recent `set_access_mode` call
+    so tests can verify the driver's auto-mode retry actually asked for
+    Read after Full was refused.
+    """
+
+    def __init__(
+        self,
+        trigger_source_writable: bool = True,
+        trigger_selector_writable: bool = True,
+        trigger_mode_writable: bool = True,
+        acquisition_mode_writable: bool = True,
+    ):
+        self.TriggerSource = FakeSettable(writable=trigger_source_writable)
+        self.TriggerSelector = FakeSettable(writable=trigger_selector_writable)
+        self.TriggerMode = FakeSettable(writable=trigger_mode_writable)
+        self.AcquisitionMode = FakeSettable(writable=acquisition_mode_writable)
         self.TriggerSoftware = FakeTriggerSoftware(self)
 
         self.handler = None
@@ -111,11 +177,48 @@ class FakeCamera:
         # Modes: silent → run() doesn't dispatch to handler
         self.silent = False
 
+        # Access-mode injection state (constraint 2 of the plan).
+        self.last_set_access_mode: str = ""
+        self.set_access_mode_calls: list[str] = []
+        self.refuse_full_on_set_access_mode: bool = False
+        self.refuse_full_on_enter: bool = False
+        self.refuse_read_on_enter: bool = False
+
         # Context-manager: __enter__ returns self, __exit__ is a no-op
         self.entered = False
         self.exited = False
 
+    def set_access_mode(self, mode: str) -> None:
+        """Record the requested mode; raise if the refuse flag is set for Full.
+
+        The driver calls this BEFORE entering `with cam:`, so this is the
+        first of the two boundaries where access denial can surface.
+        """
+        self.set_access_mode_calls.append(mode)
+        if (
+            self.refuse_full_on_set_access_mode
+            and mode == FakeAccessMode.Full
+        ):
+            raise FakeVmbCameraError(
+                "fake: set_access_mode(Full) refused"
+            )
+        self.last_set_access_mode = mode
+
     def __enter__(self) -> "FakeCamera":
+        if (
+            self.last_set_access_mode == FakeAccessMode.Full
+            and self.refuse_full_on_enter
+        ):
+            raise FakeVmbCameraError(
+                "fake: __enter__ refused for AccessMode.Full"
+            )
+        if (
+            self.last_set_access_mode == FakeAccessMode.Read
+            and self.refuse_read_on_enter
+        ):
+            raise FakeVmbCameraError(
+                "fake: __enter__ refused for AccessMode.Read"
+            )
         self.entered = True
         return self
 
@@ -164,12 +267,19 @@ def install_fake_vmbpy(
     Returns the first camera if any exist (for the common one-camera happy
     path), or None if the caller explicitly installed an empty list (to
     exercise the "no cameras found" error path).
+
+    The fake module exposes `VmbSystem`, `AccessMode`, and `VmbCameraError`
+    — the three vmbpy names the driver references at runtime.
     """
     if cameras is None:
         cameras = [FakeCamera()]
     FakeVmbSystem._cameras = cameras
     FakeVmbSystem._raise_on_get_all_cameras = None
-    fake = types.SimpleNamespace(VmbSystem=FakeVmbSystem)
+    fake = types.SimpleNamespace(
+        VmbSystem=FakeVmbSystem,
+        AccessMode=FakeAccessMode,
+        VmbCameraError=FakeVmbCameraError,
+    )
     sys.modules["vmbpy"] = fake
     return cameras[0] if cameras else None
 
@@ -486,6 +596,241 @@ def test_trigger_backoff_after_consecutive_fails() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Access-mode fallback tests (Jul 27 2026 refactor — kSA-open coexistence)
+#
+# These cover the constraints from the fluffy-sleeping-babbage plan:
+#   (a-c) auto-mode Full-first, Read-fallback at both denial boundaries
+#   (d)   both-modes-denied combined error, no over-pointing at multicast
+#   (e)   Read-mode feature .set() gating by the writable bit
+#   (f)   Read-mode never calls TriggerSoftware.run()
+#   (g)   access_mode public property matches negotiated mode
+#   (h)   invalid access_mode string rejected at __init__
+#   (i)   Read-mode FrameNotYetAvailableError includes Read context
+# ---------------------------------------------------------------------------
+
+def test_auto_full_succeeds_records_access_mode() -> None:
+    """(a) In auto mode, if Full opens, access_mode property returns 'full'."""
+    try:
+        fake_cam = install_fake_vmbpy()  # no refuse flags → Full opens
+        from drivers.rheed_camera import VmbCamera
+        cam = VmbCamera(trigger_hz=100.0)  # default access_mode="auto"
+        assert cam.access_mode == "", (
+            f"expected empty pre-connect, got {cam.access_mode!r}"
+        )
+        cam.connect()
+        assert cam.connected
+        assert cam.access_mode == "full", (
+            f"expected access_mode='full', got {cam.access_mode!r}"
+        )
+        assert fake_cam.set_access_mode_calls == [FakeAccessMode.Full], (
+            f"expected auto to try Full only, got "
+            f"{fake_cam.set_access_mode_calls}"
+        )
+        cam.disconnect()
+        assert cam.access_mode == "", (
+            f"expected empty after disconnect, got {cam.access_mode!r}"
+        )
+    finally:
+        uninstall_fake_vmbpy()
+
+
+def test_auto_full_denied_at_enter_falls_back_to_read() -> None:
+    """(b) auto → Full denied at __enter__, Read opens successfully."""
+    try:
+        fake_cam = install_fake_vmbpy()
+        fake_cam.refuse_full_on_enter = True
+        from drivers.rheed_camera import VmbCamera
+        cam = VmbCamera(trigger_hz=100.0)  # auto
+        cam.connect()
+        assert cam.connected
+        assert cam.access_mode == "read", (
+            f"expected fallback to 'read', got {cam.access_mode!r}"
+        )
+        assert fake_cam.set_access_mode_calls == [
+            FakeAccessMode.Full, FakeAccessMode.Read,
+        ], f"unexpected sequence: {fake_cam.set_access_mode_calls}"
+        # Read attempt did enter the with-block
+        assert fake_cam.entered
+        cam.disconnect()
+    finally:
+        uninstall_fake_vmbpy()
+
+
+def test_auto_full_denied_at_set_access_mode_falls_back_to_read() -> None:
+    """(c) auto → Full denied at set_access_mode (before __enter__), Read opens."""
+    try:
+        fake_cam = install_fake_vmbpy()
+        fake_cam.refuse_full_on_set_access_mode = True
+        from drivers.rheed_camera import VmbCamera
+        cam = VmbCamera(trigger_hz=100.0)  # auto
+        cam.connect()
+        assert cam.connected
+        assert cam.access_mode == "read", (
+            f"expected fallback to 'read', got {cam.access_mode!r}"
+        )
+        # Driver attempted set_access_mode(Full) — refused, then tried Read
+        assert fake_cam.set_access_mode_calls == [
+            FakeAccessMode.Full, FakeAccessMode.Read,
+        ], f"unexpected sequence: {fake_cam.set_access_mode_calls}"
+        # last_set_access_mode should be Read (Full never took effect)
+        assert fake_cam.last_set_access_mode == FakeAccessMode.Read
+        assert fake_cam.entered
+        cam.disconnect()
+    finally:
+        uninstall_fake_vmbpy()
+
+
+def test_auto_full_and_read_both_denied_raises_combined_error() -> None:
+    """(d) auto → Full AND Read both denied → combined error names both."""
+    try:
+        fake_cam = install_fake_vmbpy()
+        fake_cam.refuse_full_on_enter = True
+        fake_cam.refuse_read_on_enter = True
+        from drivers.rheed_camera import VmbCamera
+        cam = VmbCamera(trigger_hz=100.0)  # auto
+        try:
+            cam.connect()
+        except RuntimeError as exc:
+            msg = str(exc)
+            msg_lower = msg.lower()
+            # Must name both failure modes
+            assert "full denied" in msg_lower, (
+                f"expected 'Full denied' in msg, got: {exc}"
+            )
+            assert "read also failed" in msg_lower, (
+                f"expected 'Read also failed' in msg, got: {exc}"
+            )
+            # Multicast mentioned as ONE candidate, not the sole cause
+            assert "multicast" in msg_lower, (
+                f"expected 'multicast' among candidates, got: {exc}"
+            )
+            # Multiple candidate causes surfaced (not just multicast)
+            assert "ksa" in msg_lower or "permitted access modes" in msg_lower, (
+                f"expected multiple candidates, got: {exc}"
+            )
+            assert not cam.connected
+            return
+        raise AssertionError("expected RuntimeError, none raised")
+    finally:
+        uninstall_fake_vmbpy()
+
+
+def test_read_mode_skips_writes_when_feature_not_writable() -> None:
+    """(e) In Read mode, every feature .set() is gated by the writable bit."""
+    try:
+        # Simulate Read-mode SDK behavior: features report writable=False
+        fake_cam = install_fake_vmbpy(cameras=[FakeCamera(
+            trigger_source_writable=False,
+            trigger_selector_writable=False,
+            trigger_mode_writable=False,
+            acquisition_mode_writable=False,
+        )])
+        from drivers.rheed_camera import VmbCamera
+        cam = VmbCamera(trigger_hz=100.0, access_mode="read")
+        cam.connect()
+        assert cam.connected
+        assert cam.access_mode == "read"
+        # No writes should have fired — writable bit was False on all four
+        assert fake_cam.TriggerSource.set_call_count == 0, (
+            f"TriggerSource.set called {fake_cam.TriggerSource.set_call_count} "
+            "times despite writable=False"
+        )
+        assert fake_cam.TriggerSelector.set_call_count == 0
+        assert fake_cam.TriggerMode.set_call_count == 0
+        assert fake_cam.AcquisitionMode.set_call_count == 0
+        cam.disconnect()
+    finally:
+        uninstall_fake_vmbpy()
+
+
+def test_read_mode_never_calls_trigger_software_run() -> None:
+    """(f) In Read mode, TriggerSoftware.run() is never called."""
+    try:
+        fake_cam = install_fake_vmbpy()
+        from drivers.rheed_camera import VmbCamera
+        # Fast trigger_hz — if the loop mistakenly called run(), count > 0
+        cam = VmbCamera(trigger_hz=1000.0, access_mode="read")
+        cam.connect()
+        assert cam.connected
+        assert cam.access_mode == "read"
+        # Give the idle loop time to iterate many periods
+        time.sleep(0.1)
+        assert fake_cam.trigger_run_count == 0, (
+            f"Read mode must never trigger, got trigger_run_count="
+            f"{fake_cam.trigger_run_count}"
+        )
+        cam.disconnect()
+    finally:
+        uninstall_fake_vmbpy()
+
+
+def test_access_mode_property_matches_negotiated_mode() -> None:
+    """(g) access_mode property returns 'full'/'read' matching negotiation."""
+    from drivers.rheed_camera import VmbCamera
+    # Explicit Full
+    try:
+        install_fake_vmbpy()
+        cam_full = VmbCamera(trigger_hz=100.0, access_mode="full")
+        assert cam_full.access_mode == ""  # not connected yet
+        cam_full.connect()
+        assert cam_full.access_mode == "full"
+        cam_full.disconnect()
+    finally:
+        uninstall_fake_vmbpy()
+    # Explicit Read
+    try:
+        install_fake_vmbpy()
+        cam_read = VmbCamera(trigger_hz=100.0, access_mode="read")
+        assert cam_read.access_mode == ""
+        cam_read.connect()
+        assert cam_read.access_mode == "read"
+        cam_read.disconnect()
+    finally:
+        uninstall_fake_vmbpy()
+
+
+def test_invalid_access_mode_raises_value_error_at_init() -> None:
+    """(h) VmbCamera(access_mode='banana') → ValueError at __init__."""
+    from drivers.rheed_camera import VmbCamera
+    try:
+        VmbCamera(access_mode="banana")
+    except ValueError as exc:
+        msg = str(exc)
+        assert "access_mode" in msg, f"unexpected message: {exc}"
+        assert "banana" in msg, f"expected 'banana' in message, got: {exc}"
+        return
+    raise AssertionError("expected ValueError, none raised")
+
+
+def test_read_mode_frame_not_yet_error_includes_read_context() -> None:
+    """(i) In Read mode, FrameNotYetAvailableError includes Read-mode context."""
+    try:
+        install_fake_vmbpy()
+        from drivers.rheed_camera import VmbCamera, FrameNotYetAvailableError
+        cam = VmbCamera(trigger_hz=100.0, access_mode="read")
+        cam.connect()
+        assert cam.access_mode == "read"
+        # In Read mode the driver never triggers, so no frame will ever
+        # arrive on this synthetic setup. Read frame → FrameNotYet.
+        try:
+            cam.read_frame()
+        except FrameNotYetAvailableError as exc:
+            msg = str(exc)
+            assert "AccessMode.Read" in msg, (
+                f"expected 'AccessMode.Read' in message, got: {msg}"
+            )
+            assert "multicast" in msg.lower(), (
+                f"expected multicast hint in Read message, got: {msg}"
+            )
+            cam.disconnect()
+            return
+        cam.disconnect()
+        raise AssertionError("expected FrameNotYetAvailableError, none raised")
+    finally:
+        uninstall_fake_vmbpy()
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -538,6 +883,16 @@ TESTS = [
     test_reconnect_after_disconnect,
     test_bad_frame_recorded_but_stream_survives,
     test_trigger_backoff_after_consecutive_fails,
+    # Access-mode fallback (Jul 27 2026 refactor)
+    test_auto_full_succeeds_records_access_mode,
+    test_auto_full_denied_at_enter_falls_back_to_read,
+    test_auto_full_denied_at_set_access_mode_falls_back_to_read,
+    test_auto_full_and_read_both_denied_raises_combined_error,
+    test_read_mode_skips_writes_when_feature_not_writable,
+    test_read_mode_never_calls_trigger_software_run,
+    test_access_mode_property_matches_negotiated_mode,
+    test_invalid_access_mode_raises_value_error_at_init,
+    test_read_mode_frame_not_yet_error_includes_read_context,
 ]
 
 

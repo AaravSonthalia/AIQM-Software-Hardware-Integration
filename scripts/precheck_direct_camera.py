@@ -8,7 +8,7 @@ which tests raw vmbpy independently.
 
 Reports pass/fail for:
   1. ``VmbCamera`` importable + constructable
-  2. ``connect()`` — streaming thread starts
+  2. ``connect()`` — streaming thread starts (in the negotiated AccessMode)
   3. ``read_frame()`` — returns a frame within ~5s
   4. Frame stats sensible (mean, std, range)
   5. **BGW palette LUT applied** — every unique RGB triple in the frame
@@ -19,13 +19,26 @@ Reports pass/fail for:
      the historical ``(0, I, 0)`` bug this check evolved from.
   6. ``disconnect()`` cleanly
 
-Prints a summary block designed as a meeting-report line.
+Prints a summary block designed as a meeting-report line, including the
+negotiated AccessMode for auditability.
 
-Usage on Bulbasaur (kSA must NOT be holding the camera):
-    python scripts\\precheck_direct_camera.py
+Usage on Bulbasaur (kSA state depends on --access-mode):
+    python scripts\\precheck_direct_camera.py                     # auto (default)
+    python scripts\\precheck_direct_camera.py --access-mode full  # kSA-closed
+    python scripts\\precheck_direct_camera.py --access-mode read  # kSA-open coexist
+
+Access-mode semantics (match ``VmbCamera(access_mode=...)``):
+  * ``auto`` — try Full first; on access denial, fall back to Read.
+    Use for validation when kSA state is unknown or mixed.
+  * ``full`` — require exclusive control. Use for the kSA-closed
+    regression path.
+  * ``read`` — passive consumer only. Requires camera multicast enabled
+    (Task #187). Use to isolate the Read code path from the auto-fallback
+    logic when kSA is open.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -56,8 +69,31 @@ def verdict(ready: bool, hint: str = "") -> int:
     return 0 if ready else 1
 
 
-def main() -> int:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Direct-camera pre-flight for the Vimba VmbCamera path. "
+            "Reports pass/fail per stage plus the negotiated AccessMode."
+        ),
+    )
+    parser.add_argument(
+        "--access-mode",
+        choices=("auto", "full", "read"),
+        default="auto",
+        help=(
+            "Requested AccessMode: 'auto' (Full first, Read fallback), "
+            "'full' (exclusive), or 'read' (passive, requires camera "
+            "multicast — Task #187). Default: auto."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+
     print("=== Direct-camera pre-flight ===")
+    print(f"Requested access mode: {args.access_mode}")
     print()
 
     # --- 1. VmbCamera importable + constructable ---
@@ -70,7 +106,12 @@ def main() -> int:
             "check drivers/rheed_camera.py + vmbpy install (pip install vmbpy)",
         )
     try:
-        cam = VmbCamera(camera_index=0, trigger_hz=1.0, bit_depth=12)
+        cam = VmbCamera(
+            camera_index=0,
+            trigger_hz=1.0,
+            bit_depth=12,
+            access_mode=args.access_mode,
+        )
     except Exception as e:
         status("VmbCamera constructable", False, f"{type(e).__name__}: {e}")
         return verdict(False, "VmbCamera __init__ failed")
@@ -84,10 +125,16 @@ def main() -> int:
         return verdict(
             False,
             "connect failed — likely (a) no camera visible to VimbaX SDK, "
-            "(b) kSA is holding the Manta, or (c) VimbaX SDK not installed. "
-            "Try scripts/vimba_camera_smoke.py --list-only to isolate.",
+            "(b) kSA holds the camera in Full and multicast isn't enabled "
+            "(try --access-mode read once Task #187 lands), (c) VimbaX SDK "
+            "not installed, or (d) both Full and Read were denied. Try "
+            "scripts/vimba_camera_smoke.py --list-only to isolate.",
         )
-    status("VmbCamera.connect()", True, "streaming thread active")
+    status(
+        "VmbCamera.connect()",
+        True,
+        f"streaming thread active in AccessMode.{cam.access_mode.capitalize()}",
+    )
 
     # --- 3. read_frame() with brief retry (first frame may take ~1-2s) ---
     frame = None
@@ -199,6 +246,11 @@ def main() -> int:
 
     # --- All checks weighted for the verdict ---
     all_ok = stats_ok and palette_ok
+    # Restate the negotiated mode near the verdict so a scan of the
+    # summary tail alone conveys which SDK access mode the session ran in
+    # — critical for auto mode where kSA state determined the outcome.
+    print()
+    print(f"Negotiated access mode: {cam.access_mode}")
     return verdict(
         all_ok,
         "some checks did not pass — see above" if not all_ok else "",
