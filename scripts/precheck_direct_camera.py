@@ -61,8 +61,8 @@ def status(label: str, ok: bool, detail: str = "") -> None:
 def verdict(ready: bool, hint: str = "") -> int:
     print()
     if ready:
-        print("Verdict: READY for Growth Monitor camera_mode=\"direct\" testing.")
-        print("Next: launch growth_monitor_app.py, set Camera mode = 'direct',")
+        print("Verdict: READY for Growth Monitor camera_mode=\"vimba\" testing.")
+        print("Next: launch growth_monitor_app.py, set Camera mode = 'vimba',")
         print("and arm a session.")
     else:
         print(f"Verdict: BLOCKED — {hint}")
@@ -130,10 +130,15 @@ def main(argv: list[str] | None = None) -> int:
             "not installed, or (d) both Full and Read were denied. Try "
             "scripts/vimba_camera_smoke.py --list-only to isolate.",
         )
+    # Cache the negotiated mode NOW — cam.access_mode gets cleared to ""
+    # when disconnect() runs at step 6, and the final verdict block prints
+    # this value after disconnect. Reading `cam.access_mode` there would
+    # show an empty string.
+    negotiated_access_mode = cam.access_mode
     status(
         "VmbCamera.connect()",
         True,
-        f"streaming thread active in AccessMode.{cam.access_mode.capitalize()}",
+        f"streaming thread active in AccessMode.{negotiated_access_mode.capitalize()}",
     )
 
     # --- 3. read_frame() with brief retry (first frame may take ~1-2s) ---
@@ -249,8 +254,10 @@ def main(argv: list[str] | None = None) -> int:
     # Restate the negotiated mode near the verdict so a scan of the
     # summary tail alone conveys which SDK access mode the session ran in
     # — critical for auto mode where kSA state determined the outcome.
+    # Uses the cached value from post-connect (see comment at cache site);
+    # `cam.access_mode` is now "" because disconnect() cleared it.
     print()
-    print(f"Negotiated access mode: {cam.access_mode}")
+    print(f"Negotiated access mode: {negotiated_access_mode}")
     return verdict(
         all_ok,
         "some checks did not pass — see above" if not all_ok else "",

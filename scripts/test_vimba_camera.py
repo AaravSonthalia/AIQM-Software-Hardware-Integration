@@ -830,6 +830,75 @@ def test_read_mode_frame_not_yet_error_includes_read_context() -> None:
         uninstall_fake_vmbpy()
 
 
+def test_full_mode_get_access_mode_raise_propagates() -> None:
+    """(j) In Full mode, feature.get_access_mode() raising propagates.
+
+    Silently skipping a required trigger config would leave the camera in
+    an unusable state — constraint 3 says Full-mode probe failures must
+    propagate rather than be swallowed.
+    """
+    try:
+        fake_cam = install_fake_vmbpy()
+        # Inject a probe failure on the first feature the driver touches
+        fake_cam.TriggerSource._get_access_mode_raises = RuntimeError(
+            "SDK probe broke"
+        )
+        from drivers.rheed_camera import VmbCamera
+        cam = VmbCamera(trigger_hz=100.0, access_mode="full")
+        try:
+            cam.connect()
+        except RuntimeError as exc:
+            assert "SDK probe broke" in str(exc), (
+                f"expected propagation of probe error, got: {exc}"
+            )
+            assert not cam.connected
+            # Never made it to start_streaming — TriggerSource is the first
+            # feature the driver probes, so nothing beyond that should have
+            # happened. In particular, the .set() should not have fired.
+            assert fake_cam.TriggerSource.set_call_count == 0
+            return
+        raise AssertionError(
+            "expected RuntimeError to propagate from Full-mode probe failure"
+        )
+    finally:
+        uninstall_fake_vmbpy()
+
+
+def test_read_mode_get_access_mode_raise_is_logged_and_skipped() -> None:
+    """(k) In Read mode, feature.get_access_mode() raising is logged and skipped.
+
+    The driver is intentionally passive in Read; a bounded probe failure
+    on one feature shouldn't kill the whole connect. Subsequent features
+    with functioning probes proceed as normal — constraint 3's
+    "log-and-skip in Read" rule.
+    """
+    try:
+        fake_cam = install_fake_vmbpy()
+        # Probe raise on TriggerSource ONLY; other features probe normally
+        fake_cam.TriggerSource._get_access_mode_raises = RuntimeError(
+            "SDK probe broke"
+        )
+        from drivers.rheed_camera import VmbCamera
+        cam = VmbCamera(trigger_hz=100.0, access_mode="read")
+        cam.connect()
+        # Read-mode's probe-raise handling let connect succeed
+        assert cam.connected
+        assert cam.access_mode == "read"
+        # TriggerSource.set() was skipped (probe raised, driver logged-and-skipped)
+        assert fake_cam.TriggerSource.set_call_count == 0, (
+            "TriggerSource.set should be skipped when probe raises in Read"
+        )
+        # Loop continued past TriggerSource — TriggerSelector's probe
+        # succeeded (default writable=True), so .set() fired.
+        assert fake_cam.TriggerSelector.set_call_count == 1, (
+            "TriggerSelector.set should have fired — proves the driver "
+            "continued past TriggerSource's probe failure"
+        )
+        cam.disconnect()
+    finally:
+        uninstall_fake_vmbpy()
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -893,6 +962,8 @@ TESTS = [
     test_access_mode_property_matches_negotiated_mode,
     test_invalid_access_mode_raises_value_error_at_init,
     test_read_mode_frame_not_yet_error_includes_read_context,
+    test_full_mode_get_access_mode_raise_propagates,
+    test_read_mode_get_access_mode_raise_is_logged_and_skipped,
 ]
 
 
