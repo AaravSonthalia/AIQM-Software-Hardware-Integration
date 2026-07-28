@@ -52,16 +52,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Reuse the register-map constants + decoders from the production driver.
-# If the driver's understanding of the register map ever changes, this
-# script stays in sync automatically.
-from drivers.pyrometer import (  # noqa: E402
-    REG_CH1_TEMP,
-    REG_NAME0,
-    REG_VER,
-    _regs_to_ascii,
-    _regs_to_f32,
-)
+# NOTE: register-map constants + decoders (REG_CH1_TEMP, REG_VER, REG_NAME0,
+# _regs_to_f32, _regs_to_ascii) live in drivers/pyrometer.py, but that
+# module transitively pulls in owon_power_supply → pyvisa via
+# heater_control.TemperatureSensor. pyvisa is a Windows-lab-only dep and
+# isn't in CI; importing it at module top would break the headless test
+# suite (see [[gui-lazy-import-pattern]]). We import lazily inside the
+# two functions that need those symbols — phase_modbus_probe() and
+# _decode_probe() — so anything Mac/CI-side that only exercises verdict
+# logic, evidence bundling, or the Exactus parser stays clean.
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +421,9 @@ def _decode_probe(name: str, registers: Optional[list[int]]) -> str:
     if registers is None:
         return ""
     try:
+        # Lazy import — drivers.pyrometer pulls in pyvisa transitively;
+        # see the note at the top of this module.
+        from drivers.pyrometer import _regs_to_ascii, _regs_to_f32  # noqa: PLC0415
         if name == "REG_VER":
             v = registers[0]
             return f"version {v >> 8}.{v & 0xFF}"
@@ -460,6 +462,23 @@ def phase_modbus_probe(port: str, device_id: int) -> list[dict]:
         results.append({
             "baud": 0, "register_name": "-", "response": False,
             "registers": None, "error": "pymodbus not installed",
+            "decoded": "",
+        })
+        return results
+
+    # Lazy import — see the note at the top of this module. If
+    # drivers.pyrometer fails to import (pyvisa missing on the host), we
+    # can't do register-based probes, but the operator gets a clear
+    # single-line error rather than a module-level ImportError crash.
+    try:
+        from drivers.pyrometer import (  # noqa: PLC0415
+            REG_CH1_TEMP, REG_NAME0, REG_VER,
+        )
+    except Exception as exc:  # noqa: BLE001
+        results.append({
+            "baud": 0, "register_name": "-", "response": False,
+            "registers": None,
+            "error": f"drivers.pyrometer import failed: {exc}",
             "decoded": "",
         })
         return results
