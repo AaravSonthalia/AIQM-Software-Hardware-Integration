@@ -626,7 +626,7 @@ class GrowthApp(QMainWindow):
 
         pyro_temp: Optional[float] = None
         pyro = self.monitor._latest_pyro
-        if pyro is not None and pyro.connected:
+        if pyro is not None and pyro.has_valid_reading:
             pyro_temp = pyro.temperature
 
         idx = self.growth_log.record_live_label(
@@ -754,7 +754,11 @@ class GrowthApp(QMainWindow):
         if not self.growth_log.active:
             return
         pyro = self.monitor._latest_pyro
-        pyro_ok = pyro is not None and pyro.connected
+        # `has_valid_reading` is stricter than `connected` — it also
+        # rejects the pre-first-read window and any failed batch after,
+        # so an empty pyrometer cell in sensor_log.csv genuinely means
+        # "no reading" instead of a spurious 0.0.
+        pyro_ok = pyro is not None and pyro.has_valid_reading
         pyro_temp = pyro.temperature if pyro_ok else None
         pyro_temp_std = pyro.temperature_std if pyro_ok else None
         pyro_temp_n = pyro.temperature_n if pyro_ok else None
@@ -852,9 +856,14 @@ class GrowthApp(QMainWindow):
         path = self.growth_log.save_heartbeat_frame(frame)
         if not path:
             return  # Quality gate rejected, or save failed
+        # Heartbeat frame capture MUST NOT depend on pyrometer health —
+        # if camera quality passed, we save the frame. Pyrometer just
+        # gets logged as blank when there's no valid reading (post-connect
+        # window or failed batch); previously this used `connected` alone
+        # and leaked 0.0 into the heartbeat log.
         pyro_temp = (
             self.monitor._latest_pyro.temperature
-            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.has_valid_reading
             else None
         )
         self.growth_log.log_heartbeat(
@@ -882,9 +891,13 @@ class GrowthApp(QMainWindow):
         the visual evolution leading up to the trigger.
         """
         self._auto_capture_event_count += 1
+        # Auto-capture triggers on RHEED signal, NOT pyrometer health —
+        # a valid event should still fire and record the frame buffer
+        # even if the pyrometer is quiet. Temp cell is blank in that case
+        # (previously leaked 0.0 via the `connected`-only guard).
         pyro_temp = (
             self.monitor._latest_pyro.temperature
-            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.has_valid_reading
             else None
         )
         context_frames = self.auto_capture_engine.get_recent_frames()

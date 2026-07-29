@@ -2,6 +2,7 @@
 State dataclasses for the hardware control GUI.
 """
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -59,16 +60,42 @@ class PyrometerState:
     standard deviation (0.0 when n=1). Polybot-inspired: a per-poll
     mean/std gives downstream consumers a cheap statistical-consistency
     check without requiring a second pass over the sensor log.
+
+    ``None`` semantics: "no valid reading has been taken since connect
+    (or since the last error batch)." The worker emits ``connected=True``
+    with ``temperature=None`` right after ``connect()`` succeeds and
+    before the first poll, and again whenever a poll batch fails
+    entirely. Consumers MUST NOT persist ``0.0`` in place of ``None`` —
+    that leaks a spurious real-looking reading into sensor_log.csv and
+    downstream analyses. Use the ``has_valid_reading`` predicate below.
     """
-    temperature: float = 0.0
-    temperature_std: float = 0.0
-    temperature_n: int = 1
+    temperature: Optional[float] = None
+    temperature_std: Optional[float] = None
+    temperature_n: int = 0
     emissivity: Optional[float] = None  # 0.0-1.0, from TemperaSure or Modbus
     unit: str = "C"
     connected: bool = False
     error: str = ""
     device_info: str = ""
     mode: str = ""  # "modbus", "screengrab", or "dummy"
+
+    @property
+    def has_valid_reading(self) -> bool:
+        """True iff a real finite numeric reading is available right now.
+
+        Consumers should gate CSV writes / label renders / thresholds on
+        this — NOT on ``connected`` alone, which is True for the interval
+        between ``connect()`` and the first successful read. ``math.isfinite``
+        rejects ``nan`` and ``inf`` — a driver with a dual-endian ambiguity
+        can produce non-finite floats, and treating them as valid would
+        leak ``nan`` into every downstream analysis that assumes float
+        arithmetic.
+        """
+        return (
+            self.connected
+            and self.temperature is not None
+            and math.isfinite(self.temperature)
+        )
 
 
 @dataclass

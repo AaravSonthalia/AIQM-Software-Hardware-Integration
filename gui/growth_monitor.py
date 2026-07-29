@@ -1286,9 +1286,13 @@ class GrowthMonitor(QWidget):
 
     def update_pyrometer_state(self, state: PyrometerState):
         self._latest_pyro = state
-        if state.connected:
+        if state.has_valid_reading:
             self.temp_display.value.setText(f"{state.temperature:.0f} \u2103")
         else:
+            # Covers both disconnected and connected-but-no-reading-yet
+            # (post-connect / post-failed-batch). Rendering "---" instead
+            # of "0 \u2103" prevents the header label from advertising a
+            # spurious reading when the sensor is quiet.
             self.temp_display.value.setText("---")
 
     def update_mistral_state(self, state: MistralState):
@@ -1897,7 +1901,7 @@ class GrowthMonitor(QWidget):
             psu_source = "direct"
 
         pyro_temp: Optional[float] = None
-        if self._latest_pyro and self._latest_pyro.connected:
+        if self._latest_pyro and self._latest_pyro.has_valid_reading:
             pyro_temp = self._latest_pyro.temperature
 
         # Grab any queued note text WITHOUT clearing the input — the
@@ -1991,7 +1995,7 @@ class GrowthMonitor(QWidget):
         now = datetime.now()
         temp_str = (
             f"{self._latest_pyro.temperature:.1f}"
-            if self._latest_pyro and self._latest_pyro.connected else ""
+            if self._latest_pyro and self._latest_pyro.has_valid_reading else ""
         )
 
         # PSU value snapshot — prefer MISTRAL screengrab OCR since that's

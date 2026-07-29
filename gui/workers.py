@@ -460,6 +460,16 @@ class PyrometerWorker(QThread):
                 state.temperature_n = int(arr.size)
                 state.connected = True
                 state.error = ""
+            else:
+                # Batch entirely failed. Reset the reading fields to their
+                # None sentinels so we don't leak the previous cycle's
+                # temperature into the next emission timestamp. `connected`
+                # stays True because the sensor object is still open — only
+                # the reading itself is stale. `state.error` was set in the
+                # except clause above.
+                state.temperature = None
+                state.temperature_std = None
+                state.temperature_n = 0
 
             # Emissivity is a slow-moving config value — single read is fine.
             if hasattr(self._sensor, "read_emissivity"):
