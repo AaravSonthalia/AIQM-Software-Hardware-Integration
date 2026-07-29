@@ -197,6 +197,255 @@ may genuinely look unchanged, and a vendor window may repaint its last image.
 For Elog, `watchdog.jsonl` records path, size, mtime, last-record source time,
 and tail hash, but only source-time advancement confirms new records.
 
+## Vendor GUI Unexpected Closure
+
+Treat closing a vendor data window and exiting the complete vendor application
+as different tests. A title-bar X or vendor Exit action is performed manually
+by the named operator after `failure-start`; the recorder or process observer
+must never send `WM_CLOSE`, call a close/kill API, or terminate a process.
+Closing an application that owns control, interlock, or safety functions is
+ineligible even when its readout is also used by Growth Monitor.
+
+Before the action, bind the exact top-level data HWND to its owning PID,
+process creation time, executable/command line, window title, and source
+driver HWND. Do not accept a title-only match, a launcher/wrapper PID, the
+recorder PID, or an unrelated `python.exe`. Record these outcomes separately:
+
+- the target data HWND disappears while the vendor process remains alive;
+- the vendor process exits, confirmed through its pre-opened process handle;
+- another same-title window appears but is not yet bound as recovery.
+
+An external window/process loss is fault evidence only. Passing also requires
+the affected production State to become invalid by the stale deadline and the
+actual Growth Monitor path to stop using the previous value. Check its session
+logs and UI, not only the independent probe: affected sensor columns must not
+repeat stale-valid values, and a lost RHEED source must not produce heartbeat
+frames, event images, or new classifications from the cached frame. Reopening
+the vendor software must bind the expected new HWND/process identity before
+manual reconnect and re-ARM.
+
+## Growth Monitor GUI Lifecycle and Unexpected Exit
+
+The source probe runs its own workers and cannot establish whether the Growth
+Monitor process is alive. A Growth Monitor lifecycle run therefore requires a
+separate, durable, read-only process/window observer. The observer records its
+own PID and binds the Growth Monitor main HWND to the actual Python process,
+script command line, process creation time, and Git commit. It may query and
+wait on the process but must have no terminate right and no close/kill command.
+Growth Monitor remains an interactively launched application.
+
+First test a graceful title-bar X with Growth Monitor idle/disarmed. A
+RUNNING-path test is allowed only as an approved advisory test session while
+the equipment itself is idle and non-controlling. Run both variants: no
+auxiliary windows open, and RHEED/temperature/Equalizer or other floating
+windows open. Distinguish:
+
+- **main HWND lost:** the primary window disappears;
+- **process exited:** the bound process handle signals and yields an exit code;
+- **floating-window residue:** the main HWND is gone but the process or another
+  top-level window owned by the same PID remains.
+
+Main-window loss is not proof of process exit. If a floating window keeps the
+process alive, verify that every worker, classifier, heartbeat, and session
+write has stopped and that no stale display still appears live. Record a
+lingering process, worker, or live-looking stale window as a validation
+failure, not as successful shutdown.
+
+Exercise abrupt termination first with a synthetic/offline process or a
+tabletop copy. Do not automate it and do not proceed to a connected production
+workstation until the offline evidence, safe-state review, and independent
+observer have passed. A target crash is the planned fault; loss of the
+independent observer is an evidence-fatal result.
+
+Also keep a `--fault-style spontaneous` observer recipe ready for a genuinely
+unplanned GUI disappearance. Record `precheck-complete` only while the healthy
+baseline is still present, and do not add `close-action` afterward. Never
+manufacture a spontaneous live crash. A loss before the required baseline or
+without surviving observer evidence is incomplete, not a pass.
+
+After either exit path, audit every existing session CSV/JSON for complete,
+parseable records and observe the old session directory until it is quiescent.
+Growth Logger calls Python `flush()` after common row writes and closes files
+on a graceful X, but it does not `fsync()` those session files. This supports
+process-exit testing only; it is not evidence of durability through
+workstation or site-power loss.
+
+On restart, require a new PID/process-creation identity and verify the GUI is
+initially `idle`. It must not automatically ARM, START, resume control, or
+append to the old session. The operator explicitly ARM(s), confirms fresh
+source-appropriate readings, and then explicitly START(s) a new, cross-linked
+test session. A `rearmed` marker alone remains an assertion unless accompanied
+by read-only UI/state evidence.
+
+### Read-Only Lifecycle Observer
+
+Start Growth Monitor interactively. For a RUNNING-path test, use only an
+approved advisory test session while the equipment is idle and no sample,
+control loop, ramp, or autonomous action is active. Pin that exact session
+directory; for an idle/disarmed test, omit the two session arguments.
+
+```powershell
+$growth = @(
+  Get-Process |
+    Where-Object MainWindowTitle -eq "Oxide MBE Growth Monitor"
+)
+if ($growth.Count -ne 1) { throw "Expected exactly one Growth Monitor" }
+$growthMonitorPid = $growth[0].Id
+$growthMonitorHwnd = $growth[0].MainWindowHandle
+$growthMonitorImage = $growth[0].Path
+if ($growthMonitorHwnd -eq 0) { throw "Growth Monitor has no main HWND" }
+if (-not $growthMonitorImage) { throw "Cannot resolve Growth Monitor image" }
+$session = "E:\OMBE\GrowthMonitor\<exact-test-session>"
+$run = "D:\O-MBE-validation\failure\gui_exit_YYYYMMDD_HHMMSS"
+$job = "D:\O-MBE-validation\jobs\gui_exit_YYYYMMDD_HHMMSS"
+$precheckEvidenceFile = (
+  "D:\O-MBE-validation\evidence\gui_precheck_idle_safe.png"
+)
+$closeEvidenceFile = (
+  "D:\O-MBE-validation\evidence\gui_close_action_safe.png"
+)
+
+& $manager launch --output-dir $job --cwd $checkout -- $python `
+  scripts\ombe_gui_lifecycle_probe.py run `
+  --pid $growthMonitorPid `
+  --hwnd $growthMonitorHwnd `
+  --expected-title "Oxide MBE Growth Monitor" `
+  --expected-image $growthMonitorImage `
+  --expected-command-token growth_monitor `
+  --target-role growth-monitor --scenario-id gui-running-x-01 `
+  --fault-style graceful --test-context live-idle-advisory `
+  --gui-state advisory-running `
+  --session-dir $session --require-session-advance sensor_log.csv `
+  --operator "<name>" --observer "<different name>" --approver "<owner>" `
+  --authorization-ref "<maintenance record>" --sop-ref "<GUI-close SOP>" `
+  --safe-state-note "<idle equipment; advisory test session only>" `
+  --abort-criteria "<unexpected control, output, alarm, or wrong process>" `
+  --confirm-safe-state --require-action-markers `
+  --require-recovery-validation `
+  --baseline-duration-s 10 --post-loss-observation-s 5 `
+  --orphan-grace-s 30 --duration-s 300 --output-dir $run
+```
+
+The observer opens only `PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE`;
+it has no close/terminate command. After the baseline is visibly healthy,
+write markers from another terminal, then the named operator manually clicks
+the main-window X. Repeat once with no floating windows and once with the
+RHEED, temperature, and Equalizer windows open. The action gate rejects a
+marker if sampling has ended, the latest sample/cadence is stale, the bound
+window has already disappeared, a required stream is not advancing, or too
+little observation time remains.
+
+```powershell
+& $python "$checkout\scripts\ombe_gui_lifecycle_probe.py" mark `
+  --output-dir $run --kind precheck-complete `
+  --label "baseline and safe state verified" --operator "<observer>" `
+  --evidence-ref $precheckEvidenceFile
+
+& $python "$checkout\scripts\ombe_gui_lifecycle_probe.py" mark `
+  --output-dir $run --kind close-action `
+  --label "operator about to click main-window X" --operator "<operator>" `
+  --evidence-ref $closeEvidenceFile
+```
+
+Poll the managed job at least every 30 seconds. Before writing any recovery
+marker, wait until status reports `result_available=true` and verify that
+`$run\run_complete.json` exists. On restart, identify the exact replacement
+process/window and let the marker command verify it read-only. Create the UI
+evidence files before writing the corresponding marker; each reference must be
+a regular file. The observer records its size, mtime, and SHA-256 and rechecks
+it whenever the summary is rebuilt.
+
+```powershell
+$newGrowth = @(
+  Get-Process |
+    Where-Object MainWindowTitle -eq "Oxide MBE Growth Monitor"
+)
+if ($newGrowth.Count -ne 1) { throw "Expected one replacement GUI" }
+$newGrowthMonitorPid = $newGrowth[0].Id
+$newGrowthMonitorHwnd = $newGrowth[0].MainWindowHandle
+$newGrowthMonitorImage = $newGrowth[0].Path
+if ($newGrowthMonitorHwnd -eq 0) { throw "Replacement GUI has no main HWND" }
+if (-not $newGrowthMonitorImage) { throw "Cannot resolve replacement image" }
+$newSession = "E:\OMBE\GrowthMonitor\<new-linked-recovery-session>"
+$idleEvidenceFile = "D:\O-MBE-validation\evidence\restart_idle.png"
+$armedEvidenceFile = "D:\O-MBE-validation\evidence\restart_armed.png"
+$newSessionEvidenceFile = (
+  "D:\O-MBE-validation\evidence\restart_new_session.png"
+)
+
+& $python "$checkout\scripts\ombe_gui_lifecycle_probe.py" mark `
+  --output-dir $run --kind gui-restarted `
+  --label "replacement GUI identity verified" --operator "<observer>" `
+  --new-pid $newGrowthMonitorPid `
+  --new-hwnd $newGrowthMonitorHwnd `
+  --new-expected-title "Oxide MBE Growth Monitor" `
+  --new-expected-image $newGrowthMonitorImage `
+  --new-expected-command-token growth_monitor
+
+& $python "$checkout\scripts\ombe_gui_lifecycle_probe.py" mark `
+  --output-dir $run --kind idle-confirmed `
+  --label "replacement GUI starts idle" --operator "<observer>" `
+  --evidence-ref $idleEvidenceFile
+
+& $python "$checkout\scripts\ombe_gui_lifecycle_probe.py" mark `
+  --output-dir $run --kind gui-rearmed `
+  --label "operator explicitly armed replacement GUI" `
+  --operator "<operator>" --evidence-ref $armedEvidenceFile
+
+& $python "$checkout\scripts\ombe_gui_lifecycle_probe.py" mark `
+  --output-dir $run --kind new-session-started `
+  --label "operator explicitly started linked recovery session" `
+  --operator "<operator>" --new-session-dir $newSession `
+  --evidence-ref $newSessionEvidenceFile
+
+& $python "$checkout\scripts\ombe_gui_lifecycle_probe.py" finalize `
+  --output-dir $run --reaudit-session
+```
+
+For an idle test with no pinned session, omit `new-session-started` and
+`--reaudit-session`, use `--gui-state idle-disarmed`, and omit all session
+arguments; the other recovery markers still apply. For
+`advisory-running`, the CLI requires a pinned session and at least one
+`--require-session-advance`. Before `new-session-started`, wait until the new
+session's `sensor_log.csv` has at least one complete data row. The run remains
+exit 3 until the required recovery evidence is complete. Every recovery marker
+reopens the stored read-only binding and verifies the new PID, process creation
+time, executable, exact HWND/title/class, visibility, and command token; a
+one-time restart assertion is insufficient.
+
+Any post-exit or post-restart change to the old session is a validation
+failure. The observer's exit code covers lifecycle evidence only; pair vendor
+window tests with `ombe_failure_probe.py` to evaluate stale State, cached
+frames, classification, and production logging.
+
+For a vendor GUI test, first start `ombe_failure_probe.py` with
+`--fault-class window-source-loss`. Then start the lifecycle observer with the
+same operator/authorization metadata, `--target-role vendor-data-window` (or
+`vendor-application` for an eligible complete application), and
+`--paired-failure-run <failure-probe output dir>`. The observer requires the
+driver's bound source HWND to match the selected lifecycle target; live
+data-window tests also require at least 30 seconds of post-loss observation.
+If reopening a data window keeps the vendor process alive, use the original
+PID and the new top-level data HWND for `gui-restarted`; the observer requires
+the original process-creation identity and rejects reuse of the old HWND.
+Also pass the rebound window's exact title/image and a vendor-specific
+`--new-expected-command-token`; the default `growth_monitor` token is not
+valid for a vendor process. A complete vendor-application restart still
+requires a distinct PID. Only after both action gates pass may the operator
+manually use the approved vendor X/Exit action.
+
+## GUI Lifecycle Test Matrix
+
+| Scenario | Independent fault proof | Required downstream result | Recovery gate |
+|---|---|---|---|
+| Vendor data-window X | Bound HWND becomes invalid; owning process remains | Target State invalid by deadline; no affected stale values or cached RHEED outputs | Expected data window rebound, then manual reconnect/re-ARM |
+| Eligible vendor application Exit | Pre-opened target process handle signals | Same fail-closed behavior; no unrelated PID accepted | Expected executable/command identity and fresh source evidence |
+| Growth Monitor X, no floating windows | Main HWND lost and target process exit observed | Session files parseable and quiescent; no residual acquisition | New PID starts idle; manual ARM and START a new session |
+| Growth Monitor X, floating windows open | Main HWND lost; same-PID windows and process sampled separately | No worker, classifier, log, or live-looking stale window remains | Close/restart per SOP; new identity and explicit re-ARM |
+| Unplanned Growth Monitor disappearance | Pre-existing spontaneous observer sees main HWND/process loss; no retroactive action marker | Same session-integrity and no-residual-acquisition checks | New PID starts idle; preserve incident evidence before re-ARM |
+| Abrupt Growth Monitor exit | Offline/tabletop target process exit; independent observer survives | Recoverable evidence is reported without claiming clean shutdown | Restart idle; old session immutable; new linked session |
+| Workstation/site-power loss | Second-machine, UPS, or event-log evidence | Same-machine flush evidence is insufficient | Separate post-boot run; never claim same-process continuity |
+
 ## Instrument Power Loss
 
 Use `--fault-class instrument-power-loss` only for an exact, approved power
@@ -271,7 +520,9 @@ if its displayed value changes. Record:
 
 Exit code 0 means a complete passing episode, 2 means recorder/evidence fatal
 error, 3 means incomplete or not evaluable, and 4 means a completed validation
-that exposed no detection or retained stale-valid data.
+failure. Examples include missed detection, retained stale-valid data,
+unexpected process residue/exit status, or post-exit writes to the old
+session.
 
 ## Results
 
@@ -285,6 +536,11 @@ that exposed no detection or retained stale-valid data.
 | S2 Ethernet - not evaluable | | | | | | | |
 | S3 approved device/adapter | | | | | | | |
 | S4 observation/tabletop | | | | | | | |
+| S1 vendor data-window X | | | | | | | |
+| S1 eligible vendor application Exit | | | | | | | |
+| S1 Growth Monitor graceful X | | | | | | | |
+| S1 Growth Monitor X with floating windows | | | | | | | |
+| S0 Growth Monitor abrupt-exit tabletop | | | | | | | |
 
 ## Findings
 
