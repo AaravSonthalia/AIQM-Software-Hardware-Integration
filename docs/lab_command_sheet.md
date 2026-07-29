@@ -260,14 +260,19 @@ Verdict states and next actions:
 | `silent_all_combos` | Device isn't answering Modbus at any combo. If TemperaSure confirms the probe is alive, force-Modbus experiment (4.3) is a candidate. Otherwise physical inspection. |
 | `pymodbus_missing` | Install `pymodbus`: `pip install pymodbus pyserial`. Env issue, not a device issue. |
 
-### 4.3 `pyrometer_force_modbus.py` (EXPERIMENTAL WRITE, expert-gated)
+### 4.3 `pyrometer_force_modbus.py` (state-changing WRITE, expert-gated)
 
 **Read Section 4.0 flowchart before considering this script.** This is
-the ONLY write-capable pyrometer script in the repo. It sends Jacques's
-candidate Exactus→Modbus command `02 4D 4D 03` (STX + "MM" + ETX, from
-`JacquesPyrometerTesting.ipynb`). The command is NOT independently
-confirmed by any BASF manual page we've read — treat as
-candidate-experimental.
+the ONLY state-changing pyrometer script in the repo. It sends the BASF-
+documented Exactus→Modbus mode-switch command `02 4D 4D 03`
+(BASF Exactus User Manual v5.04 page 51 — "Switch to Modbus Mode",
+Format: STX 0x4D 0x4D ETX, Response: None).
+
+**BASF's own recommended recovery** from TemperaSure/special-mode is
+Path A (power-cycle the probe — manual page 53: "To return the probe
+to Modbus mode, disconnect the probe from the computer and cycle the
+power to the probe"). This script (Path B) is a documented alternative
+for when power-cycle is not immediately available.
 
 **Pre-flight**:
 
@@ -277,9 +282,9 @@ candidate-experimental.
    running this script to confirm the probe is alive → close TemperaSure
    → run force_modbus → close force_modbus → optionally reopen
    TemperaSure to confirm the probe is still alive.
-3. Have Path A fallback authorization from Jiangang before starting
-   (in case force-Modbus doesn't work and physical power-cycle is
-   needed).
+3. Have Path A authorization from Jiangang before starting — if this
+   script doesn't produce `identity_found_at_default` on the follow-up
+   discover pass, the fallback is power-cycle (BASF's primary recovery).
 
 **Preview the bytes without touching the port** (always safe, works
 without pyserial):
@@ -308,20 +313,34 @@ python scripts\pyrometer_force_modbus.py --i-am-doing-a-write --verify `
 | State | Meaning | Success? |
 |-------|---------|----------|
 | `dry_run` | Preview only, nothing sent | N/A |
-| `wrote_no_response` | Write completed, no bytes echoed. Neutral outcome — matches BASF's "no response expected" documentation. | **Unknown**. Verify via 4.2. |
-| `wrote_with_response` | Write completed, some bytes came back. | **NOT SUCCESS.** Jacques's notebook observed echo-like bytes; could equally be Prolific PL2303 local echo. Verify via 4.2. |
+| `wrote_no_response` | Write completed, no bytes echoed. Matches BASF's documented `Response: None` (manual page 51). | **Unknown**. Verify via 4.2. |
+| `wrote_with_response` | Write completed, some bytes came back. Look at `response_classification` in the evidence bundle to know what shape. | **NOT SUCCESS by itself** — see classification below. Verify via 4.2. |
 | `port_error` | Serial open or write raised. | Failure. Check TemperaSure isn't running, cable is seated, port matches Device Manager. |
 | `safety_denied` | Neither `--i-am-doing-a-write` nor `--dry-run` was set. Nothing sent. | N/A |
 
-**Success is proven ONLY by re-running `pyrometer_modbus_discover.py`
-and getting `identity_found_at_default`.** Never treat any verdict from
-this script — including `wrote_with_response` — as evidence the mode
-switch worked.
+**Response classification** — when the verdict is `wrote_with_response`, the
+evidence bundle also records `response_classification` describing what shape
+the received bytes had. Labels are observational (describe what was seen);
+they do NOT assert causation:
+
+| Classification | What was seen | What it's consistent with (NOT proven) |
+|----------------|---------------|-----------------------------------------|
+| `echo_of_sent` | Response bytes exactly match sent bytes (`02 4D 4D 03`) | USB-serial local echo (matches Jacques's notebook pattern). Also possible: physical TX/RX short at connector, terminal-side echo config. Not proof of probe response. |
+| `echo_plus_extra` | Response starts with sent bytes, followed by more | Could be echo + probe ACK, echo + noise, echo + stale buffer. Inspect raw hex; do not guess. |
+| `partial_echo` | Response is a proper prefix of sent bytes | Truncated echo, driver flush artifact. Inspect raw hex. |
+| `non_echo_response` | Response bytes differ from what we sent | Novel bytes on the wire. Could be probe data, noise, partial framing. Inspect raw hex. |
+| `no_response` | 0 bytes received (only appears if the state were somehow set — normal `wrote_no_response` verdict already covers silence) | Silence. |
+
+**Neither the state nor the classification is a success flag.** Success is
+proven ONLY by re-running `pyrometer_modbus_discover.py` and getting
+`identity_found_at_default`. `echo_of_sent` is diagnostic-worthy (it
+suggests the serial line has an echo issue that made prior silent verdicts
+unreliable) but it is not proof of anything about the probe's mode.
 
 If verification returns `silent_all_combos` again, **do NOT retry the
 force write in a loop**. Fall back to Path A (physical power-cycle,
-requires Jiangang's OK). Record the outcome in the day's memory update
-so the next session inherits the finding.
+BASF's own recommended recovery per manual page 53). Record the outcome
+in the day's memory update so the next session inherits the finding.
 
 ---
 

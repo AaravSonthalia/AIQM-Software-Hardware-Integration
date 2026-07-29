@@ -1,15 +1,19 @@
-"""Pyrometer force-Modbus — EXPERIMENTAL WRITE (Exactus → Modbus mode switch).
+"""Pyrometer force-Modbus — state-changing WRITE (Exactus → Modbus mode switch).
 
-Purpose: send Jacques's candidate Exactus→Modbus mode-switch command
-(``02 4D 4D 03`` = STX + "MM" + ETX, from JacquesPyrometerTesting.ipynb
-cell 3) to a BASF Exactus pyrometer that we suspect is stuck in Exactus
-binary streaming mode with streaming stopped. After running this and
-waiting ~500 ms, the probe SHOULD default back to Modbus RTU — but this
-is NOT independently confirmed by any BASF manual page we've read, so
-the command is candidate-experimental, NOT a validated unlock.
+Purpose: send the BASF Exactus→Modbus mode-switch command
+(``02 4D 4D 03`` = STX + 'M' + LRC + ETX) to a probe that appears to be
+stuck in Exactus mode after a TemperaSure session. After running this
+and waiting ~500 ms, the probe returns to Modbus RTU per BASF's spec.
+
+The byte sequence is documented in the BASF Exactus User Manual v5.04
+page 51 (Switch to Modbus Mode command). BASF's own recommended recovery
+after TemperaSure/special-mode is a physical power-cycle (page 53) —
+this write is a documented protocol command AND state-changing, so it
+stays behind the ``--i-am-doing-a-write`` gate. See
+[[basf-exactus-manual-findings]].
 
 ════════════════════════════════════════════════════════════════════════
-This is EXPERT-GATED, EXPERIMENTAL. Read before running:
+This is expert-gated. Read before running:
 
   1. Run ``pyrometer_modbus_discover.py`` FIRST. If it finds identity at
      any (baud, device_id) combo, the probe is already answering Modbus
@@ -18,19 +22,27 @@ This is EXPERT-GATED, EXPERIMENTAL. Read before running:
      exclusive. TemperaSure should be available to reopen BEFORE (verify
      probe is alive) and AFTER (verify probe still alive) as an
      alive-check, but not concurrently.
-  3. If this script fails, the fallback is Path A: physical
-     power-cycle of the probe (BASF manual p. 51 documents that the
-     probe defaults to Modbus after every power-up). That needs
-     Jiangang's authorization and physical access to the probe box.
+  3. BASF's OWN recommended recovery is Path A (power-cycle the probe).
+     Manual page 53: "To return the probe to Modbus mode, disconnect the
+     probe from the computer and cycle the power to the probe." That
+     needs Jiangang's authorization and physical access to the probe
+     box. This script (Path B) is a documented alternative for when
+     power-cycle is not immediately available.
   4. Verify success by re-running ``pyrometer_modbus_discover.py``. Bytes
-     coming back on the port after this write are NOT success —
-     Jacques's notebook observed an echo-like response, which could
-     equally be Prolific PL2303 local echo. Success only means
+     coming back on the port after this write are NOT success — the BASF
+     manual documents ``Response: None (pyrometer switches to Modbus
+     Mode immediately)`` for this command. Response bytes matching the
+     sent bytes are `echo_of_sent` (consistent with USB-serial local
+     echo, not proof of probe response — see
+     [[prolific-pl2303-local-echo]]). Success is proven ONLY by
      "discover subsequently reports identity_found_at_default."
 ════════════════════════════════════════════════════════════════════════
 
 Safety design:
-  * The gate ``--i-am-doing-a-write`` is REQUIRED. Absent → exit 2.
+  * The gate ``--i-am-doing-a-write`` is REQUIRED. Absent → exit 2. The
+    command is BASF-documented, but it's still state-changing — the
+    probe transitions from Exactus mode to Modbus mode as a direct
+    result. Gate stays.
   * ``--dry-run`` alone opens NO port, just prints the bytes it WOULD
     send. Useful for CI-testability and for previewing intent.
   * File-name-as-intent: ``pyrometer_force_modbus`` in a Slack paste is
@@ -38,7 +50,7 @@ Safety design:
   * Raw pyserial (not pymodbus): this is a 4-byte fixed-content Exactus
     ASCII command, not Modbus. Using pymodbus here would add
     wrong-protocol scaffolding and hide what's happening.
-  * Echo capture (round-3 addition): after the write, read the port for
+  * Echo capture: after the write, read the port for
     ``POST_WRITE_ECHO_WINDOW_S`` and record everything received. The
     ``response_hex`` field is diagnostic ONLY — see caveat above.
   * This script does NOT auto-verify. Verification is
@@ -80,17 +92,19 @@ from scripts.pyrometer_physical_debug import (  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 
-# The Exactus ASCII "switch to Modbus mode" command:
+# The Exactus ASCII "Switch to Modbus Mode" command:
 #   0x02 = STX (start of text)
-#   0x4D = 'M'
-#   0x4D = 'M'  (mnemonic: "Modbus Mode")
+#   0x4D = 'M' (command byte, per BASF manual v5.04 page 51)
+#   0x4D = LRC — "the LRC for single byte commands is simply the command
+#          byte repeated" (page 51 note). XOR of {0x4D} = 0x4D.
 #   0x03 = ETX (end of text)
 #
-# Source: Jacques's `JacquesPyrometerTesting.ipynb` cell 3, comment
-# "Switch to Modbus Mode (no response expected)". This is NOT
-# independently confirmed by any BASF manual page we've read — treat
-# as CANDIDATE-EXPERIMENTAL. See the module docstring's expert-gated
-# section for the fully-caveated framing.
+# Source: BASF Exactus User Manual v5.04 page 51, "Summary of Commands →
+# Switch to Modbus Mode". Format: STX 0x4D 0x4D ETX. Response: None
+# (pyrometer switches to Modbus Mode immediately). Command Example:
+# 02 4D 4D 03. Also observed in Jacques's JacquesPyrometerTesting.ipynb
+# cell 3. See [[basf-exactus-manual-findings]] for the full command
+# reference.
 EXACTUS_TO_MODBUS_BYTES: bytes = bytes([0x02, 0x4D, 0x4D, 0x03])
 
 # Sanity guard: the byte constant is exactly 4 bytes. If a future edit
@@ -132,6 +146,55 @@ VERDICT_SAFETY_DENIED = "safety_denied"
 
 
 # ---------------------------------------------------------------------------
+# Response classification labels (observational, not assertive)
+# ---------------------------------------------------------------------------
+#
+# Codex round-4 refinement: previous "wrote_with_response" was ambiguous —
+# it covered echo-of-sent, partial echo, echo + extra bytes, and truly
+# novel bytes all under the same label, and the SOP had to inform the
+# operator that none of them mean success.
+#
+# The new response_classification field disambiguates WHAT was seen, still
+# without claiming what it MEANS. Labels are observational — describing the
+# shape of the response — not asserting a root cause. Success continues to
+# come from re-running pyrometer_modbus_discover.py; none of these
+# classifications by themselves prove the mode switch worked.
+#
+# Rationale for keeping "consistent with USB-serial echo" out of the label:
+# we've observed the pattern in Jacques's notebook but have not proven
+# local echo on the O-MBE/Ch-MBE hardware. Labels stay descriptive; the
+# SOP explains what echo-of-sent is consistent with. See
+# [[prolific-pl2303-local-echo]].
+RESPONSE_NONE = "no_response"              # 0 bytes received
+RESPONSE_ECHO_OF_SENT = "echo_of_sent"     # response == sent bytes exactly
+RESPONSE_ECHO_PLUS_EXTRA = "echo_plus_extra"  # starts with sent bytes + more
+RESPONSE_PARTIAL_ECHO = "partial_echo"     # partial prefix match of sent
+RESPONSE_NON_ECHO = "non_echo_response"    # neither empty nor echo-shaped
+
+
+def classify_response(sent: bytes, received: bytes) -> str:
+    """Classify a post-write response by shape only. Observational.
+
+    NEITHER label proves anything about probe state or line behavior —
+    they only describe what appeared on the wire. Downstream interpretation
+    lives in the SOP; success still requires pyrometer_modbus_discover.py
+    to report `identity_found_at_default`.
+    """
+    if not received:
+        return RESPONSE_NONE
+    if received == sent:
+        return RESPONSE_ECHO_OF_SENT
+    if received.startswith(sent):
+        return RESPONSE_ECHO_PLUS_EXTRA
+    # Partial-echo: received is a proper prefix of sent (shorter, matches),
+    # OR received's leading bytes match some prefix of sent. The common
+    # case is a truncated echo where a few bytes made it through.
+    if len(received) < len(sent) and sent.startswith(received):
+        return RESPONSE_PARTIAL_ECHO
+    return RESPONSE_NON_ECHO
+
+
+# ---------------------------------------------------------------------------
 # Terminal helpers (mirror pyrometer_physical_debug's style)
 # ---------------------------------------------------------------------------
 
@@ -166,21 +229,27 @@ def _hex_pretty(b: bytes) -> str:
 
 PREAMBLE_TEXT: str = (
     "═════════════════════════════════════════════════════════════════════\n"
-    " EXPERIMENTAL WRITE — pyrometer mode-switch (Exactus → Modbus)\n"
+    " STATE-CHANGING WRITE — pyrometer mode-switch (Exactus → Modbus)\n"
     "═════════════════════════════════════════════════════════════════════\n"
-    " This script writes an EXPERIMENTAL mode-switch command from\n"
-    " Jacques's notebook. It is NOT confirmed by the BASF manual pages\n"
-    " we've read.\n"
+    " This script writes the BASF-documented mode-switch command\n"
+    " (Exactus User Manual v5.04, page 51). BASF's OWN recommended\n"
+    " recovery from TemperaSure/special-mode is a physical power-cycle\n"
+    " (manual page 53) — this script is Path B, a documented alternative\n"
+    " when power-cycle is not immediately available.\n"
     "\n"
     " Pre-flight checklist:\n"
     "   1. Have you run pyrometer_modbus_discover.py first?\n"
     "   2. Is TemperaSure CLOSED right now? (COM4 is exclusive.)\n"
     "   3. Is TemperaSure AVAILABLE to reopen after this script exits\n"
     "      so you can verify the probe is still alive?\n"
+    "   4. Do you have authorization for Path A (power-cycle) as\n"
+    "      fallback if Path B doesn't produce the desired result?\n"
     "\n"
     " Bytes coming back on the port after this write are NOT success.\n"
-    " Jacques's notebook observed an echo-like response, which could\n"
-    " equally be Prolific PL2303 local echo. Success ONLY means\n"
+    " The BASF spec says 'Response: None (pyrometer switches to Modbus\n"
+    " Mode immediately)'. Response bytes matching what we sent are an\n"
+    " `echo_of_sent` observation — consistent with USB-serial local\n"
+    " echo, not proof of probe response. Success is proven ONLY by\n"
     " 'discover subsequently reports identity_found_at_default'.\n"
     "═════════════════════════════════════════════════════════════════════"
 )
@@ -283,12 +352,19 @@ def write_evidence_bundle(
     dry_run: bool,
     write_result: Optional[dict],
     state: str,
+    response_classification: str = "",
 ) -> dict[str, Path]:
     """Persist the run's structured results for share / paste-back.
 
     JSON schema is specific to this script — deliberately different
     from pyrometer_physical_debug's and pyrometer_modbus_discover's
     schemas. See plan P3.
+
+    ``response_classification`` (Codex round-4) is one of the
+    ``RESPONSE_*`` labels — describes the SHAPE of what came back on
+    the wire without claiming causation. See ``classify_response``.
+    Empty string on dry-run / safety-denied / port-error runs where no
+    write reached the wire.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     bundle: dict = {
@@ -304,6 +380,7 @@ def write_evidence_bundle(
         "response_bytes_len": (
             write_result.get("response_bytes_len", 0) if write_result else 0
         ),
+        "response_classification": response_classification,
         "write_error": write_result.get("error", "") if write_result else "",
         "verdict": {"state": state},
     }
@@ -477,6 +554,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         args.port, EXACTUS_TO_MODBUS_BYTES,
         POST_WRITE_WAIT_S, POST_WRITE_ECHO_WINDOW_S,
     )
+    response_classification = ""
     if write_result["error"]:
         status("Open + write", False, write_result["error"])
         state = VERDICT_PORT_ERROR
@@ -485,15 +563,28 @@ def main(argv: Optional[list[str]] = None) -> int:
             "Open + write", True,
             f"wrote {write_result['bytes_written']} byte(s) at {BAUD_RATE} 8N1",
         )
+        # Reconstruct raw response bytes from the pretty-printed hex.
+        # write_and_capture_echo currently returns hex-formatted only;
+        # classify by re-parsing the same string. Safe roundtrip because
+        # _hex_pretty produces "XX XX XX" with no ambiguity.
+        received_bytes = (
+            bytes.fromhex(write_result["response_hex"].replace(" ", ""))
+            if write_result["response_hex"] else b""
+        )
+        response_classification = classify_response(
+            EXACTUS_TO_MODBUS_BYTES, received_bytes,
+        )
         if write_result["response_bytes_len"] > 0:
             info(
                 f"Echo capture: {write_result['response_bytes_len']} byte(s) received",
                 write_result["response_hex"],
             )
+            info(f"Response classification: {response_classification}")
             info(
-                "REMINDER: bytes returned are NOT success. Could be echo "
-                "(Prolific PL2303 local echo is a known pattern). Verify "
-                "via pyrometer_modbus_discover.py."
+                "REMINDER: bytes returned are NOT success. `echo_of_sent` "
+                "is consistent with USB-serial local echo (see "
+                "docs/lab_command_sheet.md 4.3 verdict table). Verify "
+                "success via pyrometer_modbus_discover.py."
             )
             state = VERDICT_WROTE_WITH_RESPONSE
         else:
@@ -504,12 +595,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             state = VERDICT_WROTE_NO_RESPONSE
 
     section("Verdict")
-    print(f"State: {state}")
+    print(f"State:                   {state}")
+    if response_classification:
+        print(f"Response classification: {response_classification}")
     print(
         "\n"
         "This verdict is DIAGNOSTIC ONLY — not a success flag.\n"
-        "wrote_with_response means 'we saw bytes come back,' not\n"
-        "'the mode switch worked.' Success is proven ONLY by re-running\n"
+        "Response bytes on the wire — even if `echo_of_sent` — do not\n"
+        "confirm the mode switch. Success is proven ONLY by re-running\n"
         "pyrometer_modbus_discover.py and getting identity_found_at_default."
     )
 
@@ -518,6 +611,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         written = write_evidence_bundle(
             args.output_dir, vars(args), environment_snapshot,
             dry_run=False, write_result=write_result, state=state,
+            response_classification=response_classification,
         )
         print()
         print("Evidence bundle written:")

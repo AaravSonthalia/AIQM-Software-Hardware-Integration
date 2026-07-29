@@ -31,11 +31,17 @@ from scripts.pyrometer_force_modbus import (  # noqa: E402
     NEXT_STEP_COMMAND_TEMPLATE,
     POST_WRITE_ECHO_WINDOW_S,
     POST_WRITE_WAIT_S,
+    RESPONSE_ECHO_OF_SENT,
+    RESPONSE_ECHO_PLUS_EXTRA,
+    RESPONSE_NON_ECHO,
+    RESPONSE_NONE,
+    RESPONSE_PARTIAL_ECHO,
     VERDICT_DRY_RUN,
     VERDICT_PORT_ERROR,
     VERDICT_SAFETY_DENIED,
     VERDICT_WROTE_NO_RESPONSE,
     VERDICT_WROTE_WITH_RESPONSE,
+    classify_response,
     main,
     write_and_capture_echo,
     write_evidence_bundle,
@@ -392,6 +398,146 @@ class EchoCaptureTests(unittest.TestCase):
             rc_no_echo = main(["--i-am-doing-a-write"])
         self.assertEqual(rc_with_echo, 0)
         self.assertEqual(rc_no_echo, 0)
+
+
+# ---------------------------------------------------------------------------
+# Codex round-4: response_classification labels (observational, not causal)
+# ---------------------------------------------------------------------------
+
+class ClassifyResponsePureTests(unittest.TestCase):
+    """Pure-function tests for ``classify_response``.
+
+    The labels describe the SHAPE of what came back on the wire — no
+    causation, no interpretation. Downstream (SOP) does the interpreting.
+    """
+
+    SENT = bytes([0x02, 0x4D, 0x4D, 0x03])
+
+    def test_empty_received_is_no_response(self):
+        self.assertEqual(classify_response(self.SENT, b""), RESPONSE_NONE)
+
+    def test_exact_echo_is_echo_of_sent(self):
+        self.assertEqual(
+            classify_response(self.SENT, bytes([0x02, 0x4D, 0x4D, 0x03])),
+            RESPONSE_ECHO_OF_SENT,
+        )
+
+    def test_echo_plus_trailing_bytes_is_echo_plus_extra(self):
+        """Echo followed by extra bytes — could be echo + probe ACK or
+        echo + noise. Label is observational only."""
+        received = bytes([0x02, 0x4D, 0x4D, 0x03, 0x06])  # echo + ACK-shaped
+        self.assertEqual(
+            classify_response(self.SENT, received),
+            RESPONSE_ECHO_PLUS_EXTRA,
+        )
+
+    def test_partial_prefix_of_sent_is_partial_echo(self):
+        """Shorter response that matches a prefix of the sent bytes."""
+        self.assertEqual(
+            classify_response(self.SENT, bytes([0x02, 0x4D])),
+            RESPONSE_PARTIAL_ECHO,
+        )
+
+    def test_completely_different_bytes_is_non_echo(self):
+        """Real probe response for Report Version (BASF manual page 51)
+        would start with `02 95 ...` — a totally different shape."""
+        received = bytes([0x02, 0x95, 0x44, 0xE2, 0x5F, 0x50, 0x2B,
+                          0x10, 0x10, 0x16, 0x73, 0xFF, 0x03])
+        self.assertEqual(
+            classify_response(self.SENT, received),
+            RESPONSE_NON_ECHO,
+        )
+
+    def test_single_ack_byte_is_non_echo(self):
+        """ACK (0x06) is a shape mismatch, not a prefix of what we sent."""
+        self.assertEqual(
+            classify_response(self.SENT, bytes([0x06])),
+            RESPONSE_NON_ECHO,
+        )
+
+    def test_labels_are_observational_not_assertive(self):
+        """Guard against future edits that rename to causal labels
+        (e.g. `local_echo_detected`, `probe_ack_confirmed`). Codex
+        round-4: labels stay descriptive."""
+        assertive_forbidden = (
+            "local_echo_detected",
+            "probe_ack_confirmed",
+            "probe_response",
+            "success",
+        )
+        for label in (RESPONSE_NONE, RESPONSE_ECHO_OF_SENT,
+                      RESPONSE_ECHO_PLUS_EXTRA, RESPONSE_PARTIAL_ECHO,
+                      RESPONSE_NON_ECHO):
+            for forbidden in assertive_forbidden:
+                self.assertNotIn(
+                    forbidden, label,
+                    f"Label {label!r} contains assertive term "
+                    f"{forbidden!r} — Codex round-4 requires "
+                    "observational labels only.",
+                )
+
+
+class ResponseClassificationEvidenceBundleTests(unittest.TestCase):
+    """The evidence bundle MUST record the classification alongside the
+    raw hex so paste-back reviewers see both the observation and the
+    shape-label without having to re-parse the hex."""
+
+    def test_bundle_records_echo_of_sent_when_response_equals_sent(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                _fake_pyserial(echo_bytes=bytes([0x02, 0x4D, 0x4D, 0x03])), \
+                redirect_stdout(io.StringIO()):
+            main(["--i-am-doing-a-write", "--output-dir", tmp])
+            data = json.loads((Path(tmp) / "result.json").read_text())
+        self.assertEqual(data["response_classification"], RESPONSE_ECHO_OF_SENT)
+
+    def test_bundle_records_no_response_when_silent(self):
+        with tempfile.TemporaryDirectory() as tmp, _fake_pyserial(), \
+                redirect_stdout(io.StringIO()):
+            main(["--i-am-doing-a-write", "--output-dir", tmp])
+            data = json.loads((Path(tmp) / "result.json").read_text())
+        self.assertEqual(data["response_classification"], RESPONSE_NONE)
+
+    def test_bundle_records_echo_plus_extra(self):
+        """Received bytes start with sent bytes but contain more after."""
+        with tempfile.TemporaryDirectory() as tmp, \
+                _fake_pyserial(echo_bytes=bytes([0x02, 0x4D, 0x4D, 0x03, 0x06])), \
+                redirect_stdout(io.StringIO()):
+            main(["--i-am-doing-a-write", "--output-dir", tmp])
+            data = json.loads((Path(tmp) / "result.json").read_text())
+        self.assertEqual(
+            data["response_classification"], RESPONSE_ECHO_PLUS_EXTRA,
+        )
+
+    def test_bundle_records_non_echo_when_report_version_response_shape(self):
+        """If the probe were in Exactus mode and the write happened to
+        elicit a version-string-shaped response (hypothetically), the
+        classifier should call it non_echo — not conflate it with echo."""
+        version_shaped = bytes([
+            0x02, 0x95, 0x44, 0xE2, 0x5F, 0x50, 0x2B,
+            0x10, 0x10, 0x16, 0x73, 0xFF, 0x03,
+        ])
+        with tempfile.TemporaryDirectory() as tmp, \
+                _fake_pyserial(echo_bytes=version_shaped), \
+                redirect_stdout(io.StringIO()):
+            main(["--i-am-doing-a-write", "--output-dir", tmp])
+            data = json.loads((Path(tmp) / "result.json").read_text())
+        self.assertEqual(data["response_classification"], RESPONSE_NON_ECHO)
+
+    def test_bundle_omits_classification_on_dry_run(self):
+        """Dry-run never touches the port → classification is empty string."""
+        with tempfile.TemporaryDirectory() as tmp, _fake_pyserial(), \
+                redirect_stdout(io.StringIO()):
+            main(["--dry-run", "--output-dir", tmp])
+            data = json.loads((Path(tmp) / "result.json").read_text())
+        self.assertEqual(data["response_classification"], "")
+
+    def test_bundle_omits_classification_on_safety_denied(self):
+        """Safety-denied run writes the bundle but no write happened."""
+        with tempfile.TemporaryDirectory() as tmp, _fake_pyserial(), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            main(["--output-dir", tmp])
+            data = json.loads((Path(tmp) / "result.json").read_text())
+        self.assertEqual(data["response_classification"], "")
 
 
 # ---------------------------------------------------------------------------
