@@ -185,9 +185,10 @@ Pyrometer silent when TemperaSure closed?
   │    interprets the response. Runs BEFORE the state-changing force
   │    script to distinguish "probe alive in Exactus" (no force needed)
   │    from "line has echo" (force is unlikely to help) from true silence.
-  │    ├─ exactus_responsive → probe is alive in Exactus mode. No force
-  │    │  needed. Just switch mode via TemperaSure or the force script
-  │    │  if you want back to Modbus.
+  │    ├─ exactus_responsive → probe is alive AND currently in Exactus
+  │    │  mode. Strong evidence of a working probe. If you need Modbus
+  │    │  (which our GUI does), an expert-approved mode switch is still
+  │    │  the path back — force_modbus (4.4) OR power-cycle.
   │    ├─ echo_of_sent → serial line is echoing. Investigate cable /
   │    │  DIP-switch / terminal config before running force_modbus.
   │    ├─ query_no_response → true silence. Force is a candidate IF
@@ -317,7 +318,7 @@ Verdict states and next actions:
 
 | State | Meaning | Next action |
 |-------|---------|-------------|
-| `exactus_responsive` | Response starts with `02 95` (BASF Report Version reply). Probe is alive AND in Exactus mode. | If you need Modbus, run `pyrometer_force_modbus.py` (4.4) OR power-cycle. If Exactus streaming is fine, no action. |
+| `exactus_responsive` | Response starts with `02 95` (BASF Report Version reply). Probe is alive AND currently in Exactus mode. This is strong evidence of a working probe — it does NOT mean the mode-switch is unnecessary in general. | To prove the probe is alive: done, no further action needed. To get Modbus (which our GUI needs): an expert-approved mode switch is still the path back — run `pyrometer_force_modbus.py` (4.4) OR power-cycle (BASF's recommended recovery per manual page 53). To keep using Exactus (rare — we're moving away from that): no action. |
 | `echo_of_sent` | Response exactly matches the sent bytes (`02 56 56 03`). Consistent with USB-serial local echo (not proven — see `[[prolific-pl2303-local-echo]]`). | Investigate cable / DIP-switch / terminal config BEFORE running force. Force is unlikely to help if the line is echoing. |
 | `echo_plus_extra` | Response starts with sent bytes, followed by more. | Inspect raw hex; may be echo + ACK or echo + noise. |
 | `partial_echo` | Response is a proper prefix of the sent bytes. | Inspect raw hex; driver flush artifact or truncated echo. |
