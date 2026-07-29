@@ -48,14 +48,18 @@ New-Item -ItemType Directory -Path $evidence -Force
 Runnable from Mac dev env too — no lab hardware needed:
 
 ```powershell
-python scripts\test_vimba_camera.py               # VmbCamera + Read fallback
-python scripts\test_pyrometer_physical_debug.py   # pyrometer debug script
-python scripts\test_precheck_mistral_ads.py       # MISTRAL ADS precheck
-python scripts\test_audit_session_sensor_log.py   # sensor-log audit
+python scripts\test_vimba_camera.py                    # VmbCamera + Read fallback
+python scripts\test_pyrometer_physical_debug.py        # pyrometer debug script
+python scripts\test_pyrometer_worker.py                # pyrometer worker + has_valid_reading
+python scripts\test_pyrometer_downstream_consumers.py  # log_sensors / heartbeat / commit
+python scripts\test_pyrometer_modbus_discover.py       # baud × device_id discovery sweep
+python scripts\test_pyrometer_force_modbus.py          # expert-gated mode-switch write
+python scripts\test_precheck_mistral_ads.py            # MISTRAL ADS precheck
+python scripts\test_audit_session_sensor_log.py        # sensor-log audit
 ```
 
-All four should exit `0` with green summaries. Failures here mean
-something regressed in the pulled code — do NOT proceed until fixed.
+All should exit `0` with green summaries. Failures here mean something
+regressed in the pulled code — do NOT proceed until fixed.
 
 ---
 
@@ -149,36 +153,175 @@ consistent.
 
 ## 4. Pyrometer (Task #196) — BEFORE opening TemperaSure
 
-Critical: run this diagnostic **before** launching TemperaSure or any
-other pyrometer-facing tool. TemperaSure grabs COM4 exclusively and
-mode-switches can put the device in a state where this diagnostic
-would misread.
+Critical: TemperaSure grabs COM4 **exclusively**. None of the pyrometer
+scripts below can share the port with it. The rule is:
+
+> **TemperaSure MUST be CLOSED while these scripts run.** Keep
+> TemperaSure available to open BEFORE (verify probe is alive) and
+> AFTER (re-verify probe is still alive), but never concurrently. The
+> two apps cannot own COM4 at the same time.
+
+### 4.0 Decision flowchart
+
+```
+Pyrometer silent when TemperaSure closed?
+  │
+  ├─ Run pyrometer_physical_debug.py first (READ-ONLY diagnostic)
+  │    ├─ Verdict = exactus_streaming / modbus_responsive → use the
+  │    │  matching driver in the GUI. STOP.
+  │    └─ Verdict = silent / transmitting_unknown / port_down → continue.
+  │
+  ├─ Run pyrometer_modbus_discover.py (READ-ONLY, broader sweep)
+  │    ├─ identity_found_at_default → device is fine at (115200, 1).
+  │    │  ModbusPyrometer will read it. STOP.
+  │    ├─ identity_found_at_non_default → device is at unexpected
+  │    │  (baud, device_id). Reconfigure driver OR use TemperaSure to
+  │    │  reconfigure device back to default. STOP (do NOT force).
+  │    └─ silent_all_combos → device isn't answering Modbus at any
+  │       combo. If TemperaSure just confirmed the probe is alive,
+  │       continue to force-Modbus experiment. Otherwise physical
+  │       inspection / power-cycle.
+  │
+  └─ Run pyrometer_force_modbus.py (EXPERIMENTAL WRITE, expert-gated)
+       ├─ Requires --i-am-doing-a-write (safety gate; --dry-run
+       │  previews the bytes without touching the port)
+       ├─ Re-run pyrometer_modbus_discover.py to confirm the switch
+       │  worked. wrote_with_response from force_modbus is NOT success
+       │  by itself — see Section 4.3 "Interpreting the verdict."
+       └─ If still silent after force-Modbus: fall back to Path A
+          (physical power-cycle the probe, needs Jiangang's OK). Do
+          NOT loop force-Modbus retries.
+```
+
+### 4.1 `pyrometer_physical_debug.py` (READ-ONLY, always safe)
 
 ```powershell
-python scripts\pyrometer_physical_debug.py --output-dir $evidence\pyrometer
+python scripts\pyrometer_physical_debug.py --output-dir $evidence\pyrometer_debug
 ```
 
 Or with a longer Exactus listen if the device is expected to be
 streaming slowly:
 
 ```powershell
-python scripts\pyrometer_physical_debug.py --exactus-listen-s 10 --output-dir $evidence\pyrometer
+python scripts\pyrometer_physical_debug.py --exactus-listen-s 10 `
+    --output-dir $evidence\pyrometer_debug
 ```
 
 Verdict states and next actions:
 
 | State | Next action |
 |-------|-------------|
-| `exactus_streaming` | Use `ExactusSerialPyrometer` in the GUI |
-| `modbus_responsive` | Use `ModbusPyrometer` in the GUI |
-| `both_active_unexpected` | Either driver works; report to group |
-| `transmitting_unknown` | Capture raw bytes; wrong baud or unknown protocol |
-| `silent` | Physical inspection per verdict hint (power / cable / IFD-5) |
-| `port_down` | Check Device Manager COM assignment + hoggers in Phase 0 output |
+| `exactus_streaming` | Use `ExactusSerialPyrometer` in the GUI. Done. |
+| `modbus_responsive` | Use `ModbusPyrometer` in the GUI. Done. |
+| `both_active_unexpected` | Either driver works; report to group. |
+| `transmitting_unknown` | Continue to 4.2 (discover) — different baud may match. |
+| `silent` | Continue to 4.2 (discover) — device may be at non-default (baud, id). |
+| `port_down` | Check Device Manager COM assignment + hoggers in Phase 0 output. |
 
-Do NOT run any write-capable pyrometer scripts (mode switches, reboots,
-rate changes) without explicit sign-off — get Jiangang confirmation
-first if hardware state needs changing.
+### 4.2 `pyrometer_modbus_discover.py` (READ-ONLY, broader sweep)
+
+Broadens `pyrometer_physical_debug`'s search: 5 baud rates × 11 device
+IDs (default) instead of 3 bauds × 1 device_id. Opens the port ONCE per
+baud (inner device-ID loop shares the same client), so the full 55-combo
+sweep takes ~500 ms of port overhead instead of ~11 s.
+
+**Data-only reads**: touches REG_VER / REG_NAME0 / REG_SN0 / REG_CH1_TEMP
+only. Never reads config registers (address, baud, rate, cmd), never
+writes anything. Broadcast address 0 is intentionally excluded (Modbus
+spec §4.1.1 — write-only convention).
+
+```powershell
+python scripts\pyrometer_modbus_discover.py --output-dir $evidence\pyrometer_discover
+```
+
+After a probe power-cycle (BASF manual p. 51 documents 5-10 s self-init),
+give the device time to boot with a **one-shot** wait — this is NOT
+per-combo, just the initial pre-sweep pause:
+
+```powershell
+python scripts\pyrometer_modbus_discover.py --initial-wait-s 8 `
+    --output-dir $evidence\pyrometer_discover
+```
+
+For debugging multiple devices on the bus, walk the full matrix
+instead of early-stopping on the first hit per baud:
+
+```powershell
+python scripts\pyrometer_modbus_discover.py --exhaustive `
+    --output-dir $evidence\pyrometer_discover
+```
+
+Verdict states and next actions:
+
+| State | Next action |
+|-------|-------------|
+| `identity_found_at_default` | Device is at (115200, 1) — the driver default. `ModbusPyrometer` will read it. Done. |
+| `identity_found_at_non_default` | Device answered at a non-default (baud, id). **This script does NOT reconfigure** — either update `ModbusPyrometer` construction to match OR use TemperaSure to reconfigure the device back. |
+| `silent_all_combos` | Device isn't answering Modbus at any combo. If TemperaSure confirms the probe is alive, force-Modbus experiment (4.3) is a candidate. Otherwise physical inspection. |
+| `pymodbus_missing` | Install `pymodbus`: `pip install pymodbus pyserial`. Env issue, not a device issue. |
+
+### 4.3 `pyrometer_force_modbus.py` (EXPERIMENTAL WRITE, expert-gated)
+
+**Read Section 4.0 flowchart before considering this script.** This is
+the ONLY write-capable pyrometer script in the repo. It sends Jacques's
+candidate Exactus→Modbus command `02 4D 4D 03` (STX + "MM" + ETX, from
+`JacquesPyrometerTesting.ipynb`). The command is NOT independently
+confirmed by any BASF manual page we've read — treat as
+candidate-experimental.
+
+**Pre-flight**:
+
+1. Run `pyrometer_modbus_discover.py` first (Section 4.2). Only proceed
+   if it returned `silent_all_combos`.
+2. TemperaSure MUST be **closed**. Open TemperaSure briefly BEFORE
+   running this script to confirm the probe is alive → close TemperaSure
+   → run force_modbus → close force_modbus → optionally reopen
+   TemperaSure to confirm the probe is still alive.
+3. Have Path A fallback authorization from Jiangang before starting
+   (in case force-Modbus doesn't work and physical power-cycle is
+   needed).
+
+**Preview the bytes without touching the port** (always safe, works
+without pyserial):
+
+```powershell
+python scripts\pyrometer_force_modbus.py --dry-run
+```
+
+**Actual write** (requires the explicit ack flag):
+
+```powershell
+python scripts\pyrometer_force_modbus.py --i-am-doing-a-write `
+    --output-dir $evidence\pyrometer_force_modbus
+```
+
+Add `--verify` to print the next-step command (the discover invocation)
+after the run — the script does NOT auto-invoke it:
+
+```powershell
+python scripts\pyrometer_force_modbus.py --i-am-doing-a-write --verify `
+    --output-dir $evidence\pyrometer_force_modbus
+```
+
+**Interpreting the verdict** — repeat this to yourself before acting:
+
+| State | Meaning | Success? |
+|-------|---------|----------|
+| `dry_run` | Preview only, nothing sent | N/A |
+| `wrote_no_response` | Write completed, no bytes echoed. Neutral outcome — matches BASF's "no response expected" documentation. | **Unknown**. Verify via 4.2. |
+| `wrote_with_response` | Write completed, some bytes came back. | **NOT SUCCESS.** Jacques's notebook observed echo-like bytes; could equally be Prolific PL2303 local echo. Verify via 4.2. |
+| `port_error` | Serial open or write raised. | Failure. Check TemperaSure isn't running, cable is seated, port matches Device Manager. |
+| `safety_denied` | Neither `--i-am-doing-a-write` nor `--dry-run` was set. Nothing sent. | N/A |
+
+**Success is proven ONLY by re-running `pyrometer_modbus_discover.py`
+and getting `identity_found_at_default`.** Never treat any verdict from
+this script — including `wrote_with_response` — as evidence the mode
+switch worked.
+
+If verification returns `silent_all_combos` again, **do NOT retry the
+force write in a loop**. Fall back to Path A (physical power-cycle,
+requires Jiangang's OK). Record the outcome in the day's memory update
+so the next session inherits the finding.
 
 ---
 
