@@ -1061,9 +1061,13 @@ class GrowthApp(QMainWindow):
         # an unchanged setpoint, so only fire when the change exceeds the
         # configured tolerance. Ignore None readings (transient OCR failures).
         elapsed = self.monitor.get_elapsed_seconds()
+        # Set-change events happen at arbitrary moments — including during
+        # the post-connect / failed-batch pyrometer window. `has_valid_reading`
+        # ensures we don't leak 0.0/stale readings into set_change_events.csv
+        # when the operator changes V-set or I-set at that moment.
         pyro_temp = (
             self.monitor._latest_pyro.temperature
-            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.has_valid_reading
             else None
         )
 
