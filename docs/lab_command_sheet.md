@@ -53,6 +53,7 @@ python scripts\test_pyrometer_physical_debug.py        # pyrometer debug script
 python scripts\test_pyrometer_worker.py                # pyrometer worker + has_valid_reading
 python scripts\test_pyrometer_downstream_consumers.py  # log_sensors / heartbeat / commit
 python scripts\test_pyrometer_modbus_discover.py       # baud × device_id discovery sweep
+python scripts\test_pyrometer_active_exactus_query.py  # Report Version query (non-state-changing)
 python scripts\test_pyrometer_force_modbus.py          # expert-gated mode-switch write
 python scripts\test_precheck_mistral_ads.py            # MISTRAL ADS precheck
 python scripts\test_audit_session_sensor_log.py        # sensor-log audit
@@ -177,20 +178,35 @@ Pyrometer silent when TemperaSure closed?
   │    ├─ identity_found_at_non_default → device is at unexpected
   │    │  (baud, device_id). Reconfigure driver OR use TemperaSure to
   │    │  reconfigure device back to default. STOP (do NOT force).
-  │    └─ silent_all_combos → device isn't answering Modbus at any
-  │       combo. If TemperaSure just confirmed the probe is alive,
-  │       continue to force-Modbus experiment. Otherwise physical
-  │       inspection / power-cycle.
+  │    └─ silent_all_combos → continue to active Exactus query below.
   │
-  └─ Run pyrometer_force_modbus.py (EXPERIMENTAL WRITE, expert-gated)
+  ├─ Run pyrometer_active_exactus_query.py (non-state-changing WRITE)
+  │    Sends the BASF-documented Report Version query (`02 56 56 03`);
+  │    interprets the response. Runs BEFORE the state-changing force
+  │    script to distinguish "probe alive in Exactus" (no force needed)
+  │    from "line has echo" (force is unlikely to help) from true silence.
+  │    ├─ exactus_responsive → probe is alive in Exactus mode. No force
+  │    │  needed. Just switch mode via TemperaSure or the force script
+  │    │  if you want back to Modbus.
+  │    ├─ echo_of_sent → serial line is echoing. Investigate cable /
+  │    │  DIP-switch / terminal config before running force_modbus.
+  │    ├─ query_no_response → true silence. Force is a candidate IF
+  │    │  TemperaSure confirms the probe is alive; otherwise physical
+  │    │  inspection first.
+  │    └─ non_echo_response / echo_plus_extra / partial_echo → inspect
+  │       raw hex; don't guess. See Section 4.3 verdict table.
+  │
+  └─ Run pyrometer_force_modbus.py (state-changing WRITE, expert-gated)
        ├─ Requires --i-am-doing-a-write (safety gate; --dry-run
        │  previews the bytes without touching the port)
        ├─ Re-run pyrometer_modbus_discover.py to confirm the switch
-       │  worked. wrote_with_response from force_modbus is NOT success
-       │  by itself — see Section 4.3 "Interpreting the verdict."
+       │  worked. The verdict `wrote_with_response` (plus its
+       │  `response_classification` in the evidence bundle) is NEVER
+       │  success by itself — see Section 4.4 "Interpreting the verdict."
        └─ If still silent after force-Modbus: fall back to Path A
-          (physical power-cycle the probe, needs Jiangang's OK). Do
-          NOT loop force-Modbus retries.
+          (physical power-cycle the probe — BASF's own recommended
+          recovery per manual page 53; needs Jiangang's OK). Do NOT
+          loop force-Modbus retries.
 ```
 
 ### 4.1 `pyrometer_physical_debug.py` (READ-ONLY, always safe)
@@ -260,7 +276,67 @@ Verdict states and next actions:
 | `silent_all_combos` | Device isn't answering Modbus at any combo. If TemperaSure confirms the probe is alive, force-Modbus experiment (4.3) is a candidate. Otherwise physical inspection. |
 | `pymodbus_missing` | Install `pymodbus`: `pip install pymodbus pyserial`. Env issue, not a device issue. |
 
-### 4.3 `pyrometer_force_modbus.py` (state-changing WRITE, expert-gated)
+### 4.3 `pyrometer_active_exactus_query.py` (non-state-changing WRITE)
+
+Sits between the READ-ONLY sweep (4.2) and the state-changing force
+script (4.4). Sends the BASF-documented Report Version query
+(`02 56 56 03`, manual page 51) and interprets the response. **Does
+NOT change probe state** — Report Version is a query, not a control
+command. Because it puts bytes on the wire, though, it is not
+read-only; the docstring's phrasing is "non-state-changing, not
+read-only."
+
+Trust contract enforcement: an `ALLOWED_QUERIES` whitelist inside the
+script rejects any payload other than `REPORT_VERSION_BYTES` before
+opening the port. Adding a new query to the whitelist requires a
+manual-page citation, a docstring update, and updating the
+`test_only_report_version_is_allowed` assertion — same discipline as
+`pyrometer_physical_debug.py`'s READ-ONLY invariant.
+
+**Preview the bytes** (safe, opens no port):
+
+```powershell
+python scripts\pyrometer_active_exactus_query.py --dry-run
+```
+
+**Actual query** (no safety gate — non-state-changing):
+
+```powershell
+python scripts\pyrometer_active_exactus_query.py `
+    --output-dir $evidence\pyrometer_active_query
+```
+
+Extend the response window if the probe is slow to answer:
+
+```powershell
+python scripts\pyrometer_active_exactus_query.py --response-window-s 3.0 `
+    --output-dir $evidence\pyrometer_active_query
+```
+
+Verdict states and next actions:
+
+| State | Meaning | Next action |
+|-------|---------|-------------|
+| `exactus_responsive` | Response starts with `02 95` (BASF Report Version reply). Probe is alive AND in Exactus mode. | If you need Modbus, run `pyrometer_force_modbus.py` (4.4) OR power-cycle. If Exactus streaming is fine, no action. |
+| `echo_of_sent` | Response exactly matches the sent bytes (`02 56 56 03`). Consistent with USB-serial local echo (not proven — see `[[prolific-pl2303-local-echo]]`). | Investigate cable / DIP-switch / terminal config BEFORE running force. Force is unlikely to help if the line is echoing. |
+| `echo_plus_extra` | Response starts with sent bytes, followed by more. | Inspect raw hex; may be echo + ACK or echo + noise. |
+| `partial_echo` | Response is a proper prefix of the sent bytes. | Inspect raw hex; driver flush artifact or truncated echo. |
+| `non_echo_response` | Response bytes differ from what we sent AND don't start with `02 95`. | Inspect raw hex; could be NAK (`0x15` per manual page 51), noise, or unexpected framing. |
+| `query_no_response` | 0 bytes received. True active silence (we sent a query and heard nothing back). | If TemperaSure confirms probe is alive → `force_modbus` (4.4) is a candidate. Otherwise physical inspection. |
+| `port_error` | Serial open or write raised. | Check TemperaSure isn't running, cable is seated, port matches Device Manager. |
+| `dry_run` | Preview only. Nothing sent. | N/A |
+
+`version_info` sub-field (evidence bundle only, present iff verdict is
+`exactus_responsive`):
+
+- `shape` — one of `complete` (13 bytes, matches BASF spec), `truncated`
+  (starts with `02 95` but shorter), or `extra_bytes` (starts with
+  `02 95` but longer). Documents the length mismatch without failing.
+- `version_byte` — the single byte after `02 95` (e.g. `0x44` in BASF's
+  example)
+- `prom_hex` — the 9-byte PROM code (factory-use identifier)
+
+### 4.4 `pyrometer_force_modbus.py` (state-changing WRITE, expert-gated)
 
 **Read Section 4.0 flowchart before considering this script.** This is
 the ONLY state-changing pyrometer script in the repo. It sends the BASF-
