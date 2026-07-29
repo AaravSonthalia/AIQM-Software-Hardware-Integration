@@ -58,6 +58,87 @@ def status(label: str, ok: bool, detail: str = "") -> None:
     print(line)
 
 
+def info(label: str, detail: str = "") -> None:
+    """Neutral status line — neither pass nor fail. Used when a check
+    intentionally reports its result without contributing to the verdict
+    (e.g. the dark-frame stats check under --allow-dark-frame)."""
+    line = f"  [INFO] {label}"
+    if detail:
+        line += f" — {detail}"
+    print(line)
+
+
+# ---------------------------------------------------------------------------
+# Pure-function stats evaluation (extracted so tests can exercise it
+# without instantiating the whole VmbCamera pipeline)
+# ---------------------------------------------------------------------------
+
+# The mean/std thresholds that define a "sensible" frame — i.e. a frame
+# with a real RHEED signal on it. Constants at module scope so tests
+# can reference them without duplication.
+STATS_MEAN_MIN: float = 0.5
+STATS_MEAN_MAX: float = 250.0
+STATS_STD_MIN: float = 0.5
+
+
+def evaluate_frame_stats(frame, allow_dark_frame: bool) -> dict:
+    """Compute frame stats and decide how to render + score them.
+
+    Returns:
+      {
+        "mean": float, "std": float, "min": int, "max": int,
+        "heuristic_ok": bool,      # True iff the mean/std thresholds pass
+        "tag": str,                # "PASS" | "FAIL" | "INFO"
+        "contributes_pass": bool,  # gates the final verdict
+        "detail": str,             # human-readable one-liner
+      }
+
+    Under the default (``allow_dark_frame=False``):
+      * heuristic pass → tag=PASS, contributes_pass=True
+      * heuristic fail → tag=FAIL, contributes_pass=False (blocks verdict)
+
+    Under ``--allow-dark-frame`` (``allow_dark_frame=True``):
+      * heuristic pass → tag=PASS, contributes_pass=True (unchanged)
+      * heuristic fail → tag=INFO, contributes_pass=True — the check still
+        RUNS and its numbers are reported, but a dark frame no longer
+        blocks the verdict. Useful for beam-off code-path validation
+        where the RHEED gun is intentionally off (Jul 28 lab pattern).
+
+    Note: the flag never REMOVES the stats check; it only reclassifies a
+    failing result as informational. A grower's session with the beam on
+    that mysteriously produces a dark frame will still be visible in the
+    output as an INFO line so it's not silently hidden.
+    """
+    import numpy as np  # local import so this helper stays testable without
+                        # forcing numpy import at module top (already imported
+                        # above; local re-import is a no-op).
+    mean = float(np.mean(frame))
+    std = float(np.std(frame))
+    minv = int(np.min(frame))
+    maxv = int(np.max(frame))
+    heuristic_ok = (
+        STATS_MEAN_MIN < mean < STATS_MEAN_MAX and std > STATS_STD_MIN
+    )
+    detail = f"mean={mean:.1f}, std={std:.1f}, range=[{minv}, {maxv}]"
+    if heuristic_ok:
+        tag = "PASS"
+        contributes = True
+    elif allow_dark_frame:
+        tag = "INFO"
+        contributes = True
+        detail += " (dark frame accepted per --allow-dark-frame)"
+    else:
+        tag = "FAIL"
+        contributes = False
+    return {
+        "mean": mean, "std": std, "min": minv, "max": maxv,
+        "heuristic_ok": heuristic_ok,
+        "tag": tag,
+        "contributes_pass": contributes,
+        "detail": detail,
+    }
+
+
 def verdict(ready: bool, hint: str = "") -> int:
     print()
     if ready:
@@ -84,6 +165,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "Requested AccessMode: 'auto' (Full first, Read fallback), "
             "'full' (exclusive), or 'read' (passive, requires camera "
             "multicast — Task #187). Default: auto."
+        ),
+    )
+    parser.add_argument(
+        "--allow-dark-frame",
+        action="store_true",
+        help=(
+            "Treat a dark frame (mean < 0.5 or std < 0.5) as [INFO] "
+            "rather than [FAIL]. The stats check still runs and its "
+            "numbers are still printed, but a dark frame no longer "
+            "blocks the verdict. Use for beam-off code-path validation "
+            "(the RHEED gun is intentionally off) — the default is the "
+            "grow-time heuristic which correctly flags 'no signal'."
         ),
     )
     return parser.parse_args(argv)
@@ -184,18 +277,17 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # --- 4. Frame stats sensible (mean, std, range) ---
-    mean = float(np.mean(frame))
-    std = float(np.std(frame))
-    minv = int(np.min(frame))
-    maxv = int(np.max(frame))
-    # Sensible band: not saturated black (mean=0), not saturated white
-    # (mean=255), and has actual variation (std > 0).
-    stats_ok = 0.5 < mean < 250 and std > 0.5
-    status(
-        "Frame stats sensible",
-        stats_ok,
-        f"mean={mean:.1f}, std={std:.1f}, range=[{minv}, {maxv}]",
-    )
+    # evaluate_frame_stats owns the rendering + verdict-contribution
+    # decision so --allow-dark-frame can reclassify a dark-frame FAIL
+    # into a non-blocking INFO. See its docstring for the full semantics.
+    stats = evaluate_frame_stats(frame, allow_dark_frame=args.allow_dark_frame)
+    if stats["tag"] == "PASS":
+        status("Frame stats sensible", True, stats["detail"])
+    elif stats["tag"] == "INFO":
+        info("Frame stats sensible", stats["detail"])
+    else:  # FAIL
+        status("Frame stats sensible", False, stats["detail"])
+    stats_ok = stats["contributes_pass"]
 
     # --- 5. BGW palette LUT applied ---
     # The driver defaults to apply_palette=True, mapping raw uint8
