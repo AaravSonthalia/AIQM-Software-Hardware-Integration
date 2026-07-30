@@ -193,7 +193,7 @@ python gui.py
 
 ## MBE Hardware Control
 - **Scienta Omicron MISTRAL** controls all MBE hardware (pumps, valves, heaters, manipulators) via touch-screen panels. GUI-based, no serial API. Not needed for v2.
-- **Eurotherm Temperature Controller** (likely model 3508) — controls substrate heater. Speaks **Modbus TCP on port 502**. IP likely on instrument subnet (`10.0.42.x` or `10.120.40.170`). Python driver already exists at `/Users/aj/test-claude/projects/research-lab/src/control/temp_pid.py`. Key registers: PV temp (reg 1, /10), setpoint (reg 2), current SP (reg 5), output power rate (reg 36). Safety limits 20-930°C. **This is how we get V/I and heater temp into the Growth Monitor — over Ethernet, no port conflicts.**
+- **Eurotherm Temperature Controller** (likely model 3508) — controls substrate heater. Speaks **Modbus TCP on port 502**. IP likely on instrument subnet (`10.0.42.x` or `10.120.40.170`). Python driver lives in-repo at `drivers/temp_pid.py` (extracted from the retired research-lab repo). Key registers: PV temp (reg 1, /10), setpoint (reg 2), current SP (reg 5), output power rate (reg 36). Safety limits 20-930°C. **This is how we get V/I and heater temp into the Growth Monitor — over Ethernet, no port conflicts.**
 - **OWON PSU** is our controllable heater bypass for AI-Scientist mode (v4). Deprioritized per PI.
 - CPU inference benchmarked at **13ms/frame** — no GPU/cluster needed.
 - **Note:** Eurotherm is now owned by Watlow (acquisition completed Oct 2022). kSA 400's support for both "Eurotherm" and "Watlow" covers the same product line.
