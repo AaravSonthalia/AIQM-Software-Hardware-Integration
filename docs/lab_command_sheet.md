@@ -179,6 +179,10 @@ consistent.
 
 ### Validated O-MBE transport settings
 
+```
+COM4, 115200 8N1, Modbus ID 1, RTS=False; DTR unimportant on this path.
+```
+
 | Setting | Value |
 |---------|-------|
 | Port | COM4 (Prolific PL2303GS, `VID:PID=067B:23A3`) |
@@ -214,12 +218,15 @@ measured through the RTS loopback.
 
 The hypothesis survived a full day of work because it explained every
 observation available at the time. Nothing below this line was needed
-to fix the actual fault. The diagnostic ladder in 4.0–4.4 is retained
-because the scripts remain useful for a genuinely unresponsive probe —
-but **check RTS before running any of it**.
+to fix the actual fault.
 
-`pyrometer_force_modbus.py` (4.4) was never run and is not required.
-There was no mode to switch.
+**The Exactus-mode recovery ladder in 4.0–4.4 is OBSOLETE for this
+setup.** It is retained only as a separate escalation path for a
+genuinely nonresponsive system — one that stays silent *after* RTS has
+been confirmed de-asserted. Do not enter it before checking RTS.
+
+`pyrometer_force_modbus.py` (4.4) was never run and is not required
+here. There was no mode to switch.
 
 ---
 
