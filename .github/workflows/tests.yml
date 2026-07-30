@@ -23,11 +23,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          # No cache: pip — that flag needs a requirements.txt or
-          # pyproject.toml in the repo to compute a cache key from,
-          # and we have neither (deps installed inline below). Cache
-          # miss on every run adds ~30s to pip install; acceptable
-          # for a 5-dep list. Revisit if we add requirements.txt.
+          cache: pip
+          # Cache key comes from requirements.txt (added 2026-07-29).
 
       - name: Install Linux Qt runtime deps
         # PyQt6 offscreen platform needs libxkbcommon + libEGL on
@@ -44,12 +41,7 @@ jobs:
           python -m pip install --upgrade pip
           # Pin nothing yet — repo tolerates drift across minor
           # versions. Add == pins if a break happens.
-          pip install \
-            PyQt6 \
-            numpy \
-            matplotlib \
-            scikit-learn \
-            Pillow
+          pip install -r requirements.txt
 
       - name: Run headless unittest suite
         env:
@@ -75,7 +67,9 @@ jobs:
         run: |
           set +e
           failed=""
-          for f in scripts/test_*.py; do
+          # Pytest suites moved from scripts/ to tests/ (2026-07-29);
+          # scripts/ keeps hardware probes, which never run in CI.
+          for f in tests/test_*.py; do
             name=$(basename "$f")
             if echo " $SKIP_TESTS " | grep -q " $name "; then
               echo "SKIP $name (hardware-dependent)"
