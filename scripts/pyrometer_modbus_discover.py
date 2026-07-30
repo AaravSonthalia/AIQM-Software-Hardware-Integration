@@ -303,6 +303,7 @@ def sweep_modbus(
     device_ids: tuple[int, ...],
     per_combo_timeout_s: float,
     exhaustive: bool,
+    rts: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """Sweep (baud, device_id) matrix issuing REG_VER read to each combo.
 
@@ -343,7 +344,24 @@ def sweep_modbus(
             port=port, baudrate=baud, timeout=per_combo_timeout_s,
             bytesize=8, parity="N", stopbits=1,
         )
-        if not client.connect():
+        opened = client.connect()
+        if opened:
+            # RTS must be set after the port is open and before any
+            # traffic. pyserial leaves it asserted, which on Bulbasaur's
+            # IFD-5 + PL2303GS path loops the link back: every probe
+            # returns its own request and the sweep records a miss. That
+            # is what produced silent_all_combos across 55 combinations
+            # on Jul 28 and Jul 30 2026 — a cable state, not a device.
+            sock = getattr(client, "socket", None)
+            if sock is None:
+                info(f"Baud {baud}: no serial object on client; RTS not set")
+            else:
+                try:
+                    sock.rts = rts
+                    info(f"Baud {baud}: RTS set to {rts}")
+                except Exception as exc:  # noqa: BLE001 — driver-dependent
+                    info(f"Baud {baud}: could not set RTS ({exc})")
+        if not opened:
             # Client wouldn't even connect — record one miss for the whole
             # baud (not per device_id — the failure is baud-level).
             misses.append({
@@ -563,6 +581,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             "multiple devices share the bus."
         ),
     )
+    parser.add_argument(
+        "--rts", action=argparse.BooleanOptionalAction, default=False,
+        help=(
+            "RTS line state, applied after the port opens and before any "
+            "traffic (default: --no-rts). pyserial asserts RTS by default; "
+            "on Bulbasaur's IFD-5 + PL2303GS path that loops the link back "
+            "so every combo records a miss. Use --rts only to reproduce "
+            "the old broken behaviour or on a chamber whose cabling is "
+            "known to need it."
+        ),
+    )
     args = parser.parse_args(argv)
 
     bauds = args.bauds if args.bauds is not None else CANDIDATE_BAUDS
@@ -592,6 +621,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"Initial wait:       {args.initial_wait_s}s "
           f"({'post-power-cycle' if args.initial_wait_s > 0 else 'none'})")
     print(f"Exhaustive:         {args.exhaustive}")
+    print(f"RTS:                {args.rts}"
+          f"{'  ← asserted; expect loopback on the O-MBE path' if args.rts else ''}")
     print("Safety:             Modbus function 0x03 only; data registers only "
           "(REG_VER/NAME/SN/CH1_TEMP); no config regs; no writes")
 
@@ -652,7 +683,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     hits, misses = sweep_modbus(
         args.port, bauds, device_ids,
-        args.per_combo_timeout_s, args.exhaustive,
+        args.per_combo_timeout_s, args.exhaustive, args.rts,
     )
     print()
     info(f"{len(hits)} hit(s), {len(misses)} miss(es)")

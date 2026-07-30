@@ -124,6 +124,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Force word-swap for float32 (try if temps come out implausible)",
     )
+    p.add_argument(
+        "--rts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "RTS line state, applied after the port opens (default: "
+            "--no-rts). pyserial asserts RTS by default; on Bulbasaur's "
+            "IFD-5 + PL2303GS path that loops the link back and every read "
+            "fails. That is why this script's CSV had a header and no rows."
+        ),
+    )
     args = p.parse_args(argv)
 
     client = ModbusSerialClient(
@@ -141,6 +152,17 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    # Set RTS after open, before any traffic. See the --rts help text.
+    sock = getattr(client, "socket", None)
+    if sock is None:
+        print("WARNING: no serial object on client; RTS not set.", file=sys.stderr)
+    else:
+        try:
+            sock.rts = args.rts
+            print(f"RTS set to {args.rts}")
+        except Exception as exc:  # noqa: BLE001 — driver-dependent
+            print(f"WARNING: could not set RTS ({exc}).", file=sys.stderr)
 
     print(
         f"Connected {args.port} @ {args.baud} (8N1, slave={args.id}); "

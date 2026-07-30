@@ -317,6 +317,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Seconds to keep reading after each request (default 1.0)",
     )
     parser.add_argument(
+        "--rts", action=argparse.BooleanOptionalAction, default=False,
+        help=(
+            "RTS line state, applied after the port opens and before any "
+            "traffic (default: --no-rts). Measured on Bulbasaur COM4 "
+            "Jul 30 2026: --rts returns the request verbatim (loopback), "
+            "--no-rts returns the probe's reply. Pass --rts to reproduce "
+            "the loopback deliberately."
+        ),
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Print the frames that would be sent; opens no port",
     )
@@ -345,6 +355,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"Device ID:         {args.device_id}")
     print(f"Function:          0x03 Read Holding Registers (read-only)")
     print(f"Registers:         {', '.join(names)}")
+    print(f"RTS:               {args.rts}"
+          f"{'  ← asserted; expect loopback on the O-MBE path' if args.rts else ''}")
     print(f"Response window:   {args.response_window_s}s")
     print(f"Mode:              {'DRY-RUN' if args.dry_run else 'ACTIVE READ'}")
     print()
@@ -357,6 +369,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "device_id": args.device_id,
             "registers": names,
             "response_window_s": args.response_window_s,
+            "rts": args.rts,
             "dry_run": args.dry_run,
             "output_dir": str(args.output_dir) if args.output_dir else None,
         },
@@ -399,6 +412,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.port, args.baud, bytesize=8, parity="N", stopbits=1,
                 timeout=0.1,
             ) as ser:
+                # Set RTS before any traffic. pyserial asserts it by
+                # default; on the O-MBE path that means the link loops
+                # back and nothing reaches the probe.
+                ser.rts = args.rts
+                info(f"RTS set to {args.rts}")
                 for name in names:
                     r = probe_register(ser, name, args.device_id, args.response_window_s)
                     probes.append(r)

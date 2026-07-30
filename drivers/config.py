@@ -70,6 +70,23 @@ class MBESystemConfig:
     pyrometer_port: str = "COM4"
     pyrometer_baudrate: int = 115200
     pyrometer_device_id: int = 1
+    # RTS line state applied immediately after the port opens.
+    #
+    # This is a property of the CABLING AND ADAPTER, not of the probe, so
+    # it belongs per chamber rather than as a driver default. On Bulbasaur
+    # (O-MBE: IFD-5 in RS232 position + Prolific PL2303GS) an asserted RTS
+    # — pyserial's default — puts the link into loopback, returning every
+    # request byte-for-byte while the probe never sees it. Measured on
+    # COM4, Jul 30 2026:
+    #
+    #   RTS=True  -> 01 03 13 00 00 01 80 8E  (the request, echoed)
+    #   RTS=False -> 01 03 02 09 03 FE 15     (version 9.3, CRC valid)
+    #
+    # DTR had no effect on either outcome and is deliberately not
+    # configured here. Ch-MBE's cabling is UNCHARACTERISED — its value
+    # below is inherited from O-MBE as a starting point and must be
+    # verified against that probe before it is trusted.
+    pyrometer_rts: bool = False
 
     # Data storage paths
     single_images_folder: str = ""
@@ -115,6 +132,11 @@ OXIDE_MBE = MBESystemConfig(
     ],
     temperasure_title="BASF TemperaSure 5.7.0.4 Advanced Mode",
     temperasure_exe=r"C:\Users\Lab10\Desktop\TemperaSure.exe",
+    # VERIFIED on hardware Jul 30 2026 — probe EXI4765 answered
+    # REG_VER 0x1300 with version 9.3, matching TemperaSure's reported
+    # FW 9.3.0.6, and REG_CH1_TEMP with 201.41 C against TemperaSure's
+    # 201.5. First direct read of this probe.
+    pyrometer_rts=False,
     single_images_folder=(
         r"C:\Users\Lab10\Desktop\Automated RHEED Image Acquisition"
         r"\Acquiring Images Via Python Script Tests\Single Images"
@@ -156,6 +178,11 @@ CHALCOGENIDE_MBE = MBESystemConfig(
     ],
     temperasure_title="BASF TemperaSure 5.7.0.4",
     temperasure_exe=r"C:\Users\Omicron\Desktop\TemperaSure.exe",
+    # UNVERIFIED — inherited from O-MBE, never tested on this chamber's
+    # cabling. Ch-MBE may use a different adapter or interface module. If
+    # its pyrometer reads return the request verbatim, try True here
+    # before suspecting the probe.
+    pyrometer_rts=False,
     single_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     stream_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     # ADS: 7 cells on Ch-MBE (Task #191 validated Jul 22 2026).
