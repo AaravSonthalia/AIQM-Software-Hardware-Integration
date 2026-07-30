@@ -86,13 +86,20 @@ class ModbusPyrometer(TemperatureSensor):
         parity: str = "N",
         stopbits: int = 1,
         bytesize: int = 8,
-        rts: bool = False,
+        rts: Optional[bool] = None,
     ):
-        """``rts=False`` is load-bearing — see ``connect``.
+        """``rts`` controls the RTS line — see ``connect``.
 
-        pyserial defaults RTS to asserted. On Bulbasaur's IFD-5 + Prolific
-        PL2303GS path that puts the line into loopback: every byte written
-        comes straight back and the probe is never reached.
+        ``None`` (the default) makes no claim and leaves pyserial's own
+        behaviour untouched. ``False`` de-asserts RTS, which on
+        Bulbasaur's IFD-5 + Prolific PL2303GS path is what makes the probe
+        reachable at all: with RTS asserted the link loops back and every
+        request returns byte-for-byte without reaching the instrument.
+
+        The default is None rather than False so that constructing this
+        driver against an uncharacterised chamber cannot silently change
+        that chamber's serial behaviour. Callers should pass
+        ``MBESystemConfig.pyrometer_rts``.
         """
         self._port = port
         self._baudrate = baudrate
@@ -141,22 +148,36 @@ class ModbusPyrometer(TemperatureSensor):
         # This is per-chamber configuration, not a universal truth: the
         # value comes from MBESystemConfig.pyrometer_rts because Ch-MBE's
         # cabling has not been characterised.
-        sock = getattr(self._client, "socket", None)
-        if sock is None:
+        #
+        # rts=None means "no decision recorded for this chamber" and must
+        # leave the line exactly as pyserial set it. Touching it here
+        # would turn an unconfigured chamber into an untested behaviour
+        # change, which is the one thing this setting exists to avoid.
+        if self._rts is None:
             log.warning(
-                "ModbusPyrometer: no underlying serial object on the "
-                "pymodbus client; RTS could not be set to %s. If reads "
-                "return the request verbatim, this is why.", self._rts,
+                "ModbusPyrometer: RTS not configured for this chamber "
+                "(pyrometer_rts=None); using the serial library default. "
+                "If reads return the request verbatim, the line is "
+                "looping back — set pyrometer_rts=False in "
+                "drivers/config.py for this chamber and re-verify.",
             )
         else:
-            try:
-                sock.rts = self._rts
-                log.info("ModbusPyrometer: RTS set to %s", self._rts)
-            except Exception as exc:  # noqa: BLE001 — driver-dependent
+            sock = getattr(self._client, "socket", None)
+            if sock is None:
                 log.warning(
-                    "ModbusPyrometer: could not set RTS to %s (%s). A "
-                    "loopback response is likely.", self._rts, exc,
+                    "ModbusPyrometer: no underlying serial object on the "
+                    "pymodbus client; RTS could not be set to %s. If reads "
+                    "return the request verbatim, this is why.", self._rts,
                 )
+            else:
+                try:
+                    sock.rts = self._rts
+                    log.info("ModbusPyrometer: RTS set to %s", self._rts)
+                except Exception as exc:  # noqa: BLE001 — driver-dependent
+                    log.warning(
+                        "ModbusPyrometer: could not set RTS to %s (%s). A "
+                        "loopback response is likely.", self._rts, exc,
+                    )
 
         # Auto-detect word order
         self._detect_word_order()

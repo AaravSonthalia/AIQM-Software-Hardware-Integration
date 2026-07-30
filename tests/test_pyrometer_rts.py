@@ -26,22 +26,28 @@ from drivers.pyrometer import ModbusPyrometer
 
 
 class ConfigSurfaceTests(unittest.TestCase):
-    def test_field_exists_with_safe_default(self):
-        """Default must be the working value, not pyserial's."""
-        self.assertFalse(MBESystemConfig.pyrometer_rts)
+    def test_default_is_none_not_false(self):
+        """Unconfigured must mean "no claim", never a silent behaviour change.
+
+        Defaulting to False would export an O-MBE measurement to every
+        chamber that has not been tested, changing their serial behaviour
+        without evidence. None leaves them exactly as they were.
+        """
+        self.assertIsNone(MBESystemConfig.pyrometer_rts)
 
     def test_ombe_is_false(self):
         """O-MBE is the verified case — probe answered with RTS de-asserted."""
         self.assertFalse(OXIDE_MBE.pyrometer_rts)
+        self.assertIsNotNone(OXIDE_MBE.pyrometer_rts)
 
-    def test_chmbe_has_an_explicit_value(self):
-        """Ch-MBE is unverified but must still be explicit, not implicit.
+    def test_chmbe_stays_unset(self):
+        """Ch-MBE's cabling is uncharacterised, so it must make no claim.
 
-        Its cabling has never been characterised; the point of asserting
-        this is that the value is a decision someone can find and revisit,
-        rather than an inherited default nobody noticed.
+        This test is the guard against a well-meaning future edit copying
+        O-MBE's False across "for consistency". Changing it requires
+        measuring the Ch-MBE probe first, and changing this test with it.
         """
-        self.assertIsInstance(CHALCOGENIDE_MBE.pyrometer_rts, bool)
+        self.assertIsNone(CHALCOGENIDE_MBE.pyrometer_rts)
 
     def test_setting_is_per_chamber_not_module_global(self):
         """A future edit must not collapse this into one shared constant."""
@@ -49,12 +55,23 @@ class ConfigSurfaceTests(unittest.TestCase):
 
 
 class DriverAcceptsRtsTests(unittest.TestCase):
-    def test_defaults_to_deasserted(self):
-        self.assertFalse(ModbusPyrometer()._rts)
+    def test_defaults_to_none(self):
+        """Constructing the driver must not change anyone's serial state."""
+        self.assertIsNone(ModbusPyrometer()._rts)
 
     def test_stores_explicit_value(self):
         self.assertTrue(ModbusPyrometer(rts=True)._rts)
         self.assertFalse(ModbusPyrometer(rts=False)._rts)
+
+    def test_false_is_distinguishable_from_unset(self):
+        """`if self._rts:` would treat False and None alike — it must not.
+
+        False means "de-assert the line"; None means "do not touch it".
+        Collapsing them reintroduces exactly the untested rollout this
+        design exists to prevent.
+        """
+        self.assertIsNotNone(ModbusPyrometer(rts=False)._rts)
+        self.assertIsNone(ModbusPyrometer()._rts)
 
     def test_constructing_opens_no_port(self):
         """Construction must stay inert — connect() owns all I/O."""

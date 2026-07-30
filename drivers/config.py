@@ -72,6 +72,10 @@ class MBESystemConfig:
     pyrometer_device_id: int = 1
     # RTS line state applied immediately after the port opens.
     #
+    #   None  — make no claim; leave whatever pyserial does by default.
+    #   True  — assert RTS.
+    #   False — de-assert RTS.
+    #
     # This is a property of the CABLING AND ADAPTER, not of the probe, so
     # it belongs per chamber rather than as a driver default. On Bulbasaur
     # (O-MBE: IFD-5 in RS232 position + Prolific PL2303GS) an asserted RTS
@@ -83,10 +87,16 @@ class MBESystemConfig:
     #   RTS=False -> 01 03 02 09 03 FE 15     (version 9.3, CRC valid)
     #
     # DTR had no effect on either outcome and is deliberately not
-    # configured here. Ch-MBE's cabling is UNCHARACTERISED — its value
-    # below is inherited from O-MBE as a starting point and must be
-    # verified against that probe before it is trusted.
-    pyrometer_rts: bool = False
+    # configured here.
+    #
+    # The default is None rather than False ON PURPOSE. Setting False for
+    # a chamber whose cabling nobody has tested is a behaviour change on
+    # that system, not a configuration entry — and it would silently
+    # export an O-MBE finding to hardware it was never measured against.
+    # None preserves whatever that chamber did before, and connect()
+    # logs a hint naming this field when it sees None, so an unconfigured
+    # chamber diagnoses itself the first time someone looks at the log.
+    pyrometer_rts: Optional[bool] = None
 
     # Data storage paths
     single_images_folder: str = ""
@@ -178,11 +188,15 @@ CHALCOGENIDE_MBE = MBESystemConfig(
     ],
     temperasure_title="BASF TemperaSure 5.7.0.4",
     temperasure_exe=r"C:\Users\Omicron\Desktop\TemperaSure.exe",
-    # UNVERIFIED — inherited from O-MBE, never tested on this chamber's
-    # cabling. Ch-MBE may use a different adapter or interface module. If
-    # its pyrometer reads return the request verbatim, try True here
-    # before suspecting the probe.
-    pyrometer_rts=False,
+    # Deliberately left None: Ch-MBE's serial path has never been
+    # characterised, and this chamber has never had a validated direct
+    # pyrometer read. None keeps its prior behaviour (pyserial's default)
+    # rather than exporting an O-MBE measurement to untested hardware.
+    #
+    # If Ch-MBE reads come back as a verbatim copy of the request, that is
+    # the same loopback signature O-MBE had — set False here and verify
+    # against the probe before trusting it.
+    pyrometer_rts=None,
     single_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     stream_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     # ADS: 7 cells on Ch-MBE (Task #191 validated Jul 22 2026).
