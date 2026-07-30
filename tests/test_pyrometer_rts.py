@@ -79,5 +79,57 @@ class DriverAcceptsRtsTests(unittest.TestCase):
         self.assertFalse(p.connected)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class WorkerWiringTests(unittest.TestCase):
+    """The GUI must thread pyrometer_rts from chamber config to the driver.
+
+    On Jul 30 2026 the standalone scripts read the probe successfully and
+    then the GUI, launched seconds later on the same port, failed — because
+    PyrometerWorker._create_sensor called ModbusPyrometer() with no
+    arguments at all, so the driver got its own None default instead of
+    OXIDE_MBE.pyrometer_rts. The console said exactly that, which is the
+    only reason it took seconds rather than another afternoon.
+    """
+
+    def test_worker_accepts_and_stores_rts(self):
+        from gui.workers import PyrometerWorker
+
+        self.assertIsNone(PyrometerWorker(mode="modbus").rts)
+        self.assertFalse(PyrometerWorker(mode="modbus", rts=False).rts)
+        self.assertIsNotNone(PyrometerWorker(mode="modbus", rts=False).rts)
+
+    def test_forwards_all_three_inputs_to_the_driver(self):
+        """port, baudrate and rts must all reach ModbusPyrometer.
+
+        The factory previously called ModbusPyrometer() bare, so every one
+        of these was silently replaced by a driver default.
+        """
+        from gui.workers import PyrometerWorker
+
+        sensor = PyrometerWorker(
+            mode="modbus", port="COM9", baudrate=57600, rts=False,
+        )._create_sensor()
+        self.assertEqual(sensor._port, "COM9")
+        self.assertEqual(sensor._baudrate, 57600)
+        self.assertFalse(sensor._rts)
+
+    def test_ombe_config_reaches_the_driver_as_false(self):
+        """The exact path that failed in the Jul 30 GUI session."""
+        from gui.workers import PyrometerWorker
+
+        sensor = PyrometerWorker(
+            mode="modbus", rts=OXIDE_MBE.pyrometer_rts,
+        )._create_sensor()
+        self.assertIs(sensor._rts, False)
+
+    def test_unset_rts_propagates_as_none_not_false(self):
+        """An uncharacterised chamber must reach the driver as None.
+
+        Ch-MBE's pyrometer_rts is None; if that arrived as False the GUI
+        would de-assert RTS on hardware nobody has measured.
+        """
+        from gui.workers import PyrometerWorker
+
+        sensor = PyrometerWorker(
+            mode="modbus", rts=CHALCOGENIDE_MBE.pyrometer_rts,
+        )._create_sensor()
+        self.assertIsNone(sensor._rts)

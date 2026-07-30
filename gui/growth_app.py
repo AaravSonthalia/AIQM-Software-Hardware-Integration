@@ -336,6 +336,7 @@ class GrowthApp(QMainWindow):
                 poll_interval=0.5,
                 port=exactus_port,
                 baudrate=exactus_baud,
+                rts=self._chamber_config.pyrometer_rts,
             )
             self.pyrometer_worker.state_updated.connect(self._on_pyrometer_state)
             self.pyrometer_worker.start()

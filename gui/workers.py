@@ -397,10 +397,16 @@ class PyrometerWorker(QThread):
         samples_per_poll: int = 5,
         port: str = "COM4",
         baudrate: int = 115200,
+        rts: Optional[bool] = None,
     ):
         super().__init__()
         self.mode = mode
         self.poll_interval = poll_interval
+        # RTS line state for the Modbus driver, from
+        # MBESystemConfig.pyrometer_rts. None means "no decision recorded
+        # for this chamber" and leaves the serial library alone; the
+        # driver logs a warning naming the field when it sees None.
+        self.rts = rts
         # Number of rapid sub-readings to average per poll cycle. 5 ≈ 0.5 s
         # at the Exactus default rate (~10 reads/s); for screengrab mode it
         # samples whatever jitter the GUI exposes between refreshes.
@@ -495,7 +501,18 @@ class PyrometerWorker(QThread):
         """Factory method — import and instantiate pyrometer driver."""
         if self.mode == "modbus":
             from drivers.pyrometer import ModbusPyrometer
-            return ModbusPyrometer()
+            # Forward the worker's own inputs, exactly as the exactus
+            # branch below does. This factory used to call
+            # ModbusPyrometer() bare, discarding all three: on Jul 30 2026
+            # the O-MBE GUI logged "RTS not configured for this chamber"
+            # and its Modbus reads failed, seconds after the standalone
+            # scripts had read the probe on the same port. The chamber
+            # config was correct; the worker threw it away.
+            return ModbusPyrometer(
+                port=self.port,
+                baudrate=self.baudrate,
+                rts=self.rts,
+            )
         elif self.mode == "screengrab":
             from drivers.pyrometer import ScreenGrabPyrometer
             return ScreenGrabPyrometer()
