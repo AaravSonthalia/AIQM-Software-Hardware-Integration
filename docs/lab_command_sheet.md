@@ -152,7 +152,78 @@ consistent.
 
 ---
 
-## 4. Pyrometer (Task #196) — BEFORE opening TemperaSure
+## 4. Pyrometer — RESOLVED Jul 30 2026, read this first
+
+> ### The answer, if you are here because the pyrometer is silent
+>
+> **On O-MBE, RTS must be de-asserted.** `pyserial` asserts RTS by
+> default; on Bulbasaur's IFD-5 (RS232 position) + Prolific PL2303GS
+> path an asserted RTS puts the link into **loopback** — every request
+> comes back byte-for-byte and the probe never sees it.
+>
+> Measured on COM4, request `01 03 13 00 00 01 80 8E` (read REG_VER):
+>
+> | RTS | DTR | Response |
+> |-----|-----|----------|
+> | True | True | `01 03 13 00 00 01 80 8E` — our own request |
+> | True | False | `01 03 13 00 00 01 80 8E` — our own request |
+> | False | True | `01 03 02 09 03 FE 15` — **version 9.3** |
+> | False | False | `01 03 02 09 03 FE 15` — **version 9.3** |
+>
+> RTS alone decides it. DTR is irrelevant. This is configured per
+> chamber as `MBESystemConfig.pyrometer_rts` (`drivers/config.py`);
+> O-MBE is `False` and verified, Ch-MBE is `None` and **uncharacterised**.
+>
+> **If a pyrometer read returns a verbatim copy of the request, that is
+> this bug.** Do not investigate probe modes.
+
+### Validated O-MBE transport settings
+
+| Setting | Value |
+|---------|-------|
+| Port | COM4 (Prolific PL2303GS, `VID:PID=067B:23A3`) |
+| Baud / framing | 115200 8N1 |
+| Modbus device id | 1 |
+| **RTS** | **de-asserted (`False`)** |
+| DTR | unset — no effect either way |
+| IFD-5 switch | RS232 |
+| Float layout | high word at the even address (manual p.53) |
+| Probe identity | ver 9.3, name/sn `EXI4765` |
+| Probe update rate | ~1 Hz (Graph Rate, register `0x1011`) |
+
+Verified end to end: `modbus_discover` → `identity_found_at_default`;
+`pyrometer_modbus_smoke.py` → 118 reads, 0 errors; GUI session in
+`modbus` mode → 8/8 rows populated, TemperaSure closed.
+
+**Do not poll faster than ~1 Hz and treat the result as independent
+samples.** Manual p.53: readings repeat when the host polls faster than
+the probe updates. At 2 Hz, 49% of consecutive smoke readings were
+identical, and `pyrometer_temp_std_C` reads `0.00` because all five
+sub-samples land in one update window. Log it; do not use it for
+plateau or change decisions until sampling is aligned. Changing the
+probe's update rate is a **config-register write** and is gated like
+any other state change.
+
+### FALSIFIED: the "stuck in Exactus mode" hypothesis
+
+The Jul 28 2026 diagnosis — probe in Exactus binary streaming mode with
+streaming stopped — is **wrong**. The probe was answering Modbus at
+(115200, id=1) throughout; every `silent`, `silent_all_combos`,
+`echo_of_sent` and `echo_only` verdict recorded Jul 28 and Jul 30 was
+measured through the RTS loopback.
+
+The hypothesis survived a full day of work because it explained every
+observation available at the time. Nothing below this line was needed
+to fix the actual fault. The diagnostic ladder in 4.0–4.4 is retained
+because the scripts remain useful for a genuinely unresponsive probe —
+but **check RTS before running any of it**.
+
+`pyrometer_force_modbus.py` (4.4) was never run and is not required.
+There was no mode to switch.
+
+---
+
+### TemperaSure port exclusivity (unchanged)
 
 Critical: TemperaSure grabs COM4 **exclusively**. None of the pyrometer
 scripts below can share the port with it. The rule is:
