@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Sequence
 
@@ -50,9 +51,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-CLASSIFIER2_DATA_ROOT = Path(
-    "/Users/aj/test-claude/projects/ai-for-quantum/src/data"
-)
+CLASSIFIER2_DATA_ROOT = Path(os.environ.get(
+    "AIQM_CLASSIFIER_DATA",
+    "/Users/aj/Documents/Research/Data/RHEED image classifier training data",
+))
 CLASS_DIRS = {
     "1x1":     "STO_ideal_1x1",
     "Tw(2x1)": "STO_ideal_Twinned2x1",

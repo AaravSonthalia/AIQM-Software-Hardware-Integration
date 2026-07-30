@@ -298,7 +298,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--ai-repo-root",
-        default="/Users/aj/test-claude/projects/ai-for-quantum",
+        default="/Users/aj/ai-for-quantum",
         help="AI_for_quantum repo root for ClassifierBridge",
     )
     parser.add_argument(

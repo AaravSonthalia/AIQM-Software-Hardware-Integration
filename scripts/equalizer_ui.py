@@ -34,6 +34,7 @@ from __future__ import annotations
 import csv
 import datetime
 import sys
+import os
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -49,9 +50,10 @@ from PyQt6.QtWidgets import (
 
 
 # Training set provides the basis. Mirrors the prototype's paths.
-CLASSIFIER2_DATA_ROOT = Path(
-    "/Users/aj/test-claude/projects/ai-for-quantum/src/data"
-)
+CLASSIFIER2_DATA_ROOT = Path(os.environ.get(
+    "AIQM_CLASSIFIER_DATA",
+    "/Users/aj/Documents/Research/Data/RHEED image classifier training data",
+))
 CLASS_DIRS: dict[str, str] = {
     "1x1":     "STO_ideal_1x1",
     "Tw(2x1)": "STO_ideal_Twinned2x1",

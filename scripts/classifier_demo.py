@@ -14,6 +14,7 @@ Usage (Mac):
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -31,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from gui.classifier_bridge import ClassifierBridge, GUI_LABELS
 
 # Mac dev path to the AI_for_quantum repo.
-AI_REPO_ROOT = Path("/Users/aj/test-claude/projects/ai-for-quantum")
+AI_REPO_ROOT = Path(os.environ.get("AI_REPO_ROOT", "/Users/aj/ai-for-quantum"))
 DISPLAY_WH = (640, 480)
 IMAGE_EXTS = "*.png *.bmp *.jpg *.jpeg *.tif *.tiff"
 
