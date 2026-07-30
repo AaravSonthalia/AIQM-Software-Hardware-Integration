@@ -12,15 +12,10 @@ from typing import Optional, Tuple
 from pymodbus.client import ModbusTcpClient
 from pymodbus.exceptions import ModbusException
 
-try:
-    from .base import BaseDevice
-except ImportError:
-    from base import BaseDevice
-
 logger = logging.getLogger(__name__)
 
 
-class TempPID(BaseDevice):
+class TempPID:
     """
     Eurotherm Temperature PID Controller.
 
