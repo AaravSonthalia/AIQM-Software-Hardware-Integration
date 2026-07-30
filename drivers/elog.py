@@ -3,8 +3,10 @@
 Reverse-engineered May 15 2026 from a real Bulbasaur log file. The viewer
 (``logfile_viewer``) calls them "ELog" files. Both .elo and .elo.zip are
 written by EvapControl — the .zip variant is just an ordinary zip wrapping
-a single .elo. Files rotate at local midnight; current file is always
-``log_<YYYY-MM-DD>_000000.elo`` in
+a single .elo. Files rotate at local midnight, and the name's time suffix
+records when that session started: ``log_<YYYY-MM-DD>_000000.elo`` after a
+midnight rotation, ``log_<YYYY-MM-DD>_141157.elo`` if EvapControl was
+launched at 14:11:57. Both are live. See ``find_current_log``. Logs live in
 ``C:\\_Omicron_Software\\EvapControl\\evap_control_1.2.0.51\\evap_control_1.2.0.51\\log\\``.
 
 Format
@@ -38,6 +40,7 @@ Usage
 from __future__ import annotations
 
 import datetime
+import re
 import struct
 import zipfile
 from pathlib import Path
@@ -147,12 +150,43 @@ def find_current_log(
 ) -> Path | None:
     """Return the path to today's live .elo file, or None if not found.
 
-    EvapControl rotates at local midnight; the live file is always named
-    ``log_<YYYY-MM-DD>_000000.elo`` (uncompressed). Older days are auto-zipped.
+    The filename time suffix is *when that logging session began*, not a
+    fixed rotation marker. EvapControl auto-rotates at local midnight, so
+    an uninterrupted day yields ``log_<YYYY-MM-DD>_000000.elo`` — but a
+    mid-day start (operator launched EvapControl at 14:11:57) yields
+    ``log_<YYYY-MM-DD>_141157.elo``. Both are live files.
+
+    An earlier version hardcoded the ``_000000`` suffix and returned None
+    on every mid-day start: 53 of the 1239 days in Bulbasaur's log dir,
+    including any day someone restarted EvapControl at the rig. The
+    caller (``ElogReader.connect``) turns None into a RuntimeError, so
+    the whole direct-read path went dark while the data sat on disk.
+
+    Selection rules:
+
+    * Glob ``log_<today>_*.elo`` — match the date, not the time.
+    * Require a **6-digit** time suffix. The glob alone would accept
+      ``log_<today>_backup.elo``; since ASCII letters sort above digits,
+      such a file would then win the "newest" comparison outright and be
+      served as live data. Anything not matching HHMMSS is ignored.
+    * Return the **newest** session by time suffix. 61 days in that same
+      directory hold more than one session file (EvapControl restarted
+      several times); returning the first match would hand back a stale
+      completed log whose values still look entirely plausible. A silent
+      wrong answer is worse here than the visible failure it replaces.
+      Zero-padded HHMMSS is fixed-width, so lexical order is chronological.
+    * Uncompressed only. EvapControl zips a session when it rotates away
+      from it, so a ``.elo.zip`` for today is by definition not the file
+      being written to. ``_open_elo`` can read zips — that is for reading
+      *historical* logs, not for finding the current one.
     """
     today = datetime.date.today().isoformat()
-    candidate = Path(log_dir) / f"log_{today}_000000.elo"
-    return candidate if candidate.exists() else None
+    pattern = re.compile(rf"^log_{re.escape(today)}_\d{{6}}\.elo$")
+    candidates = sorted(
+        p for p in Path(log_dir).glob(f"log_{today}_*.elo")
+        if pattern.match(p.name) and p.is_file()
+    )
+    return candidates[-1] if candidates else None
 
 
 def latest_record(

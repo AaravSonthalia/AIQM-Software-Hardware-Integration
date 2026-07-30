@@ -2,11 +2,14 @@
 Background worker threads for instrument communication.
 """
 
+import logging
 import time
 from typing import Optional
 
 import numpy as np
 from PyQt6.QtCore import QMutex, QThread, pyqtSignal
+
+log = logging.getLogger(__name__)
 
 
 def _frame_luminance(frame: np.ndarray) -> float:
@@ -645,6 +648,9 @@ class EvapControlWorker(QThread):
         # (see PowerSupplyWorker for the full comment).
         self.running = True
         self._driver = None
+        # Last connect-failure message logged, so the per-poll retry loop
+        # reports each distinct cause once instead of every second.
+        self._last_logged_error: Optional[str] = None
 
     def run(self):
         state = EvapControlState(mode=self.mode)
@@ -659,6 +665,19 @@ class EvapControlWorker(QThread):
                 except Exception as e:
                     state.connected = False
                     state.error = str(e)
+                    # Log the first occurrence of each distinct message.
+                    # This block previously recorded the reason in
+                    # state.error and nothing more; no consumer surfaces
+                    # that string, so a driver that never connected was
+                    # indistinguishable at the console from one quietly
+                    # reading nothing. Deduped because the retry loop
+                    # re-enters every poll_interval and would flood.
+                    if state.error != self._last_logged_error:
+                        self._last_logged_error = state.error
+                        log.warning(
+                            "EvapControlWorker (%s mode) not connected: %s",
+                            self.mode, state.error,
+                        )
                     self.state_updated.emit(state)
                     time.sleep(self.poll_interval)
                     continue
