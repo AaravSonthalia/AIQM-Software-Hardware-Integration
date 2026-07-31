@@ -501,6 +501,56 @@ in the day's memory update so the next session inherits the finding.
 
 ## 5. Ch-MBE regression (if working on Ch-MBE that session)
 
+### 5.0 Session discipline — read before the first command
+
+Two rules, both written after the Jul 30 2026 O-MBE session where their
+absence cost hours.
+
+**Evidence discipline.** Every test gets its **own** `--output-dir`.
+Two scripts sharing one directory both write `result.json` and the
+second silently clobbers the first — this happened on Jul 30 and the
+first bundle was only recoverable because the console scrollback
+survived. For each test record:
+
+- the exact command as typed
+- **which apps were open**, especially TemperaSure — its open/closed
+  state during two Jul 30 tests is permanently unrecoverable, and it
+  determines whether those results mean anything
+- port, baud, device id
+- **RTS and DTR state** whenever serial is involved
+- **raw RX bytes** whenever serial is involved — not the library's
+  interpretation of them
+
+**Stop conditions.** Do **not** change Ch-MBE config, write to probe
+registers, or attempt any mode switch until a **read-only identity
+exchange has been captured and reviewed**. On Jul 30 a full state-change
+ladder was built and nearly executed against a probe that was answering
+correctly the whole time; the thing that would have prevented it was
+one read-only exchange with the raw bytes visible.
+
+### 5.1 Ch-MBE hypotheses — NOT inherited O-MBE facts
+
+Everything O-MBE established on Jul 30 is chamber-specific until
+measured here. Treat each of these as an open question:
+
+| Item | O-MBE (verified) | Ch-MBE status |
+|------|------------------|---------------|
+| `pyrometer_rts` | `False` | **`None` — uncharacterised.** Test both ways |
+| Pyrometer port | COM4 | **Unverified.** Config default was never checked |
+| Float word order | high word first | **Unconfirmed.** Report both, pick the physical one |
+| Elog log dir | nested `_Omicron_Software` path | **Flat** `C:\evap_control_1.2.0.48\log` — never exercised |
+| Elog var map | all 11 names matched | **Known to differ** (different cell names) |
+| Pressure units | ADS agrees with elog to ~1% | **Different gauge.** ADS is the *primary* path here |
+| TemperaSure title | `...5.7.0.4 Advanced Mode` | `...5.7.0.4` — **no suffix** |
+| Cell count | 6, cell7 blank | **7, all populated** |
+
+If a Ch-MBE serial read returns a **verbatim copy of the request**,
+that is the RTS loopback described in Section 4 — set
+`pyrometer_rts=False` in `CHALCOGENIDE_MBE` and re-verify. Do not set
+it before observing that.
+
+### 5.2 MISTRAL ADS regression
+
 Set the chamber and re-do the MISTRAL ADS precheck:
 
 ```powershell
