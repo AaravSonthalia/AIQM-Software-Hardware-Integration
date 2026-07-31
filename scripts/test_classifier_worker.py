@@ -10,10 +10,8 @@ Design notes:
     - Signal delivery uses ``Qt.ConnectionType.DirectConnection`` so slots
       run in the emitter's thread — no receiver event loop required, no
       ``processEvents`` gymnastics.
-    - Snapshots of ``ClassifierState`` are taken via ``copy.copy`` at
-      emit time (the worker reuses one state object across iterations,
-      but replaces its dict fields with fresh objects — shallow copy is
-      safe here).
+    - The worker itself emits deep-copied snapshots so queued GUI delivery
+      cannot observe later mutations of an earlier reset/result.
     - Per-instance overrides of ``POLL_INTERVAL_S`` and
       ``MAX_CONSECUTIVE_FAILS`` avoid class-level mutation leaking
       between tests. Python's attribute lookup checks the instance
@@ -45,7 +43,7 @@ from PyQt6.QtCore import QCoreApplication, Qt  # noqa: E402
 _app = QCoreApplication.instance() or QCoreApplication(sys.argv)
 
 from gui.recon_labels import RECON_LABELS  # noqa: E402
-from gui.state import CameraState, ClassifierState  # noqa: E402
+from gui.state import CameraState, ClassifierState, RheedQcState  # noqa: E402
 from gui.workers import ClassifierWorker  # noqa: E402
 
 
@@ -70,6 +68,10 @@ class FakeBridge:
         If True, every ``classify`` call raises ``RuntimeError`` — for
         exercising the consecutive-failure counter.
     """
+
+    input_mode = "single_frame"
+    uses_temporal_history = False
+    history_frames_required = 0
 
     def __init__(
         self,
@@ -278,6 +280,24 @@ class SlotTests(unittest.TestCase):
         self.assertIs(w._latest_frame, b)
         self.assertEqual(w._latest_frame_number, 2)
 
+    def test_view_boundary_clears_pending_frame_and_advances_epoch(self):
+        w = ClassifierWorker(ai_repo_root="/nowhere")
+        w.on_rheed_state(CameraState(frame=_fake_frame(), frame_number=4))
+        old_epoch = w._view_epoch
+        w.set_rheed_qc_state(
+            RheedQcState(
+                session_active=True,
+                gun_aligned=False,
+                realignment_active=True,
+                history_required=32,
+            ),
+            force_reset=True,
+        )
+        self.assertIsNone(w._latest_frame)
+        self.assertIsNone(w._latest_frame_key)
+        self.assertGreater(w._view_epoch, old_epoch)
+        self.assertFalse(w._gun_aligned)
+
 
 class RunLoopTests(unittest.TestCase):
     """Tests exercising ``run()`` — real QThread, real signal delivery."""
@@ -326,6 +346,15 @@ class RunLoopTests(unittest.TestCase):
     def test_startup_emits_error_on_bridge_failure(self):
         w = ClassifierWorker(ai_repo_root="/nowhere")
         w.POLL_INTERVAL_S = 0.01
+        w.set_rheed_qc_state(
+            RheedQcState(
+                session_active=True,
+                view_segment_id=4,
+                visual_history_generation=9,
+                gun_aligned=True,
+            ),
+            force_reset=True,
+        )
 
         def bad_factory():
             raise RuntimeError("cannot find model at /nowhere/best_model.pth")
@@ -344,6 +373,8 @@ class RunLoopTests(unittest.TestCase):
         self.assertFalse(states[-1].loading)
         self.assertFalse(states[-1].ready)
         self.assertIn("cannot find model", states[-1].error)
+        self.assertEqual(states[-1].view_segment_id, 4)
+        self.assertEqual(states[-1].visual_history_generation, 9)
 
     def test_first_frame_gets_classified(self):
         scores = {"1x1": 1.0, "Twinned (2x1)": 0.0, "c(6x2)": 0.0,
@@ -388,6 +419,100 @@ class RunLoopTests(unittest.TestCase):
             self._feed_frame(w, 43)
             self.assertTrue(_wait_for(lambda: bridge.calls >= 2))
             self.assertEqual(bridge.calls, 2)
+        finally:
+            self._stop_and_wait(w)
+
+    def test_unaligned_view_freezes_inference_until_confirmed(self):
+        bridge = FakeBridge()
+        w, states = self._make_worker(bridge)
+        w.set_rheed_qc_state(
+            RheedQcState(
+                session_active=True,
+                gun_aligned=None,
+                history_required=32,
+            ),
+            force_reset=True,
+        )
+
+        w.start()
+        try:
+            self.assertTrue(_wait_for(lambda: len(states) >= 2))
+            self._feed_frame(w, 1)
+            time.sleep(0.08)
+            self.assertEqual(bridge.calls, 0)
+
+            aligned = RheedQcState(
+                session_active=True,
+                view_segment_id=0,
+                gun_aligned=True,
+                history_required=32,
+            )
+            w.set_rheed_qc_state(aligned, force_reset=True)
+            self._feed_frame(w, 2)
+            self.assertTrue(_wait_for(lambda: bridge.calls == 1))
+            emitted = [
+                state for state in states if state.last_frame_number == 2
+            ][-1]
+            self.assertEqual(emitted.view_segment_id, 0)
+            self.assertTrue(emitted.gun_aligned)
+            self.assertFalse(emitted.history_ready)
+            self.assertFalse(emitted.prediction_actionable)
+        finally:
+            self._stop_and_wait(w)
+
+    def test_single_frame_bridge_never_claims_temporal_history(self):
+        bridge = FakeBridge()
+        w, states = self._make_worker(bridge)
+        w.set_rheed_qc_state(
+            RheedQcState(
+                session_active=True,
+                view_segment_id=5,
+                gun_aligned=True,
+                history_required=0,
+            ),
+            force_reset=True,
+        )
+
+        w.start()
+        try:
+            self.assertTrue(_wait_for(lambda: len(states) >= 2))
+            for frame_number in (1, 2, 3):
+                self._feed_frame(w, frame_number)
+                self.assertTrue(
+                    _wait_for(lambda n=frame_number: bridge.calls >= n)
+                )
+            self.assertTrue(_wait_for(lambda: bridge.calls >= 3))
+            last = [
+                state for state in states if state.last_frame_number == 3
+            ][-1]
+            self.assertEqual(last.model_input_mode, "single_frame")
+            self.assertEqual(last.history_frame_count, 0)
+            self.assertEqual(last.history_required, 0)
+            self.assertFalse(last.history_ready)
+            self.assertFalse(last.prediction_actionable)
+        finally:
+            self._stop_and_wait(w)
+
+    def test_worker_emits_independent_state_objects(self):
+        bridge = FakeBridge()
+        w = ClassifierWorker(ai_repo_root="/nowhere")
+        w.POLL_INTERVAL_S = 0.01
+        w._create_bridge = lambda: bridge
+        raw_states: list[ClassifierState] = []
+        w.state_updated.connect(
+            raw_states.append,
+            Qt.ConnectionType.DirectConnection,
+        )
+        w.start()
+        try:
+            self.assertTrue(_wait_for(lambda: len(raw_states) >= 2))
+            loading = raw_states[0]
+            ready = raw_states[1]
+            self.assertIsNot(loading, ready)
+            self.assertTrue(loading.loading)
+            self.assertFalse(loading.ready)
+            self.assertFalse(ready.loading)
+            self.assertTrue(ready.ready)
         finally:
             self._stop_and_wait(w)
 

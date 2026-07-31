@@ -8,6 +8,7 @@ Run: ``python scripts/test_growth_logger.py`` or under pytest.
 from __future__ import annotations
 
 import csv
+import json
 import sys
 import tempfile
 import unittest
@@ -19,7 +20,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from gui.growth_logger import GrowthLogger  # noqa: E402
+from gui.growth_logger import (  # noqa: E402
+    GrowthLogger,
+    RHEED_VIEW_EVENT_ALIGNMENT_CONFIRMED,
+    RHEED_VIEW_EVENT_HISTORY_RESET,
+    RHEED_VIEW_EVENT_HISTORY_READY,
+    RHEED_VIEW_EVENT_QC_PASS,
+    RHEED_VIEW_EVENT_QC_REJECT,
+    RHEED_VIEW_EVENT_REALIGN_END,
+    RHEED_VIEW_EVENT_REALIGN_START,
+    RHEED_VIEW_EVENT_SESSION_START,
+    RHEED_VIEW_EVENT_TYPES,
+)
 
 
 def _good_frame() -> np.ndarray:
@@ -109,6 +121,14 @@ class CommitFieldsTests(unittest.TestCase):
         # These two columns landed Jul 8 — verify they're in the schema
         # so downstream code can rely on them.
         self.assertIn("classifier_status", GrowthLogger.COMMIT_FIELDS)
+        self.assertIn(
+            "classifier_prediction_actionable",
+            GrowthLogger.COMMIT_FIELDS,
+        )
+        self.assertIn(
+            "classifier_visual_history_generation",
+            GrowthLogger.COMMIT_FIELDS,
+        )
         self.assertIn("frame_quality_pass", GrowthLogger.COMMIT_FIELDS)
         self.assertIn("psu_source", GrowthLogger.COMMIT_FIELDS)
 
@@ -462,6 +482,248 @@ class ManualEventRecordTests(unittest.TestCase):
         from PIL import Image
         with Image.open(rows[0]["frame_path"]) as img:
             self.assertEqual(img.format, "BMP")
+
+
+class RheedViewEventSchemaTests(unittest.TestCase):
+    """The structured acquisition/QC log has a stable, separate schema."""
+
+    def test_schema_is_exact_and_manual_schema_is_unchanged(self):
+        expected = [
+            "timestamp", "elapsed_s", "event_idx", "event_type",
+            "realignment_id",
+            "previous_view_segment_id", "view_segment_id",
+            "visual_history_generation",
+            "gun_aligned",
+            "history_frame_count", "history_required", "history_ready",
+            "qc_reject", "qc_reason", "labeler", "confidence",
+            "prediction_actionable",
+            "frame_role", "frame_path", "note",
+            "capture_backend", "captured_at_utc", "capture_sequence",
+            "frame_age_ms", "source_hwnd",
+        ]
+        self.assertEqual(GrowthLogger.RHEED_VIEW_EVENT_FIELDS, expected)
+        self.assertNotIn("event_type", GrowthLogger.MANUAL_EVENT_FIELDS)
+        self.assertNotIn("qc_reject", GrowthLogger.MANUAL_EVENT_FIELDS)
+
+    def test_event_type_vocabulary_is_explicit(self):
+        self.assertEqual(
+            RHEED_VIEW_EVENT_TYPES,
+            {
+                RHEED_VIEW_EVENT_SESSION_START,
+                RHEED_VIEW_EVENT_ALIGNMENT_CONFIRMED,
+                RHEED_VIEW_EVENT_REALIGN_START,
+                RHEED_VIEW_EVENT_REALIGN_END,
+                RHEED_VIEW_EVENT_HISTORY_RESET,
+                RHEED_VIEW_EVENT_HISTORY_READY,
+                RHEED_VIEW_EVENT_QC_REJECT,
+                RHEED_VIEW_EVENT_QC_PASS,
+            },
+        )
+
+
+class RheedViewEventLifecycleTests(unittest.TestCase):
+    """File creation, counter reset, metadata count, and close behavior."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.logger = GrowthLogger(base_dir=self.tmp.name)
+
+    def tearDown(self):
+        try:
+            self.logger.end_session()
+        except Exception:
+            pass
+        self.tmp.cleanup()
+
+    def test_file_is_created_with_flushed_header(self):
+        self.logger.start_session("RHEED_VIEW_HEADER")
+        path = self.logger.session_dir / "rheed_view_events.csv"
+        self.assertTrue(path.exists())
+        with open(path, newline="") as stream:
+            self.assertEqual(
+                next(csv.reader(stream)),
+                GrowthLogger.RHEED_VIEW_EVENT_FIELDS,
+            )
+
+    def test_counter_is_monotonic_and_resets_for_new_session(self):
+        self.logger.start_session("RHEED_VIEW_A")
+        self.assertEqual(
+            self.logger.record_rheed_view_event(
+                RHEED_VIEW_EVENT_SESSION_START, 0.0,
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.logger.record_rheed_view_event(
+                RHEED_VIEW_EVENT_REALIGN_START, 1.0,
+            ),
+            2,
+        )
+        self.logger.end_session()
+
+        self.logger.start_session("RHEED_VIEW_B")
+        self.assertEqual(
+            self.logger.record_rheed_view_event(
+                RHEED_VIEW_EVENT_SESSION_START, 0.0,
+            ),
+            1,
+        )
+
+    def test_valid_event_without_session_returns_zero(self):
+        self.assertEqual(
+            self.logger.record_rheed_view_event(
+                RHEED_VIEW_EVENT_QC_REJECT, 1.0,
+            ),
+            0,
+        )
+
+    def test_end_session_closes_and_clears_writer(self):
+        self.logger.start_session("RHEED_VIEW_CLOSE")
+        event_file = self.logger._rheed_view_event_file
+        self.logger.end_session()
+        self.assertTrue(event_file.closed)
+        self.assertIsNone(self.logger._rheed_view_event_file)
+        self.assertIsNone(self.logger._rheed_view_event_writer)
+
+    def test_session_metadata_contains_event_count(self):
+        self.logger.start_session("RHEED_VIEW_METADATA")
+        for event_type in (
+            RHEED_VIEW_EVENT_SESSION_START,
+            RHEED_VIEW_EVENT_REALIGN_START,
+            RHEED_VIEW_EVENT_REALIGN_END,
+        ):
+            self.logger.record_rheed_view_event(event_type, 1.0)
+        self.logger.save_session_metadata({})
+        metadata_path = self.logger.session_dir / "session_metadata.json"
+        with open(metadata_path) as stream:
+            metadata = json.load(stream)
+        self.assertEqual(metadata["rheed_view_event_count"], 3)
+
+
+class RheedViewEventRecordTests(unittest.TestCase):
+    """Rows preserve state, frame evidence, and camera provenance."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.logger = GrowthLogger(base_dir=self.tmp.name)
+        self.logger.start_session("RHEED_VIEW_RECORD")
+        self.csv_path = self.logger.session_dir / "rheed_view_events.csv"
+
+    def tearDown(self):
+        try:
+            self.logger.end_session()
+        except Exception:
+            pass
+        self.tmp.cleanup()
+
+    def _read_rows(self) -> list[dict]:
+        with open(self.csv_path, newline="") as stream:
+            return list(csv.DictReader(stream))
+
+    def test_full_state_snapshot_and_capture_provenance_are_written(self):
+        state = {
+            "view_segment_id": 4,
+            "gun_aligned": True,
+            "history_frame_count": 0,
+            "history_required": 32,
+            "history_ready": False,
+            "qc_reject": False,
+            "qc_reason": "",
+            "prediction_actionable": False,
+        }
+        idx = self.logger.record_rheed_view_event(
+            RHEED_VIEW_EVENT_REALIGN_END,
+            123.456,
+            state_snapshot=state,
+            realignment_id=7,
+            previous_view_segment_id=3,
+            frame_role="post_realign",
+            note="new gun direction locked",
+            capture_metadata={
+                "capture_backend": "wgc",
+                "captured_at_utc": "2026-07-29T20:00:00.123Z",
+                "capture_sequence": 99,
+                "frame_age_ms": 4.5678,
+                "source_hwnd": 4321,
+            },
+        )
+        self.assertEqual(idx, 1)
+        row = self._read_rows()[0]
+        self.assertEqual(row["elapsed_s"], "123.46")
+        self.assertEqual(row["event_type"], RHEED_VIEW_EVENT_REALIGN_END)
+        self.assertEqual(row["realignment_id"], "7")
+        self.assertEqual(row["previous_view_segment_id"], "3")
+        self.assertEqual(row["view_segment_id"], "4")
+        self.assertEqual(row["gun_aligned"], "True")
+        self.assertEqual(row["history_frame_count"], "0")
+        self.assertEqual(row["history_required"], "32")
+        self.assertEqual(row["history_ready"], "False")
+        self.assertEqual(row["qc_reject"], "False")
+        self.assertEqual(row["prediction_actionable"], "False")
+        self.assertEqual(row["frame_role"], "post_realign")
+        self.assertEqual(row["note"], "new gun direction locked")
+        self.assertEqual(row["capture_backend"], "wgc")
+        self.assertEqual(
+            row["captured_at_utc"], "2026-07-29T20:00:00.123Z",
+        )
+        self.assertEqual(row["capture_sequence"], "99")
+        self.assertEqual(row["frame_age_ms"], "4.568")
+        self.assertEqual(row["source_hwnd"], "4321")
+
+    def test_ids_may_come_from_state_snapshot(self):
+        self.logger.record_rheed_view_event(
+            RHEED_VIEW_EVENT_REALIGN_START,
+            5.0,
+            state_snapshot={
+                "realignment_id": 8,
+                "previous_view_segment_id": 4,
+                "view_segment_id": None,
+                "gun_aligned": False,
+                "qc_reject": True,
+                "qc_reason": "gun_realigning",
+            },
+        )
+        row = self._read_rows()[0]
+        self.assertEqual(row["realignment_id"], "8")
+        self.assertEqual(row["previous_view_segment_id"], "4")
+        self.assertEqual(row["view_segment_id"], "")
+        self.assertEqual(row["gun_aligned"], "False")
+        self.assertEqual(row["qc_reject"], "True")
+        self.assertEqual(row["qc_reason"], "gun_realigning")
+
+    def test_event_frame_is_saved_and_bound_to_row(self):
+        idx = self.logger.record_rheed_view_event(
+            RHEED_VIEW_EVENT_QC_REJECT,
+            3.0,
+            frame=_dummy_frame(),
+            frame_role="qc_reject",
+        )
+        self.assertEqual(idx, 1)
+        row = self._read_rows()[0]
+        path = Path(row["frame_path"])
+        self.assertTrue(path.exists())
+        self.assertIn(
+            "rheed_view_event_001_qc_reject_", path.name,
+        )
+        self.assertEqual(path.suffix.lower(), ".bmp")
+        from PIL import Image
+        with Image.open(path) as image:
+            self.assertEqual(image.format, "BMP")
+
+    def test_invalid_event_type_raises_without_mutating_counter_or_file(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported RHEED view"):
+            self.logger.record_rheed_view_event("free_form_typo", 1.0)
+        self.assertEqual(self.logger._rheed_view_event_counter, 0)
+        self.assertEqual(self._read_rows(), [])
+
+    def test_non_mapping_state_snapshot_is_rejected(self):
+        with self.assertRaisesRegex(TypeError, "must be a mapping"):
+            self.logger.record_rheed_view_event(
+                RHEED_VIEW_EVENT_HISTORY_READY,
+                1.0,
+                state_snapshot=["not", "a", "mapping"],
+            )
+        self.assertEqual(self.logger._rheed_view_event_counter, 0)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ Background worker threads for instrument communication.
 """
 
 import time
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Optional
@@ -29,7 +30,7 @@ def _frame_luminance(frame: np.ndarray) -> float:
 
 from gui.state import (
     CameraState, ClassifierState, EvapControlState, MistralState, PowerSupplyState,
-    PyrometerState, TemperatureState,
+    PyrometerState, RheedQcState, TemperatureState,
 )
 
 # ---------------------------------------------------------------------------
@@ -379,8 +380,11 @@ class RheedCameraWorker(QThread):
             except Exception as e:
                 state.error = str(e)
                 state.frame = None
+                # A failed read is never a connected/usable observation.
+                # Recovering backends may retry on the next loop; a later
+                # successful frame sets ``connected=True`` again.
+                state.connected = False
                 if self.mode == "screengrab":
-                    state.connected = False
                     self.state_updated.emit(replace(state))
                     self.running = False
                     break
@@ -757,6 +761,11 @@ class ClassifierWorker(QThread):
     EMA_ALPHA = 0.2                 # ~5 s time constant at 2 Hz
     OOD_QUALITY_THRESHOLD = 0.3     # below this = freeze EMA + set is_ood
     MAX_CONSECUTIVE_FAILS = 5       # symmetric with Jul-2 driver-hardening pattern
+    # The currently deployed bridge calls ``classify(frame)`` and is therefore
+    # single-frame-only.  The 32-frame GRU remains an offline experiment until
+    # a temporal runtime bridge supplies the full causal tensor.
+    HISTORY_FRAMES_REQUIRED = 0
+    OFFLINE_TEMPORAL_HISTORY_FRAMES = 32
 
     def __init__(self, ai_repo_root, model_path=None):
         super().__init__()
@@ -783,6 +792,36 @@ class ClassifierWorker(QThread):
         # Model identity ("filename (YYYY-MM-DD)") — resolved once at
         # bridge-load time in run() and emitted on every subsequent state.
         self._model_version = ""
+
+        # Acquisition-side view state.  The worker defaults to aligned for
+        # backwards compatibility with standalone demos/tests; GrowthApp
+        # explicitly sets alignment to unknown at every session start.
+        # ``_view_epoch`` invalidates an in-flight result whenever a session
+        # or gun-alignment boundary is crossed.
+        self._gun_aligned: Optional[bool] = True
+        self._view_segment_id: Optional[int] = 0
+        self._view_epoch = 0
+        self._applied_view_epoch = -1
+        self._history_frame_count = 0
+        self._model_input_mode = "unknown"
+
+    def _emit_classifier_state(self, state: ClassifierState) -> None:
+        """Emit an immutable snapshot across the queued Qt connection.
+
+        Reusing one mutable dataclass lets a later inference overwrite a
+        reset/ready state before the GUI event loop consumes it.
+        """
+        self.state_updated.emit(deepcopy(state))
+
+    def _stamp_current_view(self, state: ClassifierState) -> None:
+        """Attach the current acquisition generation to any emitted state."""
+        self._frame_mutex.lock()
+        try:
+            state.gun_aligned = self._gun_aligned
+            state.view_segment_id = self._view_segment_id
+            state.visual_history_generation = self._view_epoch
+        finally:
+            self._frame_mutex.unlock()
 
     # ---- Slot: runs in the sender's thread; mutex-protected write ----
     def on_rheed_state(self, camera_state: CameraState) -> None:
@@ -822,6 +861,47 @@ class ClassifierWorker(QThread):
         finally:
             self._frame_mutex.unlock()
 
+    def set_rheed_qc_state(
+        self,
+        qc_state: RheedQcState,
+        *,
+        force_reset: bool = False,
+    ) -> None:
+        """Apply an operator-known view boundary without stopping the worker.
+
+        A realignment boundary clears only pixel-coordinate-dependent state:
+        the latest frame handoff, EMA display state, and visual history count.
+        The worker/model stays loaded, while temperature and process histories
+        owned by GrowthApp/GrowthLogger are untouched.
+
+        ``force_reset`` is used at a new session or after a camera reconnect,
+        where the stable segment identifier may be unchanged but visual
+        continuity has nevertheless been interrupted.
+        """
+        self._frame_mutex.lock()
+        try:
+            changed = (
+                qc_state.gun_aligned != self._gun_aligned
+                or qc_state.view_segment_id != self._view_segment_id
+            )
+            self._gun_aligned = qc_state.gun_aligned
+            self._view_segment_id = qc_state.view_segment_id
+            if changed or force_reset:
+                requested_generation = int(
+                    qc_state.visual_history_generation
+                )
+                self._view_epoch = max(
+                    self._view_epoch + 1,
+                    requested_generation,
+                )
+                # Prevent the frame captured immediately before the boundary
+                # from being classified as part of the new segment.
+                self._latest_frame = None
+                self._latest_frame_number = -1
+                self._latest_frame_key = None
+        finally:
+            self._frame_mutex.unlock()
+
     def _create_bridge(self):
         """Factory for the ClassifierBridge. Override in tests via monkey-patch."""
         from gui.classifier_bridge import ClassifierBridge
@@ -833,7 +913,8 @@ class ClassifierWorker(QThread):
 
         # Emit initial loading state so the UI can show "Loading classifier…"
         state = ClassifierState()  # loading=True, ready=False, error=""
-        self.state_updated.emit(state)
+        self._stamp_current_view(state)
+        self._emit_classifier_state(state)
 
         # Load bridge — blocking, ~1-2 s. This is precisely why we're on our
         # own thread: the UI stays responsive during model load.
@@ -843,7 +924,28 @@ class ClassifierWorker(QThread):
             state.loading = False
             state.ready = False
             state.error = f"Failed to load classifier: {e}"
-            self.state_updated.emit(state)
+            self._stamp_current_view(state)
+            self._emit_classifier_state(state)
+            return
+
+        self._model_input_mode = str(
+            getattr(bridge, "input_mode", "single_frame")
+        )
+        # A bridge that only exposes ``classify(frame)`` must never make the
+        # GUI claim that a 32-frame GRU has warmed up.
+        temporal_runtime = bool(
+            getattr(bridge, "uses_temporal_history", False)
+        )
+        if temporal_runtime:
+            state.loading = False
+            state.ready = False
+            state.error = (
+                "Temporal bridge capability is declared but this runtime "
+                "does not provide a history inference API."
+            )
+            state.model_input_mode = self._model_input_mode
+            self._stamp_current_view(state)
+            self._emit_classifier_state(state)
             return
 
         # Derive model identity string once — filename + file mtime as
@@ -863,18 +965,76 @@ class ClassifierWorker(QThread):
         state.normalized_percent = uniform.copy()
         state.smoothed_percent = uniform.copy()
         state.model_version = self._model_version
-        self.state_updated.emit(state)
+        self._frame_mutex.lock()
+        try:
+            state.gun_aligned = self._gun_aligned
+            state.view_segment_id = self._view_segment_id
+            self._applied_view_epoch = self._view_epoch
+            state.visual_history_generation = self._view_epoch
+        finally:
+            self._frame_mutex.unlock()
+        state.history_frame_count = 0
+        state.history_required = self.HISTORY_FRAMES_REQUIRED
+        state.history_ready = False
+        state.prediction_actionable = False
+        state.model_input_mode = self._model_input_mode
+        self._emit_classifier_state(state)
 
         # Main polling loop
         while self.running:
-            # Snapshot the latest frame under mutex
+            # Snapshot the latest frame and its acquisition-side view epoch
+            # atomically.  The epoch is checked again after inference so a
+            # result started before realignment cannot leak into the new
+            # stable segment.
             self._frame_mutex.lock()
             try:
                 frame = self._latest_frame
                 frame_number = self._latest_frame_number
                 frame_key = self._latest_frame_key
+                gun_aligned = self._gun_aligned
+                view_segment_id = self._view_segment_id
+                view_epoch = self._view_epoch
             finally:
                 self._frame_mutex.unlock()
+
+            if view_epoch != self._applied_view_epoch:
+                self._applied_view_epoch = view_epoch
+                self._history_frame_count = 0
+                self._last_classified_frame_number = -1
+                self._last_classified_frame_key = None
+                self._has_confident_data = False
+                self._smoothed = {lbl: 20.0 for lbl in RECON_LABELS}
+
+                # Emit an explicit non-actionable reset state immediately.
+                # This removes stale percentages from the UI even when no
+                # post-boundary frame has arrived yet.
+                state.error = ""
+                state.last_frame_number = -1
+                state.raw_scores = {}
+                state.normalized_percent = uniform.copy()
+                state.smoothed_percent = uniform.copy()
+                state.raw_sum = 0.0
+                state.quality = 0.0
+                state.is_bad = False
+                state.bad_confidence = 0.0
+                state.is_ood = False
+                state.has_confident_data = False
+                state.inference_ms = 0.0
+                state.gun_aligned = gun_aligned
+                state.view_segment_id = view_segment_id
+                state.visual_history_generation = view_epoch
+                state.history_frame_count = 0
+                state.history_required = self.HISTORY_FRAMES_REQUIRED
+                state.history_ready = False
+                state.prediction_actionable = False
+                state.model_input_mode = self._model_input_mode
+                self._emit_classifier_state(state)
+
+            # During alignment the camera and temperature logs keep running,
+            # but image inference is intentionally frozen.
+            if gun_aligned is not True:
+                time.sleep(self.POLL_INTERVAL_S)
+                continue
 
             # Skip if no frame yet, or same frame we already classified
             if frame is None or frame_key == self._last_classified_frame_key:
@@ -893,7 +1053,8 @@ class ClassifierWorker(QThread):
                     state.error = (
                         f"Classifier failed {self._consecutive_failures}x: {e}"
                     )
-                    self.state_updated.emit(state)
+                    state.visual_history_generation = view_epoch
+                    self._emit_classifier_state(state)
                     self._consecutive_failures = 0  # reset after emitting; retry
                 time.sleep(self.POLL_INTERVAL_S)
                 continue
@@ -906,6 +1067,8 @@ class ClassifierWorker(QThread):
                 source_still_current = (
                     self._latest_frame is not None
                     and self._latest_frame_key == frame_key
+                    and self._view_epoch == view_epoch
+                    and self._gun_aligned is True
                 )
             finally:
                 self._frame_mutex.unlock()
@@ -915,6 +1078,10 @@ class ClassifierWorker(QThread):
 
             self._last_classified_frame_number = frame_number
             self._last_classified_frame_key = frame_key
+            # This bridge classifies only the current frame.  Counting calls
+            # is not equivalent to feeding a causal history into the model.
+            self._history_frame_count = 0
+            history_ready = False
 
             # Normalize via Equalizer recipe (clip → sum → divide → uniform fallback)
             scores = result.get("classification_scores", {}) or {}
@@ -949,7 +1116,15 @@ class ClassifierWorker(QThread):
             state.has_confident_data = self._has_confident_data
             state.inference_ms = inference_ms
             state.model_version = self._model_version
-            self.state_updated.emit(state)
+            state.gun_aligned = True
+            state.view_segment_id = view_segment_id
+            state.visual_history_generation = view_epoch
+            state.history_frame_count = self._history_frame_count
+            state.history_required = self.HISTORY_FRAMES_REQUIRED
+            state.history_ready = history_ready
+            state.prediction_actionable = False
+            state.model_input_mode = self._model_input_mode
+            self._emit_classifier_state(state)
 
             time.sleep(self.POLL_INTERVAL_S)
 

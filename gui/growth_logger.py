@@ -7,6 +7,7 @@ saved RHEED frames, session metadata JSON, and growth log export.
 
 import csv
 import json
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -27,6 +28,28 @@ EVENT_STATE_KEPT_EXPLICIT = "kept_explicit"
 EVENT_STATE_KEPT_DEFAULT = "kept_default"
 EVENT_STATE_DISCARDED = "discarded"
 EVENT_STATE_AUTO_SKIPPED = "auto_skipped"
+
+# Structured RHEED view/QC event types. These are deliberately separate
+# from ``manual_events.csv``: reconstruction-change marks and acquisition
+# validity transitions have different semantics and downstream consumers.
+RHEED_VIEW_EVENT_SESSION_START = "session_start"
+RHEED_VIEW_EVENT_ALIGNMENT_CONFIRMED = "alignment_confirmed"
+RHEED_VIEW_EVENT_REALIGN_START = "realign_start"
+RHEED_VIEW_EVENT_REALIGN_END = "realign_end"
+RHEED_VIEW_EVENT_HISTORY_RESET = "history_reset"
+RHEED_VIEW_EVENT_HISTORY_READY = "history_ready"
+RHEED_VIEW_EVENT_QC_REJECT = "qc_reject"
+RHEED_VIEW_EVENT_QC_PASS = "qc_pass"
+RHEED_VIEW_EVENT_TYPES = frozenset({
+    RHEED_VIEW_EVENT_SESSION_START,
+    RHEED_VIEW_EVENT_ALIGNMENT_CONFIRMED,
+    RHEED_VIEW_EVENT_REALIGN_START,
+    RHEED_VIEW_EVENT_REALIGN_END,
+    RHEED_VIEW_EVENT_HISTORY_RESET,
+    RHEED_VIEW_EVENT_HISTORY_READY,
+    RHEED_VIEW_EVENT_QC_REJECT,
+    RHEED_VIEW_EVENT_QC_PASS,
+})
 
 
 class GrowthLogger:
@@ -92,7 +115,8 @@ class GrowthLogger:
         # for the session.
         "grower_corrected",
         # Classifier lifecycle state at LOG time. Four values:
-        #   OK       — classifier ready + emitting valid classifications
+        #   OK       — classifier inference ran; use the input-mode and
+        #              actionable columns for deployment semantics
         #   LOADING  — worker up but no successful classify() yet
         #   ERROR    — worker emitted an error (missing model, bad state)
         #   DISABLED — classifier never armed for this session (config off)
@@ -103,6 +127,12 @@ class GrowthLogger:
         # the reason explicit). Yuxin's #1 pipeline reads this to
         # partition rows appropriately.
         "classifier_status",
+        # Runtime semantics needed to distinguish a successful single-frame
+        # research output from a future temporal/actionable adviser.
+        "classifier_input_mode", "classifier_prediction_actionable",
+        "classifier_view_segment_id",
+        "classifier_visual_history_generation",
+        "classifier_history_ready",
         "note", "frame_path",
         # Boolean-ish (str "True"/"False"/""). "True" when the saved
         # frame passed the frame_quality gate at LOG time; "False" when
@@ -154,6 +184,25 @@ class GrowthLogger:
         # text queued at click time. Blank otherwise (single-tap case is
         # the primary path).
         "note",
+        "capture_backend", "captured_at_utc", "capture_sequence",
+        "frame_age_ms", "source_hwnd",
+    ]
+    # Acquisition-geometry and global image-QC transitions. State columns
+    # describe the post-event state; ``frame_role`` identifies whether the
+    # optional snapshot is the pre- or post-realignment view. Keeping this
+    # in its own CSV preserves the existing manual-event schema and prevents
+    # global QC_REJECT from being confused with reconstruction-specific
+    # not_apply labels.
+    RHEED_VIEW_EVENT_FIELDS = [
+        "timestamp", "elapsed_s", "event_idx", "event_type",
+        "realignment_id",
+        "previous_view_segment_id", "view_segment_id",
+        "visual_history_generation",
+        "gun_aligned",
+        "history_frame_count", "history_required", "history_ready",
+        "qc_reject", "qc_reason", "labeler", "confidence",
+        "prediction_actionable",
+        "frame_role", "frame_path", "note",
         "capture_backend", "captured_at_utc", "capture_sequence",
         "frame_age_ms", "source_hwnd",
     ]
@@ -227,12 +276,15 @@ class GrowthLogger:
         self._set_change_writer = None
         self._manual_event_file = None
         self._manual_event_writer = None
+        self._rheed_view_event_file = None
+        self._rheed_view_event_writer = None
         self._live_label_file = None
         self._live_label_writer = None
         self._commit_counter = 0
         self._heartbeat_counter = 0
         self._set_change_counter = 0
         self._manual_event_counter = 0
+        self._rheed_view_event_counter = 0
         self._live_label_counter = 0
         self._sensor_row_counter = 0
         self._session_start: Optional[datetime] = None
@@ -306,6 +358,19 @@ class GrowthLogger:
         # header line, one flush, per session).
         self._manual_event_file.flush()
 
+        rheed_view_event_path = self._session_dir / "rheed_view_events.csv"
+        self._rheed_view_event_file = open(
+            rheed_view_event_path, "w", newline="",
+        )
+        self._rheed_view_event_writer = csv.DictWriter(
+            self._rheed_view_event_file,
+            fieldnames=self.RHEED_VIEW_EVENT_FIELDS,
+        )
+        self._rheed_view_event_writer.writeheader()
+        # Flush immediately so acquisition-state consumers can attach while
+        # the session is running, even before the first transition occurs.
+        self._rheed_view_event_file.flush()
+
         live_label_path = self._session_dir / "live_labels.csv"
         self._live_label_file = open(live_label_path, "w", newline="")
         self._live_label_writer = csv.DictWriter(
@@ -318,6 +383,7 @@ class GrowthLogger:
         self._heartbeat_counter = 0
         self._set_change_counter = 0
         self._manual_event_counter = 0
+        self._rheed_view_event_counter = 0
         self._live_label_counter = 0
         self._sensor_row_counter = 0
         self._session_start = datetime.now()
@@ -560,6 +626,130 @@ class GrowthLogger:
             **self._capture_columns(capture_metadata),
         })
         self._manual_event_file.flush()
+        return idx
+
+    def record_rheed_view_event(
+        self,
+        event_type: str,
+        elapsed_s: float,
+        *,
+        state_snapshot: Optional[Mapping[str, object]] = None,
+        realignment_id: Optional[int] = None,
+        previous_view_segment_id: Optional[int] = None,
+        frame_role: str = "",
+        frame: Optional[np.ndarray] = None,
+        note: str = "",
+        capture_metadata: Optional[dict] = None,
+        labeler: str = "",
+        confidence: str = "",
+    ) -> int:
+        """Append a structured acquisition/QC transition.
+
+        ``state_snapshot`` is the post-event acquisition state. Recognized
+        keys are ``view_segment_id``, ``visual_history_generation``,
+        ``gun_aligned``,
+        ``history_frame_count``, ``history_required``, ``history_ready``,
+        ``qc_reject``, ``qc_reason``, ``labeler``, ``confidence``, and
+        ``prediction_actionable``.
+        ``realignment_id`` and ``previous_view_segment_id`` may be passed
+        explicitly or supplied in the snapshot.
+
+        The optional frame is evidence captured at the transition boundary,
+        not an image to be discarded. ``frame_role`` should therefore say
+        what it represents (for example ``"pre_realign"`` or
+        ``"post_realign"``). Saving is best-effort, while the structured
+        event row is always written.
+
+        Returns the 1-indexed event id, or 0 when no session is active.
+        Unknown event types raise ``ValueError`` before any counter or file
+        mutation.
+        """
+        if event_type not in RHEED_VIEW_EVENT_TYPES:
+            allowed = ", ".join(sorted(RHEED_VIEW_EVENT_TYPES))
+            raise ValueError(
+                f"Unsupported RHEED view event_type {event_type!r}; "
+                f"expected one of: {allowed}"
+            )
+        if state_snapshot is None:
+            snapshot: Mapping[str, object] = {}
+        elif isinstance(state_snapshot, Mapping):
+            snapshot = state_snapshot
+        else:
+            raise TypeError("state_snapshot must be a mapping or None")
+
+        if not self._rheed_view_event_writer:
+            return 0
+
+        self._rheed_view_event_counter += 1
+        idx = self._rheed_view_event_counter
+
+        frame_path = ""
+        if frame is not None and self._session_dir is not None:
+            ts = datetime.now().strftime("%H%M%S")
+            fname = (
+                f"rheed_view_event_{idx:03d}_{event_type}_{ts}.bmp"
+            )
+            path = self._session_dir / "frames" / fname
+            try:
+                from PIL import Image
+                Image.fromarray(frame).save(str(path))
+                frame_path = str(path)
+            except ImportError:
+                try:
+                    import cv2
+                    cv2.imwrite(
+                        str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                    )
+                    frame_path = str(path)
+                except ImportError:
+                    pass
+
+        def _value(key: str) -> object:
+            value = snapshot.get(key, "")
+            if value is None:
+                return ""
+            if isinstance(value, bool):
+                return "True" if value else "False"
+            return value
+
+        realignment_value: object = realignment_id
+        if realignment_value is None:
+            realignment_value = _value("realignment_id")
+        previous_segment_value: object = previous_view_segment_id
+        if previous_segment_value is None:
+            previous_segment_value = _value("previous_view_segment_id")
+
+        self._rheed_view_event_writer.writerow({
+            "timestamp": datetime.now().isoformat(),
+            "elapsed_s": f"{elapsed_s:.2f}",
+            "event_idx": idx,
+            "event_type": event_type,
+            "realignment_id": (
+                "" if realignment_value is None else realignment_value
+            ),
+            "previous_view_segment_id": (
+                "" if previous_segment_value is None
+                else previous_segment_value
+            ),
+            "view_segment_id": _value("view_segment_id"),
+            "visual_history_generation": _value(
+                "visual_history_generation"
+            ),
+            "gun_aligned": _value("gun_aligned"),
+            "history_frame_count": _value("history_frame_count"),
+            "history_required": _value("history_required"),
+            "history_ready": _value("history_ready"),
+            "qc_reject": _value("qc_reject"),
+            "qc_reason": _value("qc_reason"),
+            "labeler": labeler or _value("labeler"),
+            "confidence": confidence or _value("confidence"),
+            "prediction_actionable": _value("prediction_actionable"),
+            "frame_role": frame_role,
+            "frame_path": frame_path,
+            "note": note,
+            **self._capture_columns(capture_metadata),
+        })
+        self._rheed_view_event_file.flush()
         return idx
 
     def record_live_label(
@@ -1069,6 +1259,7 @@ class GrowthLogger:
             "commit_entry_count": len(self._entries),
             "heartbeat_frame_count": self._heartbeat_counter,
             "manual_event_count": self._manual_event_counter,
+            "rheed_view_event_count": self._rheed_view_event_counter,
             "live_label_count": self._live_label_counter,
         }
         meta_path = self._session_dir / "session_metadata.json"
@@ -1201,6 +1392,7 @@ class GrowthLogger:
             self._sensor_file, self._commit_file,
             self._auto_capture_file, self._heartbeat_file,
             self._set_change_file, self._manual_event_file,
+            self._rheed_view_event_file,
             self._live_label_file,
         ):
             if f and not f.closed:
@@ -1217,6 +1409,8 @@ class GrowthLogger:
         self._set_change_writer = None
         self._manual_event_file = None
         self._manual_event_writer = None
+        self._rheed_view_event_file = None
+        self._rheed_view_event_writer = None
         self._live_label_file = None
         self._live_label_writer = None
         # NOTE: _session_dir and _entries intentionally preserved

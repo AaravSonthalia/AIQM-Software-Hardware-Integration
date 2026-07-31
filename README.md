@@ -41,6 +41,8 @@ Automates the growth-log workflow during an MBE growth session:
   buffers around detected reconstruction transitions.
 - **Commit log** — timestamped grower notes via the LOG ENTRY button
   capture the moment with the current sensor snapshot.
+- **RHEED view/QC log** — explicit gun-alignment boundaries, camera-history
+  resets, and one-frame acquisition-QC labels without deleting frames.
 - **Growth-log export** — auto-generated `growth_log.xlsx` at session
   end.
 
@@ -69,6 +71,8 @@ Each session creates a directory containing:
 - `commit_log.csv` — grower LOG ENTRY records with attached frame paths
 - `auto_capture_events.csv` — detector-flagged events with buffer dumps
 - `heartbeat_log.csv` — periodic-capture index
+- `rheed_view_events.csv` — alignment, visual generation, history, and
+  explicit `qc_pass`/`qc_reject` events
 - `frames/` — RHEED frame PNGs (heartbeat + per-event buffers)
 - `session_metadata.json`
 - `growth_log.xlsx` (auto-generated on STOP)

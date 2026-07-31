@@ -192,6 +192,60 @@ class ClassifierState:
     # growers can tell at a glance which model checkpoint is running.
     model_version: str = ""
 
+    # Acquisition-side RHEED view state.  These fields are deliberately
+    # separate from ``is_bad`` / ``is_ood`` above: alignment and history
+    # readiness are operator-/pipeline-known facts, while Bad/OOD are model
+    # predictions. ``None`` means that alignment has not yet been confirmed
+    # for the current session.
+    view_segment_id: Optional[int] = None
+    # Monotonic token for any reset of pixel-coordinate-dependent state.
+    # Unlike ``view_segment_id``, this also changes on a camera-continuity
+    # reset within the same stable gun alignment.
+    visual_history_generation: int = 0
+    gun_aligned: Optional[bool] = None
+    history_frame_count: int = 0
+    # Zero means that the loaded runtime bridge is single-frame-only.  The
+    # offline temporal experiments still use 32-frame causal histories.
+    history_required: int = 0
+    history_ready: bool = False
+    prediction_actionable: bool = False
+    model_input_mode: str = "unknown"
+
+
+@dataclass
+class RheedQcState:
+    """Acquisition-side validity of the current RHEED view.
+
+    ``view_segment_id`` changes only after a gun realignment is completed.
+    Images are never deleted: frames captured while ``gun_aligned`` is False
+    remain useful realignment/QC data, but must not be mixed into the visual
+    history of the next stable segment. Temperature and process histories are
+    intentionally outside this state and continue across segment boundaries.
+
+    ``history_ready=False`` is not a Bad label. It only means that a temporal
+    adviser has not yet accumulated enough same-segment visual observations.
+    """
+
+    session_active: bool = False
+    view_segment_id: Optional[int] = None
+    visual_history_generation: int = 0
+    realignment_id: int = 0
+    gun_aligned: Optional[bool] = None
+    realignment_active: bool = False
+    history_frame_count: int = 0
+    history_required: int = 0
+    history_ready: bool = False
+
+    @property
+    def prediction_actionable(self) -> bool:
+        return (
+            self.session_active
+            and self.gun_aligned is True
+            and not self.realignment_active
+            and self.history_required > 0
+            and self.history_ready
+        )
+
 
 @dataclass
 class ActionLogEntry:

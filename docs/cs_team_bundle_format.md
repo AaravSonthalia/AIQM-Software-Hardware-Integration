@@ -20,6 +20,7 @@ data for classifier training, active-comparisons pipelines
       auto_capture_events.csv  # auto-fired capture events
       manual_events.csv     # grower MARK EVENT clicks (Jul 10+)
       heartbeat_log.csv     # continuous-capture frames
+      rheed_view_events.csv # alignment, view-segment, history, and QC events
       events_labels.csv     # per-event labels (Events tab)
       live_labels.csv       # Live Equalizer save labels (Jul 10+)
       set_change_events.csv # PSU / valve setpoint changes
@@ -55,6 +56,7 @@ you want to load.
         "auto_capture_rows": 42,
         "manual_event_rows": 3,
         "heartbeat_rows": 249,
+        "rheed_view_event_rows": 7,
         "event_label_rows": 15
       },
       "quality_flags": ["real_growth", "has_labels", "long_duration",
@@ -140,7 +142,11 @@ Key columns:
 | `recon_1x1`, `recon_Twinned (2x1)`, `recon_c(6x2)`, `recon_rt13xrt13`, `recon_HTR` | float [0,100] | GROWER's slider values at commit. Sum to 100 iff `grower_corrected=True` |
 | `classifier_recon_*` | float [0,100] | CLASSIFIER's smoothed_percent — one column per class. Always populated if classifier was OK for the session |
 | `grower_corrected` | str "True"/"False"/"" | Was `✎ Correct` active? Empty = classifier disabled entirely |
-| `classifier_status` | enum | `OK` / `LOADING` / `ERROR` / `DISABLED` at commit time |
+| `classifier_status` | enum | `OK` means inference completed, not that advice is safe/actionable; other values are `LOADING` / `ERROR` / `DISABLED` |
+| `classifier_input_mode` | str | `single_frame` for the current bridge; future temporal runtimes must identify themselves |
+| `classifier_prediction_actionable` | bool-like | Runtime gate result; current single-frame research output is `False` |
+| `classifier_view_segment_id`, `classifier_visual_history_generation` | int-like | Coordinate-system and continuity identity for rejecting stale predictions |
+| `classifier_history_ready` | bool-like | True only when the loaded runtime actually consumed its required causal history |
 | `note` | str | Grower's free-text note |
 | `frame_path` | str | Absolute path to the LOG-ENTRY frame BMP (`frames/log_<n>.bmp`) |
 | `frame_quality_pass` | str "True"/"False"/"" | Did the frame pass the black/saturation/uniform gate? |
@@ -180,7 +186,31 @@ configurable). See `HEARTBEAT_FIELDS`.
 `timestamp`, `elapsed_s`, `heartbeat_idx`, `pyrometer_temp_C`,
 `frame_path`.
 
-### 2.6 `events_labels.csv`
+### 2.6 `rheed_view_events.csv`
+
+This append-only state/event stream is the source of truth for RHEED view
+continuity and independently labeled acquisition QC. Important columns are
+`event_type`, `realignment_id`, `previous_view_segment_id`,
+`view_segment_id`, `visual_history_generation`, `gun_aligned`,
+`history_frame_count`, `history_required`, `history_ready`, `qc_reject`,
+`qc_reason`, `labeler`, `confidence`, `prediction_actionable`, `frame_role`,
+and `frame_path`. `labeler` is copied from the active grower field;
+`confidence` is currently blank unless a future labeling UI supplies it.
+
+Valid event types are `session_start`, `alignment_confirmed`,
+`realign_start`, `realign_end`, `history_reset`, `history_ready`, `qc_pass`,
+and `qc_reject`. A realignment starts a new visual coordinate system only
+after `realign_end`; never join image histories across that boundary.
+`history_reset` preserves the stable segment but invalidates temporal image
+history after a camera interruption. `history_ready=False` and
+`gun_aligned=False` make advice non-actionable, but neither is a learned
+`QC_REJECT` label. Only explicit `qc_pass`/`qc_reject` rows label one frame;
+all other frames remain `UNKNOWN`.
+
+Use `RHEEDClassify/Classifier2/global_qc_data.py` to join this stream to frame
+tables, compute content hashes, and export the fail-closed global-QC dataset.
+
+### 2.7 `events_labels.csv`
 
 Grower labels applied via Events tab (post-hoc). See
 `EVENT_LABEL_FIELDS` in `gui/growth_logger.py:166-182`.
@@ -194,7 +224,7 @@ Grower labels applied via Events tab (post-hoc). See
 | `label_timestamp_iso` | ISO-8601 | When the label was applied |
 | `recon_1x1`, `recon_tw`, `recon_c6x2`, `recon_rt13`, `recon_HTR` | float [0,1] | Equalizer mixture (May 19+, if grower used Label with Equalizer) |
 
-### 2.7 `live_labels.csv` *(Jul 10+ sessions only)*
+### 2.8 `live_labels.csv` *(Jul 10+ sessions only)*
 
 Live Equalizer tab save events. See `LIVE_LABEL_FIELDS`.
 
@@ -385,6 +415,7 @@ grayscale bytes into a flat tensor so you can see the pipe.
 
 | Bundle date | Change |
 |---|---|
+| Jul 29 2026 | Added `rheed_view_events.csv` alignment/history/global-QC contract |
 | Jul 14 2026 | v1 — initial CS-team schema doc, matches AIQM commit `9125c9d` |
 
 For newer schema additions, see `gui/growth_logger.py`'s FIELDS

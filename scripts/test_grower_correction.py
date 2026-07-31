@@ -76,6 +76,13 @@ def _make_classifier_state(
         has_confident_data=has_confident_data,
         inference_ms=13.0,
         model_version=model_version,
+        view_segment_id=3,
+        visual_history_generation=7,
+        gun_aligned=True,
+        history_required=0,
+        history_ready=False,
+        prediction_actionable=False,
+        model_input_mode="single_frame",
     )
 
 
@@ -461,6 +468,15 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(entry["grower_corrected"], "False")
         # Fully-ready classifier → OK.
         self.assertEqual(entry["classifier_status"], "OK")
+        self.assertEqual(entry["classifier_input_mode"], "single_frame")
+        self.assertEqual(
+            entry["classifier_prediction_actionable"], "False"
+        )
+        self.assertEqual(entry["classifier_view_segment_id"], "3")
+        self.assertEqual(
+            entry["classifier_visual_history_generation"], "7"
+        )
+        self.assertEqual(entry["classifier_history_ready"], "False")
 
     def test_commit_correction_on_captures_both(self):
         # Classifier says Twinned; grower disagrees and says 1x1.
@@ -503,6 +519,8 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(entry["grower_corrected"], "")
         # DISABLED because _latest_classifier is None.
         self.assertEqual(entry["classifier_status"], "DISABLED")
+        self.assertEqual(entry["classifier_input_mode"], "")
+        self.assertEqual(entry["classifier_prediction_actionable"], "")
 
     def test_commit_classifier_status_error(self):
         # Worker emits an error state (e.g. missing best_model.pth).
