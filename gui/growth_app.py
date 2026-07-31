@@ -20,6 +20,12 @@ from PyQt6.QtCore import pyqtSlot, Qt, QTimer
 log = logging.getLogger(__name__)
 
 from gui.auto_capture import AutoCaptureEngine, PixelDiffChangeDetector
+from gui.equalizer_alignment import (
+    BasisBundle,
+    CalibrationRecord,
+    RheedFrameSnapshot,
+    calibration_is_stale,
+)
 from gui.growth_logger import (
     EVENT_STATE_AUTO_SKIPPED,
     EVENT_STATE_DISCARDED,
@@ -169,8 +175,20 @@ class GrowthApp(QMainWindow):
         self._rheed_qc_state = RheedQcState(
             history_required=ClassifierWorker.HISTORY_FRAMES_REQUIRED,
         )
+        # Accepted Equalizer calibration is app-owned.  The tab may edit a
+        # candidate, but logging and lifecycle transitions always consult this
+        # single record so a stale UI object cannot authorize a Save.
+        self._equalizer_calibration: Optional[CalibrationRecord] = None
+        self._retrospective_equalizer_calibrations: dict[
+            str, CalibrationRecord
+        ] = {}
         self._camera_capture_interrupted = False
         self._realign_start_capture_token: Optional[tuple] = None
+        self._last_heartbeat_capture_token: Optional[tuple] = None
+        # Set before any shutdown work begins.  A close can be refused while a
+        # native worker is still exiting, so queued worker signals must remain
+        # fail-closed even though the main window is still alive.
+        self._shutdown_pending = False
         self.growth_log = GrowthLogger()
 
         # Periodic sensor logging timer (1 second interval while running)
@@ -259,6 +277,21 @@ class GrowthApp(QMainWindow):
         # cache.
         self.monitor.live_equalizer_tab.live_label_save_requested.connect(
             self._on_live_label_save,
+        )
+        self.monitor.live_equalizer_tab.calibration_accept_requested.connect(
+            self._on_equalizer_calibration_accept,
+        )
+        self.monitor.live_equalizer_tab.calibration_invalidation_requested.connect(
+            self._on_equalizer_calibration_invalidation,
+        )
+        self.monitor.events_tab.retrospective_calibration_accept_requested.connect(
+            self._on_retrospective_calibration_accept,
+        )
+        self.monitor.events_tab.retrospective_calibration_invalidation_requested.connect(
+            self._on_retrospective_calibration_invalidation,
+        )
+        self.monitor.events_tab.retrospective_calibration_resolve_requested.connect(
+            self._on_retrospective_calibration_resolve,
         )
         self.monitor.auto_capture_pause_toggled.connect(
             self._on_auto_capture_pause_toggled,
@@ -456,18 +489,41 @@ class GrowthApp(QMainWindow):
     @pyqtSlot()
     def _on_start(self):
         """Begin a growth session — start logging."""
+        if self._equalizer_calibration is not None:
+            self._invalidate_equalizer_calibration(
+                "new session started before prior calibration was cleared",
+            )
+        self._retrospective_equalizer_calibrations.clear()
+
         # Apply config panel settings
         save_path = self.monitor.config_save_path.text().strip()
         prefix = self.monitor.config_prefix.text().strip()
         if save_path:
-            self.growth_log._base_dir = resolve_workspace_folder(save_path)
+            configured_root = resolve_workspace_folder(save_path)
+            try:
+                recovered = self.growth_log.set_base_dir(configured_root)
+            except (OSError, RuntimeError, ValueError) as exc:
+                recovered = False
+                log.error("Could not apply Growth Monitor log root: %s", exc)
+            if not recovered:
+                self.statusBar().showMessage(
+                    "START blocked: an interrupted Live-label transaction "
+                    "under the configured log root needs inspection.",
+                    9000,
+                )
+                return
         if prefix:
             self.growth_log._filename_prefix = prefix
 
         sample_id = self.monitor.sample_id_input.text().strip() or "unnamed"
         self.growth_log.start_session(sample_id)
+        session_dir = self.growth_log.session_dir
+        self.monitor.live_equalizer_tab.set_session_id(
+            session_dir.name if session_dir is not None else "",
+        )
         self._camera_capture_interrupted = False
         self._realign_start_capture_token = None
+        self._last_heartbeat_capture_token = None
 
         # Fail closed at every session boundary: a grower must confirm the
         # initial stable view before temporal advice becomes actionable.
@@ -600,6 +656,8 @@ class GrowthApp(QMainWindow):
         # Auto-export growth log before closing session files
         path = self.growth_log.export_growth_log(metadata)
 
+        # Journal the invalidation while the session files are still open.
+        self._invalidate_equalizer_calibration("session ended")
         self.growth_log.end_session()
 
         stopped_qc = replace(
@@ -713,6 +771,29 @@ class GrowthApp(QMainWindow):
                     self._rheed_qc_state.visual_history_generation + 1
                 ),
             )
+        if self._equalizer_calibration is not None:
+            metadata = self.monitor.get_current_capture_metadata()
+            stale, reason = calibration_is_stale(
+                self._equalizer_calibration,
+                source_hwnd=int(metadata.get("source_hwnd") or 0),
+                camera_width=int(metadata.get("camera_width") or 0),
+                camera_height=int(metadata.get("camera_height") or 0),
+                capture_backend=str(metadata.get("capture_backend") or ""),
+                capture_geometry_id=str(
+                    metadata.get("capture_geometry_id") or ""
+                ),
+                view_segment_id=state.view_segment_id,
+                visual_history_generation=state.visual_history_generation,
+                session_id=self._equalizer_session_id(),
+                basis_bundle_id=(
+                    self.monitor.live_equalizer_tab.get_basis_bundle_id()
+                ),
+                gun_aligned=state.gun_aligned is True,
+                realignment_active=state.realignment_active,
+                session_active=state.session_active,
+            )
+            if stale:
+                self._invalidate_equalizer_calibration(reason)
         self._rheed_qc_state = state
         self.monitor.update_rheed_qc_state(state)
         if self.classifier_worker and self.classifier_worker.isRunning():
@@ -720,6 +801,537 @@ class GrowthApp(QMainWindow):
                 state,
                 force_reset=reset_visual_history,
             )
+
+    def _equalizer_session_id(self) -> str:
+        session_dir = self.growth_log.session_dir
+        return session_dir.name if session_dir is not None else ""
+
+    def _current_auto_capture_metadata(self) -> dict:
+        """Bind each buffered frame to its session, basis, and calibration."""
+        metadata = self.monitor.get_current_capture_metadata()
+        session_id = self._equalizer_session_id()
+        if session_id:
+            metadata["session_id"] = session_id
+        basis_bundle_id = self.monitor.live_equalizer_tab.get_basis_bundle_id()
+        if basis_bundle_id:
+            metadata["basis_bundle_id"] = basis_bundle_id
+        if self._equalizer_calibration is not None:
+            metadata["calibration_id"] = (
+                self._equalizer_calibration.calibration_id
+            )
+        return metadata
+
+    def _invalidate_equalizer_calibration(self, reason: str) -> bool:
+        """Invalidate the app-owned record and append its lifecycle event."""
+        calibration = self._equalizer_calibration
+        if calibration is None:
+            return True
+        reason = reason.strip() or "calibration invalidated"
+        journaled = False
+        try:
+            journaled = bool(
+                self.growth_log.record_calibration_invalidation(
+                    calibration,
+                    reason,
+                )
+            )
+        except (TypeError, ValueError, OSError) as exc:
+            log.error("Equalizer invalidation journal write failed: %s", exc)
+        self._equalizer_calibration = None
+        self.monitor.live_equalizer_tab.invalidate_calibration(
+            reason,
+            emit=False,
+        )
+        if not journaled:
+            log.critical(
+                "Equalizer calibration %s was cleared in memory but its "
+                "invalidation was not durably journaled",
+                calibration.calibration_id,
+            )
+            self.statusBar().showMessage(
+                "Equalizer provenance journal failed; calibration reuse is blocked.",
+                7000,
+            )
+        return journaled
+
+    @pyqtSlot(object)
+    def _on_equalizer_calibration_accept(self, pending: object) -> None:
+        """Validate, persist, and activate one grower-reviewed candidate."""
+        if not isinstance(pending, CalibrationRecord):
+            self.statusBar().showMessage(
+                "Equalizer rejected an invalid calibration payload.", 4000,
+            )
+            return
+        qc = self._rheed_qc_state
+        if (
+            not self.growth_log.active
+            or not qc.session_active
+            or qc.gun_aligned is not True
+            or qc.realignment_active
+        ):
+            self.monitor.live_equalizer_tab.invalidate_calibration(
+                "A running, gun-aligned session is required",
+                emit=False,
+            )
+            self.statusBar().showMessage(
+                "Confirm a stable RHEED view before accepting calibration.",
+                4000,
+            )
+            return
+
+        metadata = self.monitor.get_current_capture_metadata()
+        evidence_snapshot = (
+            self.monitor.live_equalizer_tab.get_calibration_snapshot()
+        )
+        evidence_kind = (
+            self.monitor.live_equalizer_tab.get_handedness_evidence_kind()
+        )
+        if evidence_snapshot is None or not evidence_kind:
+            self.monitor.live_equalizer_tab.invalidate_calibration(
+                "handedness evidence was not explicitly confirmed",
+                emit=False,
+            )
+            self.statusBar().showMessage(
+                "Confirm asymmetric handedness evidence before acceptance.",
+                5000,
+            )
+            return
+        basis_bundle = self.monitor.live_equalizer_tab.get_basis_bundle()
+        basis_bundle_id = (
+            basis_bundle.bundle_id
+            if isinstance(basis_bundle, BasisBundle)
+            else ""
+        )
+        if not basis_bundle_id or basis_bundle_id != pending.basis_bundle_id:
+            self.monitor.live_equalizer_tab.invalidate_calibration(
+                "canonical basis bundle unavailable or mismatched",
+                emit=False,
+            )
+            self.statusBar().showMessage(
+                "Calibration cannot be accepted without a canonical basis.",
+                5000,
+            )
+            return
+        stale, reason = calibration_is_stale(
+            pending,
+            source_hwnd=int(metadata.get("source_hwnd") or 0),
+            camera_width=int(metadata.get("camera_width") or 0),
+            camera_height=int(metadata.get("camera_height") or 0),
+            capture_backend=str(metadata.get("capture_backend") or ""),
+            capture_geometry_id=str(
+                metadata.get("capture_geometry_id") or ""
+            ),
+            view_segment_id=qc.view_segment_id,
+            visual_history_generation=qc.visual_history_generation,
+            session_id=self._equalizer_session_id(),
+            basis_bundle_id=basis_bundle_id,
+            gun_aligned=qc.gun_aligned is True,
+            realignment_active=qc.realignment_active,
+            session_active=True,
+        )
+        if stale:
+            self.monitor.live_equalizer_tab.invalidate_calibration(
+                reason,
+                emit=False,
+            )
+            self.statusBar().showMessage(
+                f"Calibration became stale before acceptance: {reason}",
+                5000,
+            )
+            return
+
+        try:
+            accepted = pending.accepted(
+                accepted_by=self.monitor.grower_input.text().strip(),
+                orientation_evidence_sha256=(
+                    evidence_snapshot.orientation_evidence_sha256()
+                ),
+                orientation_evidence_kind=evidence_kind,
+            )
+        except (TypeError, ValueError, OSError) as exc:
+            self.monitor.live_equalizer_tab.invalidate_calibration(
+                f"orientation evidence invalid: {exc}",
+                emit=False,
+            )
+            self.statusBar().showMessage(
+                f"Calibration evidence rejected: {exc}", 5000,
+            )
+            return
+        if self._equalizer_calibration is not None:
+            invalidated = self._invalidate_equalizer_calibration(
+                "superseded by a newly accepted calibration",
+            )
+            if not invalidated:
+                self.monitor.live_equalizer_tab.invalidate_calibration(
+                    "prior calibration invalidation was not journaled",
+                    emit=False,
+                )
+                return
+        try:
+            recorded = self.growth_log.record_calibration(
+                accepted,
+                evidence_snapshot=evidence_snapshot,
+                basis_bundle=basis_bundle,
+            )
+        except (TypeError, ValueError, OSError) as exc:
+            log.warning("Equalizer calibration journal rejected record: %s", exc)
+            recorded = False
+        if not recorded:
+            self.monitor.live_equalizer_tab.invalidate_calibration(
+                "calibration journal write failed",
+                emit=False,
+            )
+            self.statusBar().showMessage(
+                "Calibration was not activated because provenance could not be saved.",
+                5000,
+            )
+            return
+        if not self.monitor.live_equalizer_tab.set_accepted_calibration(accepted):
+            try:
+                invalidated = self.growth_log.record_calibration_invalidation(
+                    accepted,
+                    "GUI activation failed after journal write",
+                )
+            except (TypeError, ValueError, OSError):
+                invalidated = False
+            if not invalidated:
+                log.critical(
+                    "Accepted calibration %s could not be invalidated after "
+                    "GUI activation failure",
+                    accepted.calibration_id,
+                )
+            self.statusBar().showMessage(
+                "Calibration failed compatibility checks; recalibrate.", 5000,
+            )
+            return
+        self._equalizer_calibration = accepted
+        self.statusBar().showMessage(
+            f"Equalizer calibrated ({accepted.parity}, "
+            f"max residual {accepted.max_residual_px:.2f} px)",
+            4000,
+        )
+
+    @pyqtSlot(str)
+    def _on_equalizer_calibration_invalidation(self, reason: str) -> None:
+        self._invalidate_equalizer_calibration(reason)
+
+    def _fail_retrospective_calibration_acceptance(
+        self,
+        request_token: str,
+        reason: str,
+    ) -> None:
+        log.warning("Retrospective Equalizer calibration rejected: %s", reason)
+        self.monitor.events_tab.fail_retrospective_calibration_acceptance(
+            request_token,
+            reason,
+        )
+        self.statusBar().showMessage(
+            f"Retrospective calibration rejected: {reason}", 6000,
+        )
+
+    def _fail_retrospective_calibration_resolution(
+        self,
+        request_token: str,
+        reason: str,
+    ) -> None:
+        log.warning("Historical Equalizer calibration lookup rejected: %s", reason)
+        self.monitor.events_tab.fail_retrospective_calibration_resolution(
+            request_token,
+            reason,
+        )
+        self.statusBar().showMessage(
+            f"Historical calibration lookup rejected: {reason}", 6000,
+        )
+
+    @pyqtSlot(object)
+    def _on_retrospective_calibration_resolve(self, payload: object) -> None:
+        """Resolve historical records without giving Events journal ownership."""
+        if not isinstance(payload, dict):
+            log.warning("Historical calibration lookup was not a mapping")
+            return
+        request_token = str(payload.get("request_token") or "")
+        raw_ids = payload.get("calibration_ids")
+        snapshot = payload.get("snapshot")
+        basis_bundle_id = str(payload.get("basis_bundle_id") or "")
+        basis_bundle = payload.get("basis_bundle")
+        main_basis_bundle = self.monitor.live_equalizer_tab.get_basis_bundle()
+        if isinstance(raw_ids, (tuple, list)):
+            calibration_ids = tuple(str(value or "").strip() for value in raw_ids)
+        else:
+            calibration_ids = ()
+        if (
+            not request_token
+            or payload.get("retrospective") is not True
+            or not isinstance(snapshot, RheedFrameSnapshot)
+            or not snapshot.retrospective
+            or not basis_bundle_id
+            or not isinstance(basis_bundle, BasisBundle)
+            or basis_bundle.bundle_id != basis_bundle_id
+            or not isinstance(main_basis_bundle, BasisBundle)
+            or main_basis_bundle.bundle_id != basis_bundle.bundle_id
+            or not calibration_ids
+            or len(calibration_ids) > 2
+            or any(not value for value in calibration_ids)
+            or len(set(calibration_ids)) != len(calibration_ids)
+        ):
+            self._fail_retrospective_calibration_resolution(
+                request_token,
+                "invalid or incomplete app-owned historical lookup request",
+            )
+            return
+
+        session_id = self._equalizer_session_id()
+        if (
+            self.growth_log.session_dir is None
+            or snapshot.session_id != session_id
+        ):
+            self._fail_retrospective_calibration_resolution(
+                request_token,
+                "the historical frame is not bound to the attached session",
+            )
+            return
+
+        selected = None
+        lookup_error = ""
+        historical_getter = getattr(
+            self.growth_log, "get_historical_calibration", None,
+        )
+        for calibration_id in calibration_ids:
+            candidate = self._retrospective_equalizer_calibrations.get(
+                calibration_id,
+            )
+            if candidate is None and historical_getter is not None:
+                try:
+                    candidate = historical_getter(calibration_id)
+                except (OSError, TypeError, ValueError) as exc:
+                    lookup_error = str(exc)
+                    break
+            if not isinstance(candidate, CalibrationRecord):
+                continue
+            if candidate.calibration_id != calibration_id:
+                continue
+            stale, _reason = calibration_is_stale(
+                candidate,
+                source_hwnd=snapshot.source_hwnd,
+                camera_width=snapshot.camera_width,
+                camera_height=snapshot.camera_height,
+                capture_backend=snapshot.capture_backend,
+                capture_geometry_id=snapshot.capture_geometry_id,
+                view_segment_id=snapshot.view_segment_id,
+                visual_history_generation=snapshot.visual_history_generation,
+                session_id=session_id,
+                basis_bundle_id=basis_bundle_id,
+                gun_aligned=snapshot.gun_aligned,
+                realignment_active=snapshot.realignment_active,
+                session_active=True,
+            )
+            if stale or not candidate.grower_accepted:
+                continue
+            selected = candidate
+            break
+
+        if lookup_error:
+            self._fail_retrospective_calibration_resolution(
+                request_token,
+                f"calibration journal lookup failed: {lookup_error}",
+            )
+            return
+        if selected is None:
+            self.monitor.events_tab.complete_retrospective_calibration_resolution(
+                request_token,
+                None,
+                "No compatible app-owned calibration was found.",
+            )
+            return
+        if not self.monitor.events_tab.complete_retrospective_calibration_resolution(
+            request_token,
+            selected,
+        ):
+            self._fail_retrospective_calibration_resolution(
+                request_token,
+                "Events rejected the app-owned historical calibration",
+            )
+            return
+        self._retrospective_equalizer_calibrations[
+            selected.calibration_id
+        ] = selected
+        self.statusBar().showMessage(
+            f"Historical Equalizer calibration {selected.calibration_id} activated",
+            5000,
+        )
+
+    @pyqtSlot(object)
+    def _on_retrospective_calibration_accept(self, payload: object) -> None:
+        """Own, validate, journal, then activate an Events calibration."""
+        if not isinstance(payload, dict):
+            log.warning("Retrospective calibration request was not a mapping")
+            return
+        request_token = str(payload.get("request_token") or "")
+        pending = payload.get("pending")
+        snapshot = payload.get("snapshot")
+        evidence_kind = str(payload.get("evidence_kind") or "")
+        basis_bundle = payload.get("basis_bundle")
+        main_basis_bundle = self.monitor.live_equalizer_tab.get_basis_bundle()
+        if (
+            not request_token
+            or payload.get("retrospective") is not True
+            or payload.get("evidence_confirmed") is not True
+            or not isinstance(pending, CalibrationRecord)
+            or not isinstance(snapshot, RheedFrameSnapshot)
+            or not snapshot.retrospective
+            or not evidence_kind
+            or not isinstance(basis_bundle, BasisBundle)
+            or basis_bundle.bundle_id != pending.basis_bundle_id
+            or not isinstance(main_basis_bundle, BasisBundle)
+            or main_basis_bundle.bundle_id != basis_bundle.bundle_id
+            or pending.grower_accepted
+            or bool(pending.invalidated_reason)
+        ):
+            self._fail_retrospective_calibration_acceptance(
+                request_token,
+                "invalid or incomplete app-owned acceptance request",
+            )
+            return
+
+        session_id = self._equalizer_session_id()
+        stale, reason = calibration_is_stale(
+            pending,
+            source_hwnd=snapshot.source_hwnd,
+            camera_width=snapshot.camera_width,
+            camera_height=snapshot.camera_height,
+            capture_backend=snapshot.capture_backend,
+            capture_geometry_id=snapshot.capture_geometry_id,
+            view_segment_id=snapshot.view_segment_id,
+            visual_history_generation=snapshot.visual_history_generation,
+            session_id=session_id,
+            basis_bundle_id=basis_bundle.bundle_id,
+            gun_aligned=snapshot.gun_aligned,
+            realignment_active=snapshot.realignment_active,
+            session_active=(
+                self.growth_log.session_dir is not None
+                and snapshot.session_id == session_id
+            ),
+        )
+        if stale or not snapshot.gun_aligned or snapshot.realignment_active:
+            self._fail_retrospective_calibration_acceptance(
+                request_token,
+                reason or "historical frame lacks stable RHEED QC provenance",
+            )
+            return
+
+        try:
+            accepted = pending.accepted(
+                accepted_by=(
+                    self.monitor.grower_input.text().strip()
+                    or "events-retrospective"
+                ),
+                orientation_evidence_sha256=(
+                    snapshot.orientation_evidence_sha256()
+                ),
+                orientation_evidence_kind=evidence_kind,
+            )
+            recorded = self.growth_log.record_calibration(
+                accepted,
+                evidence_snapshot=snapshot,
+                basis_bundle=basis_bundle,
+            )
+        except (TypeError, ValueError, OSError) as exc:
+            recorded = False
+            reason = str(exc)
+        if not recorded:
+            self._fail_retrospective_calibration_acceptance(
+                request_token,
+                reason or "calibration journal/evidence write failed",
+            )
+            return
+
+        if not self.monitor.events_tab.complete_retrospective_calibration_acceptance(
+            request_token,
+            accepted,
+        ):
+            try:
+                invalidated = self.growth_log.record_calibration_invalidation(
+                    accepted,
+                    "Events panel activation failed after journal write",
+                )
+            except (TypeError, ValueError, OSError):
+                invalidated = False
+            if not invalidated:
+                log.critical(
+                    "Retrospective calibration %s could not be invalidated",
+                    accepted.calibration_id,
+                )
+            self._fail_retrospective_calibration_acceptance(
+                request_token,
+                "Events panel rejected the journaled calibration",
+            )
+            return
+
+        self._retrospective_equalizer_calibrations[
+            accepted.calibration_id
+        ] = accepted
+        self.statusBar().showMessage(
+            f"Retrospective Equalizer calibration {accepted.calibration_id} accepted",
+            5000,
+        )
+
+    @pyqtSlot(object)
+    def _on_retrospective_calibration_invalidation(
+        self,
+        payload: object,
+    ) -> None:
+        """Journal a popup calibration invalidation before confirming it."""
+        if not isinstance(payload, dict):
+            return
+        request_token = str(payload.get("request_token") or "")
+        calibration = payload.get("calibration")
+        reason = str(
+            payload.get("reason") or "retrospective calibration invalidated"
+        )
+        if (
+            not request_token
+            or payload.get("retrospective") is not True
+            or not isinstance(calibration, CalibrationRecord)
+        ):
+            self.monitor.events_tab.fail_retrospective_calibration_invalidation(
+                request_token,
+                "invalid app-owned invalidation request",
+            )
+            return
+        owned = self._retrospective_equalizer_calibrations.get(
+            calibration.calibration_id,
+        )
+        if owned is not calibration:
+            self.monitor.events_tab.fail_retrospective_calibration_invalidation(
+                request_token,
+                "calibration is not owned by GrowthApp",
+            )
+            return
+        try:
+            journaled = self.growth_log.record_calibration_invalidation(
+                owned,
+                reason,
+            )
+        except (TypeError, ValueError, OSError) as exc:
+            journaled = False
+            reason = str(exc)
+        if not journaled:
+            self.monitor.events_tab.fail_retrospective_calibration_invalidation(
+                request_token,
+                reason or "calibration invalidation journal write failed",
+            )
+            self.statusBar().showMessage(
+                "Retrospective calibration invalidation was not journaled.",
+                6000,
+            )
+            return
+        self._retrospective_equalizer_calibrations.pop(
+            calibration.calibration_id,
+            None,
+        )
+        self.monitor.events_tab.complete_retrospective_calibration_invalidation(
+            request_token,
+        )
 
     def _record_rheed_view_event(
         self,
@@ -972,29 +1584,63 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_live_label_save(self, weights: dict):
-        """Snapshot current sensor state + write a live_labels.csv row.
-
-        Frame comes from the LiveEqualizerTab's own cache
-        (``get_current_full_frame``) rather than ``monitor.get_current_frame``
-        — the tab-cached frame is what the grower was actually looking at
-        while balancing sliders, which is the training-signal ground
-        truth. Difference is usually one frame either way (~30-500 ms).
-
-        No-ops when there's no live frame (grower opened the tab pre-
-        session and hit Save). PSU + pyro snapshot pattern mirrors
-        ``_on_manual_event`` for consistency across the three label
-        surfaces (LOG ENTRY / MARK EVENT / Live Equalizer).
-        """
+        """Write one label bound to the tab's immutable camera snapshot."""
         if not self.growth_log.active:
             self.statusBar().showMessage(
                 "Start a session before saving live labels.", 3000,
             )
             return
-
-        frame = self.monitor.live_equalizer_tab.get_current_full_frame()
-        capture_metadata = (
-            self.monitor.live_equalizer_tab.get_current_capture_metadata()
+        calibration = self._equalizer_calibration
+        snapshot = self.monitor.live_equalizer_tab.get_current_snapshot()
+        qc = self._rheed_qc_state
+        if calibration is None or snapshot is None:
+            self.statusBar().showMessage(
+                "Accept a camera calibration on a fresh RHEED frame first.",
+                4000,
+            )
+            return
+        if (
+            not qc.session_active
+            or qc.gun_aligned is not True
+            or qc.realignment_active
+        ):
+            self._invalidate_equalizer_calibration(
+                "RHEED view is not in a stable aligned state",
+            )
+            self.statusBar().showMessage(
+                "Live label rejected: confirm a stable gun alignment.", 4000,
+            )
+            return
+        frame_age_ms = snapshot.age_ms()
+        if frame_age_ms > RHEED_EVENT_MAX_FRAME_AGE_MS:
+            self.statusBar().showMessage(
+                f"Live label rejected: RHEED frame is stale ({frame_age_ms:.0f} ms).",
+                4000,
+            )
+            return
+        stale, reason = calibration_is_stale(
+            calibration,
+            source_hwnd=snapshot.source_hwnd,
+            camera_width=snapshot.camera_width,
+            camera_height=snapshot.camera_height,
+            capture_backend=snapshot.capture_backend,
+            capture_geometry_id=snapshot.capture_geometry_id,
+            view_segment_id=qc.view_segment_id,
+            visual_history_generation=qc.visual_history_generation,
+            session_id=self._equalizer_session_id(),
+            basis_bundle_id=(
+                self.monitor.live_equalizer_tab.get_basis_bundle_id()
+            ),
+            gun_aligned=qc.gun_aligned is True,
+            realignment_active=qc.realignment_active,
+            session_active=qc.session_active,
         )
+        if stale:
+            self._invalidate_equalizer_calibration(reason)
+            self.statusBar().showMessage(
+                f"Live label rejected: {reason}", 4000,
+            )
+            return
 
         # PSU snapshot — identical priority to _on_manual_event: mistral
         # first (current O-MBE topology), direct-read next.
@@ -1018,16 +1664,23 @@ class GrowthApp(QMainWindow):
         if pyro is not None and pyro.connected:
             pyro_temp = pyro.temperature
 
-        idx = self.growth_log.record_live_label(
-            elapsed_s=self.monitor.get_elapsed_seconds(),
-            weights=weights,
-            frame=frame,
-            pyro_temp=pyro_temp,
-            voltage_V=voltage_v,
-            current_A=current_a,
-            psu_source=psu_source,
-            capture_metadata=capture_metadata,
-        )
+        try:
+            idx = self.growth_log.record_live_label(
+                elapsed_s=self.monitor.get_elapsed_seconds(),
+                weights=weights,
+                calibration=calibration,
+                snapshot=snapshot,
+                pyro_temp=pyro_temp,
+                voltage_V=voltage_v,
+                current_A=current_a,
+                psu_source=psu_source,
+            )
+        except (TypeError, ValueError, OSError) as exc:
+            log.warning("Live Equalizer label rejected: %s", exc)
+            self.statusBar().showMessage(
+                f"Live label rejected: {exc}", 5000,
+            )
+            return
         if idx > 0:
             self.statusBar().showMessage(
                 f"Live label #{idx} saved", 3000,
@@ -1328,12 +1981,16 @@ class GrowthApp(QMainWindow):
                         "Auto-capture: armed (warmup after camera reconnect)"
                     )
 
-        # Feed the auto-capture engine. Engine internally guards on `enabled`,
-        # so this is a no-op outside an active session.
-        if state.frame is not None and state.connected:
+        # ``enabled`` is only one layer of the gate: an explicit active-session
+        # check prevents stale UI/QC state from feeding the engine after STOP.
+        if (
+            self.growth_log.active
+            and state.frame is not None
+            and state.connected
+        ):
             self.auto_capture_engine.evaluate(
                 state.frame,
-                self.monitor.get_current_capture_metadata(),
+                self._current_auto_capture_metadata(),
             )
             if self.auto_capture_engine.enabled:
                 self.monitor.set_auto_capture_status(
@@ -1356,6 +2013,25 @@ class GrowthApp(QMainWindow):
         if frame is None:
             return
         capture_metadata = self.monitor.get_current_capture_metadata()
+        try:
+            capture_sequence = int(
+                capture_metadata.get("capture_sequence") or 0
+            )
+        except (TypeError, ValueError):
+            return
+        captured_at_utc = str(
+            capture_metadata.get("captured_at_utc") or ""
+        )
+        if capture_sequence <= 0 and not captured_at_utc:
+            return
+        capture_token = (
+            str(capture_metadata.get("capture_backend") or ""),
+            int(capture_metadata.get("source_hwnd") or 0),
+            capture_sequence,
+            captured_at_utc,
+        )
+        if capture_token == self._last_heartbeat_capture_token:
+            return
         path = self.growth_log.save_heartbeat_frame(frame)
         if not path:
             return  # Quality gate rejected, or save failed
@@ -1370,6 +2046,7 @@ class GrowthApp(QMainWindow):
             frame_path=path,
             capture_metadata=capture_metadata,
         )
+        self._last_heartbeat_capture_token = capture_token
         # Bump the Monitor-tab footer counter only after a successful
         # save — a quality-gated skip must not inflate the display,
         # otherwise the count drifts from the frames on disk that the

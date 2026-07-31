@@ -22,13 +22,54 @@ where a kSA tooltip appeared inside a captured RHEED frame).
 import logging
 import threading
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
 from drivers.window_capture import CapturedFrame, WindowsGraphicsCapture
 
 log = logging.getLogger(__name__)
+
+
+_DEFAULT_WINDOW_DPI = 96
+
+
+def _window_dpi_identity(
+    hwnd: int,
+    dpi_provider: Optional[Callable[[int], int]] = None,
+) -> str:
+    """Return a stable, fail-safe DPI identity for one top-level window.
+
+    Production uses ``GetDpiForWindow``.  The injected provider keeps the
+    behavior deterministic in platform-independent tests.  An unavailable,
+    failing, or zero-returning API is represented explicitly as a 96-DPI
+    fallback instead of being confused with a successful native reading.
+    """
+    dpi = 0
+    source = "fallback"
+    try:
+        if dpi_provider is not None:
+            dpi = int(dpi_provider(int(hwnd)))
+            source = "getdpiforwindow"
+        else:
+            import sys
+
+            if sys.platform == "win32" and int(hwnd) > 0:
+                import ctypes
+                import ctypes.wintypes
+
+                get_dpi = getattr(ctypes.windll.user32, "GetDpiForWindow")
+                get_dpi.argtypes = [ctypes.wintypes.HWND]
+                get_dpi.restype = ctypes.wintypes.UINT
+                dpi = int(get_dpi(ctypes.wintypes.HWND(int(hwnd))))
+                source = "getdpiforwindow"
+    except Exception:
+        dpi = 0
+        source = "fallback"
+    if dpi <= 0:
+        dpi = _DEFAULT_WINDOW_DPI
+        source = "fallback"
+    return f"dpi-{source}-{dpi}"
 
 
 def _configure_rheed_user32_argtypes() -> None:
@@ -444,6 +485,7 @@ class ScreenGrabCamera(RheedCamera):
         first_frame_timeout_s: float = 5.0,
         stale_timeout_s: float = 5.0,
         capture_factory=None,
+        dpi_provider: Optional[Callable[[int], int]] = None,
     ):
         if backend not in {"wgc", "mss"}:
             raise ValueError("backend must be 'wgc' or 'mss'")
@@ -454,9 +496,12 @@ class ScreenGrabCamera(RheedCamera):
         self._crop_chrome = crop_chrome
         self._chrome_top_px = chrome_top_px
         self._chrome_bottom_px = chrome_bottom_px
+        self._last_crop_status = "disabled" if not crop_chrome else "unobserved"
         self._first_frame_timeout_s = first_frame_timeout_s
         self._stale_timeout_s = stale_timeout_s
         self._capture_factory = capture_factory
+        self._dpi_provider = dpi_provider
+        self._wgc_dpi_identity = f"dpi-fallback-{_DEFAULT_WINDOW_DPI}"
         self._capture_session: Optional[WindowsGraphicsCapture] = None
         self._last_capture: Optional[CapturedFrame] = None
         self._consecutive_fails = 0
@@ -666,9 +711,15 @@ class ScreenGrabCamera(RheedCamera):
                 session.close()
                 raise
             self._capture_session = session
-            self._last_capture = first.with_image(
-                self._crop_chrome_pixels(first.image)
-            )
+            cropped = self._crop_chrome_pixels(first.image)
+            try:
+                self._require_effective_crop()
+            except RuntimeError:
+                session.close()
+                self._capture_session = None
+                raise
+            self._last_capture = first.with_image(cropped)
+            self._refresh_wgc_dpi_identity(hwnd)
             self._capture_method = "wgc"
             return
 
@@ -693,7 +744,9 @@ class ScreenGrabCamera(RheedCamera):
                     raise RuntimeError("WGC capture session is not initialized.")
                 sample = self._capture_session.read_latest()
                 cropped = self._crop_chrome_pixels(sample.image)
+                self._require_effective_crop()
                 self._last_capture = sample.with_image(cropped)
+                self._refresh_wgc_dpi_identity(sample.source_hwnd)
             else:
                 if sys.platform == "win32":
                     frame = self._grab_win32()
@@ -779,13 +832,24 @@ class ScreenGrabCamera(RheedCamera):
         unchanged rather than producing an empty array.
         """
         if not self._crop_chrome:
+            self._last_crop_status = "disabled"
             return frame
         h = frame.shape[0]
         top = max(0, self._chrome_top_px)
         bottom = h - max(0, self._chrome_bottom_px)
         if bottom <= top:
+            self._last_crop_status = "fallback-full"
             return frame
+        self._last_crop_status = "applied"
         return frame[top:bottom, :]
+
+    def _require_effective_crop(self) -> None:
+        """Reject WGC frames when configured chrome removal could not run."""
+        if self._crop_chrome and self._last_crop_status != "applied":
+            raise RuntimeError(
+                "kSA chrome crop is invalid for the captured window size; "
+                "restore/re-size Live Video and recalibrate"
+            )
 
     def _grab_win32(self) -> np.ndarray:
         """Capture kSA Live Video window on Windows using win32 + mss."""
@@ -871,6 +935,25 @@ class ScreenGrabCamera(RheedCamera):
         """Latest returned frame and its atomic capture provenance."""
         return self._last_capture
 
+    @property
+    def capture_geometry_id(self) -> str:
+        """Stable identity for the crop policy applied to returned frames."""
+        crop_identity = (
+            f"ksa-chrome-v2:{int(self._crop_chrome)}:"
+            f"{int(self._chrome_top_px)}:{int(self._chrome_bottom_px)}:"
+            f"{self._last_crop_status}"
+        )
+        # Keep the explicit legacy mss identifier byte-for-byte compatible.
+        # WGC needs DPI in its identity because the fixed kSA chrome crop is
+        # measured in physical pixels and can shift across DPI contexts.
+        if self._capture_method != "wgc":
+            return crop_identity
+        return f"{crop_identity}:{self._wgc_dpi_identity}"
+
+    def _refresh_wgc_dpi_identity(self, hwnd: int) -> None:
+        """Refresh the DPI component paired with the next returned frame."""
+        self._wgc_dpi_identity = _window_dpi_identity(hwnd, self._dpi_provider)
+
     def visualize_crop(self, frame: np.ndarray) -> np.ndarray:
         """Overlay the crop boundaries on a captured frame for calibration QA.
 
@@ -913,6 +996,9 @@ class ScreenGrabCamera(RheedCamera):
         self._last_capture = None
         self._consecutive_fails = 0
         self._warned_cross_platform = False
+        self._last_crop_status = (
+            "disabled" if not self._crop_chrome else "unobserved"
+        )
 
     @property
     def connected(self) -> bool:

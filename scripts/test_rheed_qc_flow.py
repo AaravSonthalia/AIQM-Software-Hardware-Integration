@@ -161,6 +161,32 @@ class RheedQcFlowTests(unittest.TestCase):
         self.assertEqual(len(self._rows()), before)
         self.assertTrue(self.window._rheed_qc_state.realignment_active)
 
+    def test_heartbeat_writes_each_capture_token_only_once(self):
+        frame = np.random.default_rng(7).integers(
+            40, 180, size=(120, 140, 3), dtype=np.uint8,
+        )
+        self.window.monitor.update_camera_state(CameraState(
+            frame=frame,
+            frame_number=3,
+            connected=True,
+            capture_backend="wgc",
+            captured_at_utc="2026-07-29T12:00:02.000Z",
+            capture_sequence=12,
+            frame_age_ms=1.0,
+            source_hwnd=123,
+            captured_monotonic_ns=0,
+            capture_geometry_id="wgc:123:140x120:roi-full:v1",
+        ))
+        self.window._on_heartbeat()
+        self.window._on_heartbeat()
+
+        path = self.window.growth_log.session_dir / "heartbeat_log.csv"
+        with open(path, newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["capture_sequence"], "12")
+        self.assertEqual(self.window.growth_log._heartbeat_counter, 1)
+
     def test_stale_same_segment_classifier_generation_is_ignored(self):
         self._event("alignment_confirmed")
         current = self.window._rheed_qc_state

@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from drivers.rheed_camera import (  # noqa: E402
     ScreenGrabCamera,
     _configure_rheed_user32_argtypes,
+    _window_dpi_identity,
 )
 
 
@@ -67,6 +68,45 @@ def test_construct_custom_params() -> None:
     assert cam._crop_chrome is False
     assert cam._chrome_top_px == 100
     assert cam._chrome_bottom_px == 50
+    assert cam.capture_geometry_id == "ksa-chrome-v2:0:100:50:disabled"
+
+
+def test_window_dpi_identity_is_native_or_explicit_fallback() -> None:
+    """DPI lookup is deterministic and never disguises fallback as native."""
+    assert (
+        _window_dpi_identity(1234, lambda hwnd: 144 if hwnd == 1234 else 0)
+        == "dpi-getdpiforwindow-144"
+    )
+    assert _window_dpi_identity(1234, lambda _hwnd: 0) == "dpi-fallback-96"
+
+    def failed_lookup(_hwnd: int) -> int:
+        raise RuntimeError("simulated GetDpiForWindow failure")
+
+    assert _window_dpi_identity(1234, failed_lookup) == "dpi-fallback-96"
+
+
+def test_only_wgc_geometry_identity_tracks_window_dpi() -> None:
+    """WGC includes DPI while the opt-in legacy mss ID stays compatible."""
+    dpi = [96]
+    cam = ScreenGrabCamera(dpi_provider=lambda _hwnd: dpi[0])
+    cam._capture_method = "wgc"
+    cam._refresh_wgc_dpi_identity(1234)
+    first = cam.capture_geometry_id
+    assert first.endswith(":dpi-getdpiforwindow-96")
+
+    dpi[0] = 144
+    cam._refresh_wgc_dpi_identity(1234)
+    second = cam.capture_geometry_id
+    assert second.endswith(":dpi-getdpiforwindow-144")
+    assert second != first
+
+    legacy = ScreenGrabCamera.legacy_mss(
+        crop_chrome=False,
+        chrome_top_px=100,
+        chrome_bottom_px=50,
+    )
+    legacy._capture_method = "mss"
+    assert legacy.capture_geometry_id == "ksa-chrome-v2:0:100:50:disabled"
 
 
 def test_user32_argtypes_configuration_is_safe() -> None:
@@ -81,6 +121,7 @@ def test_crop_chrome_pixels_typical() -> None:
     frame = np.zeros((500, 800, 3), dtype=np.uint8)
     out = cam._crop_chrome_pixels(frame)
     assert out.shape == (395, 800, 3), f"got {out.shape}"
+    assert cam.capture_geometry_id.endswith(":applied")
 
 
 def test_crop_chrome_pixels_disabled() -> None:
@@ -100,6 +141,13 @@ def test_crop_chrome_pixels_defensive_tiny_frame() -> None:
     # 50 - 30 = 20; 20 <= 75 → defensive path returns frame unchanged
     assert out.shape == tiny.shape
     assert (out == tiny).all()
+    assert cam.capture_geometry_id.endswith(":fallback-full")
+    try:
+        cam._require_effective_crop()
+    except RuntimeError as exc:
+        assert "crop is invalid" in str(exc)
+    else:
+        raise AssertionError("WGC must reject an unapplied configured crop")
 
 
 def test_crop_chrome_pixels_edge_exact_min() -> None:
@@ -285,6 +333,8 @@ def test_consecutive_failure_counter_resets_on_success() -> None:
 TESTS = [
     test_construct_defaults,
     test_construct_custom_params,
+    test_window_dpi_identity_is_native_or_explicit_fallback,
+    test_only_wgc_geometry_identity_tracks_window_dpi,
     test_user32_argtypes_configuration_is_safe,
     test_crop_chrome_pixels_typical,
     test_crop_chrome_pixels_disabled,
@@ -303,6 +353,8 @@ TESTS = [
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     print(f"ScreenGrabCamera smoke test — {len(TESTS)} cases")
     print()
     failures: list[tuple[str, BaseException]] = []

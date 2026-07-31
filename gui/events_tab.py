@@ -41,7 +41,9 @@ is bracketed by ``# === <label> ===`` header comments):
                      _on_notes_text_changed, _flush_notes_to_disk
   CLASSIFIER + EQ    _default_ai_repo_root, _get_classifier,
                      _on_classify_clicked, _on_open_equalizer,
-                     _make_equalizer_save_callback,
+                     _request_retrospective_calibration_acceptance,
+                     complete_retrospective_calibration_acceptance,
+                     _save_retrospective_equalizer_label,
                      _render_classifier_result
 
 File size discipline: 1100+ lines is at the upper end of what a single
@@ -54,9 +56,11 @@ EventsTab as the master/detail orchestrator.
 from __future__ import annotations
 
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
+import math
 from pathlib import Path
 from typing import Optional
+import uuid
 
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
@@ -92,6 +96,33 @@ RECON_LABEL_OPTIONS = [
 # Sentinel data value for "no label assigned" — distinguishable from any
 # valid reconstruction name in the dropdown's itemData.
 RECON_UNLABELED = ""
+
+
+# Retrospective Equalizer labels are only trustworthy when the selected frame
+# can be bound back to one exact acquisition snapshot.  Older event buffers did
+# not carry this lifecycle context and deliberately remain usable only through
+# the ordinary dropdown/notes form.
+_EQUALIZER_MANIFEST_FIELDS = (
+    "frame_path",
+    "capture_backend",
+    "capture_geometry_id",
+    "captured_at_utc",
+    "captured_monotonic_ns",
+    "capture_sequence",
+    "frame_age_ms",
+    "source_hwnd",
+    "camera_width",
+    "camera_height",
+    "session_id",
+    "view_segment_id",
+    "visual_history_generation",
+    "gun_aligned",
+    "realignment_active",
+    "calibration_id",
+    "basis_bundle_id",
+)
+_TRUE_TEXT = frozenset({"1", "true", "yes"})
+_FALSE_TEXT = frozenset({"0", "false", "no"})
 
 
 # An event is "unreviewed" if the grower hasn't made an explicit
@@ -144,6 +175,12 @@ class EventsTab(QWidget):
     # state-based (pending or kept_default) — when labeling lands it will
     # also include events without a primary_reconstruction tag.
     unreviewed_count_changed = pyqtSignal(int)
+    # GrowthApp owns acceptance/invalidation and the durable journal.  Events
+    # emits an immutable request context and waits for one of the public
+    # completion methods below before activating a calibration locally.
+    retrospective_calibration_accept_requested = pyqtSignal(object)
+    retrospective_calibration_invalidation_requested = pyqtSignal(object)
+    retrospective_calibration_resolve_requested = pyqtSignal(object)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -158,6 +195,11 @@ class EventsTab(QWidget):
         # Cleared on selection change and on attach_session.
         self._cached_pixmaps: list[QPixmap] = []
         self._cached_paths: list[Path] = []
+        self._capture_metadata_by_filename: dict[str, dict] = {}
+        self._capture_manifest_error: str = "No event buffer is selected."
+        self._pending_retrospective_accept_context: Optional[dict] = None
+        self._pending_retrospective_invalidation: Optional[dict] = None
+        self._pending_retrospective_resolve_context: Optional[dict] = None
         # In-memory label cache — single source of truth for "what label
         # does each event have right now." Loaded from events_labels.csv
         # on session attach, kept in sync as the grower applies labels.
@@ -418,8 +460,9 @@ class EventsTab(QWidget):
         self._equalizer_button = QPushButton("Label with Equalizer…")
         self._equalizer_button.setToolTip(
             "Open the currently displayed buffer frame in the RHEED "
-            "Equalizer (separate window). Drag the 5 sliders to label "
-            "the reconstruction mixture. Save writes back to this event."
+            "Equalizer (separate window). A complete capture manifest and "
+            "accepted camera calibration are required; HTR is unavailable "
+            "until a canonical basis exists."
         )
         self._equalizer_button.clicked.connect(self._on_open_equalizer)
         equalizer_row.addWidget(self._equalizer_button)
@@ -447,6 +490,16 @@ class EventsTab(QWidget):
         Events tab now owns label CSV writes, which need the logger's
         update_event_label method.
         """
+        # A popup is bound to one logger/session/frame.  Close it before
+        # switching sessions so a delayed Save signal cannot write into the
+        # newly attached session.
+        if self._equalizer_window is not None:
+            self._equalizer_window.close()
+            self._equalizer_window = None
+        self._pending_retrospective_accept_context = None
+        self._pending_retrospective_invalidation = None
+        self._pending_retrospective_resolve_context = None
+
         self._growth_logger = growth_logger
         self._session_dir = (
             growth_logger.session_dir
@@ -457,6 +510,8 @@ class EventsTab(QWidget):
         self.events_table.setRowCount(0)
         self._cached_pixmaps = []
         self._cached_paths = []
+        self._capture_metadata_by_filename = {}
+        self._capture_manifest_error = "No event buffer is selected."
         self._image_label.clearImage()
         self._labels_cache = (
             growth_logger.read_event_labels()
@@ -686,6 +741,8 @@ class EventsTab(QWidget):
             self._set_placeholder("Select an event to view buffer frames.")
             self._cached_pixmaps = []
             self._cached_paths = []
+            self._capture_metadata_by_filename = {}
+            self._capture_manifest_error = "No event buffer is selected."
             self._image_label.clearImage()
             self._currently_displayed_event_idx = None
             return
@@ -708,6 +765,10 @@ class EventsTab(QWidget):
         """
         event_idx = row_data.get("event_idx", "?")
         buffer_dir = row_data.get("buffer_dir", "") or ""
+        self._cached_paths = []
+        self._cached_pixmaps = []
+        self._capture_metadata_by_filename = {}
+        self._capture_manifest_error = "Capture manifest was not loaded."
 
         if self._session_dir is None or not buffer_dir:
             self._set_placeholder(
@@ -715,7 +776,13 @@ class EventsTab(QWidget):
             )
             return
 
-        full_dir = self._session_dir / buffer_dir
+        full_dir, path_error = self._resolve_event_buffer_dir(buffer_dir)
+        if full_dir is None:
+            self._capture_manifest_error = path_error
+            self._set_placeholder(
+                f"Event #{event_idx} — unsafe buffer directory:\n{path_error}"
+            )
+            return
         if not full_dir.exists() or not full_dir.is_dir():
             self._set_placeholder(
                 f"Event #{event_idx} — buffer directory not found:\n{buffer_dir}"
@@ -725,9 +792,32 @@ class EventsTab(QWidget):
         # Match both .png (legacy sessions before Jul 9 2026) and .bmp
         # (post-switch to match Justin's training data format). Sorted
         # together so within-session interleave is stable.
-        frame_paths = sorted(
+        discovered_paths = sorted(
             list(full_dir.glob("*.png")) + list(full_dir.glob("*.bmp"))
         )
+        frames_root = (self._session_dir / "frames").resolve()
+        frame_paths: list[Path] = []
+        for candidate in discovered_paths:
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(frames_root)
+                resolved.relative_to(full_dir)
+            except (OSError, ValueError):
+                self._capture_manifest_error = (
+                    "A buffered frame resolves outside its event directory or "
+                    "session frames/."
+                )
+                self._set_placeholder(
+                    f"Event #{event_idx} — unsafe buffered frame path."
+                )
+                return
+            if not resolved.is_file():
+                self._capture_manifest_error = "A buffered frame path is not a file."
+                self._set_placeholder(
+                    f"Event #{event_idx} — invalid buffered frame path."
+                )
+                return
+            frame_paths.append(resolved)
         if not frame_paths:
             self._set_placeholder(
                 f"Event #{event_idx} — buffer directory is empty."
@@ -736,6 +826,10 @@ class EventsTab(QWidget):
 
         self._cached_paths = frame_paths
         self._cached_pixmaps = [QPixmap(str(p)) for p in frame_paths]
+        (
+            self._capture_metadata_by_filename,
+            self._capture_manifest_error,
+        ) = self._load_capture_manifest(full_dir, frames_root=frames_root)
 
         self._metadata_label.setText(self._format_metadata(row_data))
         self._show_detail_content()
@@ -757,6 +851,168 @@ class EventsTab(QWidget):
         self._slider.setValue(last_idx)
         self._slider.blockSignals(False)
         self._display_frame_at(last_idx)
+
+    @staticmethod
+    def _parse_manifest_bool(value: object, field: str) -> bool:
+        text = str(value or "").strip().lower()
+        if text in _TRUE_TEXT:
+            return True
+        if text in _FALSE_TEXT:
+            return False
+        raise ValueError(f"{field} must be an explicit true/false value")
+
+    def _resolve_event_buffer_dir(
+        self, buffer_dir: object,
+    ) -> tuple[Optional[Path], str]:
+        """Resolve one event directory strictly beneath ``<session>/frames``."""
+        if self._session_dir is None:
+            return None, "No growth session is attached."
+        text = str(buffer_dir or "").strip()
+        if not text:
+            return None, "The event buffer path is blank."
+        relative = Path(text)
+        if relative.is_absolute() or relative.drive or relative.root:
+            return None, "Absolute event buffer paths are not accepted."
+        if ".." in relative.parts:
+            return None, "Parent-directory traversal is not accepted."
+        try:
+            session_dir = self._session_dir.resolve()
+            frames_root = (session_dir / "frames").resolve()
+            resolved = (session_dir / relative).resolve()
+            remainder = resolved.relative_to(frames_root)
+        except (OSError, ValueError):
+            return None, "The event buffer path escapes the session frames directory."
+        if not remainder.parts:
+            return None, "The event buffer path must name a directory below frames/."
+        return resolved, ""
+
+    @classmethod
+    def _normalize_manifest_row(cls, row: dict) -> dict:
+        """Return typed provenance for one historical frame.
+
+        The conversion is intentionally strict: manufacturing a receive time
+        or QC state for a legacy row would make an Equalizer label appear more
+        synchronized and better traced than the underlying capture actually
+        was.
+        """
+        metadata = dict(row)
+        frame_name = str(metadata.get("frame_path", "") or "").strip()
+        if not frame_name or Path(frame_name).name != frame_name:
+            raise ValueError("frame_path must be one frame filename")
+
+        for field in (
+            "capture_backend", "capture_geometry_id", "captured_at_utc",
+            "session_id", "basis_bundle_id",
+        ):
+            if not str(metadata.get(field, "") or "").strip():
+                raise ValueError(f"{field} is blank")
+
+        try:
+            metadata["capture_sequence"] = int(metadata["capture_sequence"])
+            metadata["captured_monotonic_ns"] = int(
+                metadata["captured_monotonic_ns"]
+            )
+            metadata["source_hwnd"] = int(metadata["source_hwnd"])
+            metadata["camera_width"] = int(metadata["camera_width"])
+            metadata["camera_height"] = int(metadata["camera_height"])
+            metadata["view_segment_id"] = int(metadata["view_segment_id"])
+            metadata["visual_history_generation"] = int(
+                metadata["visual_history_generation"]
+            )
+            metadata["frame_age_ms"] = float(metadata["frame_age_ms"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("numeric capture provenance is invalid") from exc
+
+        if metadata["capture_sequence"] < 0:
+            raise ValueError("capture_sequence cannot be negative")
+        if metadata["captured_monotonic_ns"] <= 0:
+            raise ValueError("captured_monotonic_ns must be positive")
+        if metadata["camera_width"] <= 0 or metadata["camera_height"] <= 0:
+            raise ValueError("camera dimensions must be positive")
+        if metadata["view_segment_id"] < 0:
+            raise ValueError("view_segment_id cannot be negative")
+        if metadata["visual_history_generation"] < 0:
+            raise ValueError("visual_history_generation cannot be negative")
+        if not math.isfinite(metadata["frame_age_ms"]) or metadata["frame_age_ms"] < 0:
+            raise ValueError("frame_age_ms must be finite and non-negative")
+
+        metadata["frame_path"] = frame_name
+        metadata["capture_backend"] = str(metadata["capture_backend"]).strip()
+        metadata["capture_geometry_id"] = str(
+            metadata["capture_geometry_id"]
+        ).strip()
+        captured_at_text = str(metadata["captured_at_utc"]).strip()
+        try:
+            captured_at = datetime.fromisoformat(captured_at_text)
+        except ValueError as exc:
+            raise ValueError("captured_at_utc is not ISO-8601") from exc
+        if captured_at.tzinfo is None or captured_at.utcoffset() is None:
+            raise ValueError("captured_at_utc must include a UTC offset")
+        if captured_at.utcoffset().total_seconds() != 0:
+            raise ValueError("captured_at_utc must be UTC")
+        metadata["captured_at_utc"] = captured_at.astimezone(timezone.utc).isoformat()
+        metadata["session_id"] = str(metadata["session_id"]).strip()
+        metadata["basis_bundle_id"] = str(metadata["basis_bundle_id"]).strip()
+        metadata["gun_aligned"] = cls._parse_manifest_bool(
+            metadata.get("gun_aligned"), "gun_aligned",
+        )
+        metadata["realignment_active"] = cls._parse_manifest_bool(
+            metadata.get("realignment_active"), "realignment_active",
+        )
+        metadata["calibration_id"] = str(
+            metadata.get("calibration_id", "") or ""
+        ).strip()
+        return metadata
+
+    @classmethod
+    def _load_capture_manifest(
+        cls,
+        event_dir: Path,
+        *,
+        frames_root: Optional[Path] = None,
+    ) -> tuple[dict[str, dict], str]:
+        """Load filename-keyed frame provenance, failing closed on ambiguity."""
+        path = event_dir / "capture_manifest.csv"
+        if frames_root is not None:
+            try:
+                resolved_root = frames_root.resolve()
+                resolved_event = event_dir.resolve(strict=True)
+                remainder = resolved_event.relative_to(resolved_root)
+            except (OSError, ValueError):
+                return {}, "Capture manifest resolves outside session frames/."
+            if not remainder.parts:
+                return {}, "Capture manifest must belong to an event below frames/."
+        if not path.is_file():
+            return {}, "This event has no capture_manifest.csv (legacy buffer)."
+        if frames_root is not None:
+            try:
+                path = path.resolve(strict=True)
+                path.relative_to(resolved_root)
+                path.relative_to(resolved_event)
+            except (OSError, ValueError):
+                return {}, "Capture manifest resolves outside session frames/."
+        try:
+            with open(path, "r", newline="") as stream:
+                reader = csv.DictReader(stream)
+                fields = set(reader.fieldnames or ())
+                missing = [name for name in _EQUALIZER_MANIFEST_FIELDS if name not in fields]
+                if missing:
+                    return {}, "Capture manifest is missing fields: " + ", ".join(missing)
+                result: dict[str, dict] = {}
+                for row_number, row in enumerate(reader, start=2):
+                    try:
+                        metadata = cls._normalize_manifest_row(row)
+                    except ValueError as exc:
+                        return {}, f"Capture manifest row {row_number} is invalid: {exc}"
+                    frame_name = metadata["frame_path"]
+                    if frame_name in result:
+                        return {}, f"Capture manifest has duplicate frame: {frame_name}"
+                    result[frame_name] = metadata
+        except OSError as exc:
+            return {}, f"Capture manifest could not be read: {exc}"
+        if not result:
+            return {}, "Capture manifest contains no frame rows."
+        return result, ""
 
     @staticmethod
     def _format_metadata(row_data: dict) -> str:
@@ -1077,14 +1333,26 @@ class EventsTab(QWidget):
 
     # --- Experimental: Equalizer integration -------------------------------
 
-    def _on_open_equalizer(self) -> None:
-        """Open the current buffer frame in a separate Equalizer window.
+    def _label_calibration_id_for_frame(
+        self, event_idx: int, frame_path: Path,
+    ) -> str:
+        """Return the latest label calibration only when it names this frame."""
+        row = self._labels_cache.get(event_idx) or {}
+        calibration_id = str(row.get("calibration_id", "") or "").strip()
+        recorded_path = str(row.get("frame_path", "") or "").strip()
+        if not calibration_id or not recorded_path:
+            return ""
+        candidate = Path(recorded_path)
+        if not candidate.is_absolute() and self._session_dir is not None:
+            candidate = self._session_dir / candidate
+        try:
+            same_frame = candidate.resolve() == frame_path.resolve()
+        except OSError:
+            same_frame = candidate.absolute() == frame_path.absolute()
+        return calibration_id if same_frame else ""
 
-        Lazy-imports the Equalizer (it's in scripts/ not gui/) so that
-        events_tab.py stays importable even if scripts/ isn't on sys.path
-        in some downstream context. Spawns a top-level non-modal window;
-        keeps a reference so the popup isn't garbage-collected.
-        """
+    def _on_open_equalizer(self) -> None:
+        """Open the selected historical frame in the shared Equalizer panel."""
         if not self._cached_paths:
             return
         idx = self._slider.value()
@@ -1094,75 +1362,542 @@ class EventsTab(QWidget):
         event_idx = self._currently_displayed_event_idx
         if event_idx is None:
             return
-
-        # Repo root is parent of gui/ — add to sys.path so scripts.equalizer_ui
-        # resolves regardless of how growth_monitor_app.py was launched.
-        import sys as _sys
-        repo_root = str(Path(__file__).resolve().parent.parent)
-        if repo_root not in _sys.path:
-            _sys.path.insert(0, repo_root)
-        try:
-            from scripts.equalizer_ui import EqualizerWindow
-        except Exception as e:
-            QMessageBox.critical(
+        logger = self._growth_logger
+        if logger is None or self._session_dir is None:
+            QMessageBox.warning(
                 self, "Equalizer unavailable",
-                f"Couldn't import the Equalizer:\n\n{e}",
+                "Attach the event to its growth session before labeling.",
             )
             return
 
-        callback = self._make_equalizer_save_callback(event_idx)
-        try:
-            self._equalizer_window = EqualizerWindow(
-                pre_loaded_image=frame_path,
-                on_save_callback=callback,
+        metadata = self._capture_metadata_by_filename.get(frame_path.name)
+        if metadata is None:
+            reason = self._capture_manifest_error or (
+                f"capture_manifest.csv has no row for {frame_path.name}."
             )
-            self._equalizer_window.show()
-            self._equalizer_window.raise_()
-            self._equalizer_window.activateWindow()
-        except SystemExit:
-            # EqualizerWindow.__init__ calls sys.exit(1) if it can't load
-            # any basis at all — swallow it here so it doesn't kill the
-            # Growth Monitor process. The user already saw the QMessageBox.
+            QMessageBox.warning(
+                self, "Equalizer provenance required",
+                f"This historical frame cannot be labeled with the Equalizer.\n\n{reason}\n\n"
+                "The ordinary reconstruction dropdown and notes remain available.",
+            )
+            return
+        if metadata["gun_aligned"] is not True:
+            QMessageBox.warning(
+                self, "Equalizer blocked",
+                "The selected frame was not recorded with gun_aligned=true.",
+            )
+            return
+        if metadata["realignment_active"] is not False:
+            QMessageBox.warning(
+                self, "Equalizer blocked",
+                "The selected frame was captured during gun realignment.",
+            )
+            return
+
+        try:
+            from PIL import Image
+            from gui.live_equalizer_tab import LiveEqualizerTab
+
+            with Image.open(frame_path) as image:
+                rgb = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Equalizer unavailable",
+                f"The shared Equalizer or selected frame could not be loaded:\n\n{exc}",
+            )
+            return
+        if (
+            rgb.shape[1] != metadata["camera_width"]
+            or rgb.shape[0] != metadata["camera_height"]
+        ):
+            QMessageBox.warning(
+                self, "Equalizer provenance mismatch",
+                "The saved image dimensions do not match capture_manifest.csv.",
+            )
+            return
+
+        if self._equalizer_window is not None:
+            self._equalizer_window.close()
             self._equalizer_window = None
 
-    def _make_equalizer_save_callback(self, event_idx: int):
-        """Build the on_save callback bound to a specific event_idx."""
-        # Class label → growth_logger.update_event_label kwarg name.
-        kwarg_for_class = {
-            "1x1":     "recon_1x1",
-            "Tw(2x1)": "recon_tw",
-            "c(6x2)":  "recon_c6x2",
-            "RT13":    "recon_rt13",
-            "HTR":     "recon_HTR",
+        window = QWidget(self, Qt.WindowType.Window)
+        window.setWindowTitle(f"Event #{event_idx} Equalizer - {frame_path.name}")
+        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        window.resize(1180, 820)
+        layout = QVBoxLayout(window)
+        layout.setContentsMargins(8, 8, 8, 8)
+        provenance_label = QLabel()
+        provenance_label.setWordWrap(True)
+        provenance_label.setStyleSheet("padding: 4px; color: #ddd;")
+        layout.addWidget(provenance_label)
+
+        try:
+            panel = LiveEqualizerTab(window, retrospective=True)
+        except Exception as exc:
+            window.close()
+            QMessageBox.critical(
+                self, "Equalizer unavailable",
+                f"The shared Equalizer could not be initialized:\n\n{exc}",
+            )
+            return
+        layout.addWidget(panel, 1)
+        window._equalizer_panel = panel
+        window._equalizer_frame_path = frame_path
+        window._equalizer_metadata = dict(metadata)
+        window._equalizer_provenance_label = provenance_label
+
+        try:
+            panel.set_session_id(metadata["session_id"])
+            panel.update_qc_context(
+                session_active=True,
+                view_segment_id=metadata["view_segment_id"],
+                visual_history_generation=metadata["visual_history_generation"],
+                gun_aligned=metadata["gun_aligned"],
+                realignment_active=metadata["realignment_active"],
+            )
+            panel.set_save_enabled(True)
+            panel.update_camera_frame(rgb, metadata)
+            panel_metadata = panel.get_current_capture_metadata()
+            if panel_metadata.get("basis_bundle_id") != metadata["basis_bundle_id"]:
+                raise ValueError(
+                    "the current canonical basis bundle does not match the manifest"
+                )
+            if (
+                panel_metadata.get("capture_geometry_id")
+                != metadata["capture_geometry_id"]
+            ):
+                raise ValueError(
+                    "the panel capture geometry does not match the manifest"
+                )
+        except Exception as exc:
+            window.close()
+            QMessageBox.critical(
+                self, "Equalizer unavailable",
+                f"The historical frame context could not be initialized:\n\n{exc}",
+            )
+            return
+
+        panel.calibration_accept_requested.connect(
+            lambda pending: self._request_retrospective_calibration_acceptance(
+                panel=panel,
+                provenance_label=provenance_label,
+                pending=pending,
+            )
+        )
+        panel.calibration_invalidation_requested.connect(
+            lambda reason: self._request_retrospective_calibration_invalidation(
+                panel=panel,
+                provenance_label=provenance_label,
+                reason=reason,
+            )
+        )
+        panel.live_label_save_requested.connect(
+            lambda weights: self._save_retrospective_equalizer_label(
+                panel=panel,
+                provenance_label=provenance_label,
+                logger=logger,
+                event_idx=event_idx,
+                frame_path=frame_path,
+                weights=weights,
+            )
+        )
+
+        window._equalizer_active_calibration = None
+        self._equalizer_window = window
+
+        def _forget_window(*_args) -> None:
+            if self._equalizer_window is window:
+                self._equalizer_window = None
+            context = self._pending_retrospective_accept_context
+            if context is not None and context.get("panel") is panel:
+                self._pending_retrospective_accept_context = None
+            invalidation = self._pending_retrospective_invalidation
+            if invalidation is not None and invalidation.get("panel") is panel:
+                self._pending_retrospective_invalidation = None
+            resolution = self._pending_retrospective_resolve_context
+            if resolution is not None and resolution.get("panel") is panel:
+                self._pending_retrospective_resolve_context = None
+
+        window.destroyed.connect(_forget_window)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+        label_calibration_id = self._label_calibration_id_for_frame(
+            event_idx, frame_path,
+        )
+        calibration_ids: list[str] = []
+        # The exact-frame label wins over the capture manifest.  GrowthApp
+        # resolves this ordered list and owns the resulting retrospective map.
+        for candidate_id in (label_calibration_id, metadata["calibration_id"]):
+            if candidate_id and candidate_id not in calibration_ids:
+                calibration_ids.append(candidate_id)
+        if not calibration_ids:
+            provenance_label.setText(
+                "No calibration ID is bound to this frame. Calibrate and accept "
+                "this exact frozen frame before saving mixture weights."
+            )
+            return
+
+        snapshot = panel.get_current_snapshot()
+        basis_bundle = panel.get_basis_bundle()
+        if snapshot is None or basis_bundle is None:
+            provenance_label.setText(
+                "Historical calibration reuse is blocked because the frozen "
+                "frame snapshot or canonical basis bundle is unavailable."
+            )
+            return
+        request_token = str(uuid.uuid4())
+        context = {
+            "request_token": request_token,
+            "calibration_ids": tuple(calibration_ids),
+            "snapshot": snapshot,
+            "basis_bundle": basis_bundle,
+            "panel": panel,
+            "retrospective": True,
         }
+        self._pending_retrospective_resolve_context = context
+        provenance_label.setText(
+            "Waiting for GrowthApp to resolve a compatible journaled "
+            "calibration for this historical frame."
+        )
+        self.retrospective_calibration_resolve_requested.emit({
+            "request_token": request_token,
+            "calibration_ids": tuple(calibration_ids),
+            "snapshot": snapshot,
+            "basis_bundle_id": metadata["basis_bundle_id"],
+            "basis_bundle": basis_bundle,
+            "retrospective": True,
+        })
 
-        def _save(weights: dict) -> None:
-            if self._growth_logger is None:
-                return
-            kwargs: dict = {}
-            for class_label, kwarg in kwarg_for_class.items():
-                kwargs[kwarg] = float(weights.get(class_label, 0.0))
-            # Pick primary_reconstruction as the argmax for back-compat with
-            # downstream filters that still look at the single-class field.
-            if weights:
-                primary_label = max(weights.items(), key=lambda kv: kv[1])[0]
-                kwargs["primary_reconstruction"] = primary_label
-            self._growth_logger.update_event_label(event_idx, **kwargs)
-            # Refresh the in-memory cache + the label form so the new
-            # primary label is reflected in the dropdown next time the
-            # grower scrolls back to this event.
-            self._label_cache[event_idx] = (
-                self._label_cache.get(event_idx) or {}
+    def complete_retrospective_calibration_resolution(
+        self,
+        request_token: str,
+        calibration,
+        reason: str = "",
+    ) -> bool:
+        """Activate only the record selected by app-owned historical lookup."""
+        context = self._pending_retrospective_resolve_context
+        if context is None or context.get("request_token") != str(request_token):
+            return False
+        panel = context["panel"]
+        window = self._equalizer_window
+        if window is None or getattr(window, "_equalizer_panel", None) is not panel:
+            return False
+        label = getattr(window, "_equalizer_provenance_label", None)
+        if calibration is None:
+            self._pending_retrospective_resolve_context = None
+            if isinstance(label, QLabel):
+                label.setText(
+                    str(reason or "No compatible journaled calibration is available. ")
+                    + " Calibrate and accept this exact frozen frame before saving."
+                )
+            return True
+        if getattr(calibration, "calibration_id", None) not in context["calibration_ids"]:
+            return False
+        if not panel.set_accepted_calibration(calibration):
+            return False
+        self._pending_retrospective_resolve_context = None
+        window._equalizer_active_calibration = calibration
+        if isinstance(label, QLabel):
+            label.setText(
+                f"Reusing app-resolved calibration {calibration.calibration_id}. "
+                "Save remains bound to this exact historical frame."
             )
-            self._label_cache[event_idx]["primary_reconstruction"] = (
-                kwargs.get("primary_reconstruction", "")
-            )
-            for k, v in kwargs.items():
-                if k.startswith("recon_"):
-                    self._label_cache[event_idx][k] = f"{v:.4f}"
-            self._refresh_unreviewed_badge()
+        return True
 
-        return _save
+    def fail_retrospective_calibration_resolution(
+        self, request_token: str, reason: str,
+    ) -> bool:
+        """Reject a malformed/untrusted resolution without activating state."""
+        context = self._pending_retrospective_resolve_context
+        if context is None or context.get("request_token") != str(request_token):
+            return False
+        self._pending_retrospective_resolve_context = None
+        QMessageBox.critical(
+            self,
+            "Historical calibration unavailable",
+            str(reason or "GrowthApp rejected the calibration lookup request."),
+        )
+        return True
+
+    def _request_retrospective_calibration_acceptance(
+        self,
+        *,
+        panel,
+        provenance_label: QLabel,
+        pending,
+    ) -> None:
+        """Send app-owned acceptance all evidence needed for validation."""
+        window = self._equalizer_window
+        if window is None or getattr(window, "_equalizer_panel", None) is not panel:
+            QMessageBox.warning(
+                self, "Calibration blocked",
+                "The retrospective Equalizer window is no longer active.",
+            )
+            return
+        if self._pending_retrospective_accept_context is not None:
+            QMessageBox.warning(
+                self, "Calibration pending",
+                "A retrospective calibration request is already awaiting the app.",
+            )
+            return
+        try:
+            snapshot = panel.get_calibration_snapshot()
+            basis_bundle = panel.get_basis_bundle()
+            evidence_getter = getattr(
+                panel,
+                "get_orientation_evidence_kind",
+                getattr(panel, "get_handedness_evidence_kind", None),
+            )
+            if evidence_getter is None:
+                raise AttributeError("handedness evidence getter is unavailable")
+            evidence_kind = str(evidence_getter() or "")
+        except (AttributeError, TypeError, ValueError) as exc:
+            QMessageBox.warning(
+                self, "Calibration blocked",
+                f"Calibration evidence is unavailable: {exc}",
+            )
+            return
+        if snapshot is None or basis_bundle is None or not evidence_kind:
+            QMessageBox.warning(
+                self, "Calibration blocked",
+                "Confirm asymmetric handedness evidence on the frozen frame first.",
+            )
+            return
+
+        request_token = str(uuid.uuid4())
+        context = {
+            "request_token": request_token,
+            "pending": pending,
+            "snapshot": snapshot,
+            "basis_bundle": basis_bundle,
+            "evidence_kind": evidence_kind,
+            "evidence_confirmed": True,
+            "panel": panel,
+            "retrospective": True,
+        }
+        self._pending_retrospective_accept_context = context
+        provenance_label.setText(
+            "Acceptance requested; waiting for GrowthApp to validate evidence "
+            "and durably journal the calibration."
+        )
+        self.retrospective_calibration_accept_requested.emit(dict(context))
+
+    def complete_retrospective_calibration_acceptance(
+        self, request_token: str, accepted,
+    ) -> bool:
+        """Activate a journaled record; False requires app-side invalidation."""
+        context = self._pending_retrospective_accept_context
+        if context is None or context.get("request_token") != str(request_token):
+            return False
+        panel = context["panel"]
+        pending = context["pending"]
+        window = self._equalizer_window
+        if (
+            window is None
+            or getattr(window, "_equalizer_panel", None) is not panel
+            or getattr(accepted, "calibration_id", None)
+            != getattr(pending, "calibration_id", None)
+        ):
+            return False
+        if not panel.set_accepted_calibration(accepted):
+            return False
+        window._equalizer_active_calibration = accepted
+        self._pending_retrospective_accept_context = None
+        label = getattr(window, "_equalizer_provenance_label", None)
+        if isinstance(label, QLabel):
+            label.setText(
+                f"Accepted and journaled calibration {accepted.calibration_id}. "
+                "Mixture labels may now be saved for this historical frame."
+            )
+        return True
+
+    def fail_retrospective_calibration_acceptance(
+        self, request_token: str, reason: str,
+    ) -> bool:
+        """App callback: reject an unjournaled request and clear panel state."""
+        context = self._pending_retrospective_accept_context
+        if context is None or context.get("request_token") != str(request_token):
+            return False
+        self._pending_retrospective_accept_context = None
+        panel = context["panel"]
+        panel.invalidate_calibration(
+            str(reason or "retrospective calibration acceptance failed"),
+            emit=False,
+        )
+        QMessageBox.critical(
+            self, "Calibration not accepted",
+            str(reason or "GrowthApp rejected the calibration request."),
+        )
+        return True
+
+    def _request_retrospective_calibration_invalidation(
+        self,
+        *,
+        panel,
+        provenance_label: QLabel,
+        reason: str,
+    ) -> None:
+        """Ask GrowthApp to journal removal of the popup's active record."""
+        window = self._equalizer_window
+        if window is None or getattr(window, "_equalizer_panel", None) is not panel:
+            return
+        calibration = getattr(window, "_equalizer_active_calibration", None)
+        if calibration is None:
+            return
+        if self._pending_retrospective_invalidation is not None:
+            return
+        request_token = str(uuid.uuid4())
+        context = {
+            "request_token": request_token,
+            "calibration": calibration,
+            "reason": str(reason or "retrospective calibration invalidated"),
+            "panel": panel,
+            "retrospective": True,
+        }
+        window._equalizer_active_calibration = None
+        self._pending_retrospective_invalidation = context
+        provenance_label.setText(
+            "Calibration cleared locally; waiting for GrowthApp to journal "
+            "the invalidation."
+        )
+        self.retrospective_calibration_invalidation_requested.emit(dict(context))
+
+    def complete_retrospective_calibration_invalidation(
+        self, request_token: str,
+    ) -> bool:
+        context = self._pending_retrospective_invalidation
+        if context is None or context.get("request_token") != str(request_token):
+            return False
+        self._pending_retrospective_invalidation = None
+        window = self._equalizer_window
+        if window is not None and getattr(window, "_equalizer_panel", None) is context["panel"]:
+            label = getattr(window, "_equalizer_provenance_label", None)
+            if isinstance(label, QLabel):
+                label.setText(
+                    "Calibration invalidation journaled. Recalibrate this frozen "
+                    "frame before saving."
+                )
+        return True
+
+    def fail_retrospective_calibration_invalidation(
+        self, request_token: str, reason: str,
+    ) -> bool:
+        context = self._pending_retrospective_invalidation
+        if context is None or context.get("request_token") != str(request_token):
+            return False
+        self._pending_retrospective_invalidation = None
+        QMessageBox.critical(
+            self, "Calibration invalidation failed",
+            str(reason or "GrowthApp could not update the calibration journal."),
+        )
+        return True
+
+    def _save_retrospective_equalizer_label(
+        self,
+        *,
+        panel,
+        provenance_label: QLabel,
+        logger: GrowthLogger,
+        event_idx: int,
+        frame_path: Path,
+        weights: dict,
+    ) -> None:
+        """Save four active weights with the exact frame/calibration DTOs."""
+        if logger is not self._growth_logger:
+            QMessageBox.warning(
+                self, "Equalizer save blocked",
+                "The growth session changed while the Equalizer was open.",
+            )
+            return
+        calibration = panel.get_calibration()
+        snapshot = panel.get_current_snapshot()
+        window = self._equalizer_window
+        app_activated = (
+            window is not None
+            and getattr(window, "_equalizer_panel", None) is panel
+            and getattr(window, "_equalizer_active_calibration", None) is calibration
+        )
+        if calibration is None or snapshot is None or not app_activated:
+            QMessageBox.warning(
+                self, "Equalizer save blocked",
+                "An app-activated calibration and the frozen historical frame "
+                "are required.",
+            )
+            return
+
+        columns = {
+            "1x1": "recon_1x1",
+            "Tw(2x1)": "recon_tw",
+            "c(6x2)": "recon_c6x2",
+            "RT13": "recon_rt13",
+        }
+        values: dict[str, float] = {}
+        try:
+            for label, column in columns.items():
+                value = float(weights[label])
+                if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                    raise ValueError(f"{label} weight is outside [0, 1]")
+                values[column] = value
+        except (KeyError, TypeError, ValueError) as exc:
+            QMessageBox.warning(
+                self, "Equalizer save blocked", f"Invalid mixture weights: {exc}",
+            )
+            return
+
+        winning_label = max(columns, key=lambda label: values[columns[label]])
+        primary_names = {
+            "1x1": "1x1",
+            "Tw(2x1)": "Twinned (2x1)",
+            "c(6x2)": "c(6x2)",
+            "RT13": "rt13xrt13",
+        }
+        try:
+            saved = logger.update_event_label(
+                event_idx,
+                primary_reconstruction=primary_names[winning_label],
+                **values,
+                recon_HTR=None,
+                calibration=calibration,
+                snapshot=snapshot,
+                frame_path=str(frame_path),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            QMessageBox.critical(
+                self, "Equalizer save failed", f"The label was not written:\n\n{exc}",
+            )
+            return
+        if not saved:
+            QMessageBox.critical(
+                self, "Equalizer save failed",
+                "The label writer rejected the retrospective record.",
+            )
+            return
+
+        refreshed = logger.read_event_labels().get(event_idx)
+        if refreshed is not None:
+            self._labels_cache[event_idx] = refreshed
+        else:
+            cached = self._labels_cache.setdefault(
+                event_idx,
+                {field: "" for field in GrowthLogger.EVENT_LABEL_FIELDS},
+            )
+            cached.update({key: f"{value:.4f}" for key, value in values.items()})
+            cached.update({
+                "event_idx": str(event_idx),
+                "primary_reconstruction": primary_names[winning_label],
+                "recon_HTR": "",
+                "calibration_id": calibration.calibration_id,
+                "frame_path": str(frame_path),
+            })
+        if self._currently_displayed_event_idx == event_idx:
+            self._populate_label_form(event_idx)
+        self._refresh_unreviewed_badge()
+        provenance_label.setText(
+            f"Saved event #{event_idx} with calibration "
+            f"{calibration.calibration_id}; HTR remains unavailable."
+        )
 
     def _render_classifier_result(self, result: dict) -> None:
         """Format classifier output as a compact inline label."""

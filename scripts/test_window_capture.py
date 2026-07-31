@@ -13,6 +13,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from drivers.window_capture import (  # noqa: E402
+    CapturedFrame,
     WindowCaptureError,
     WindowCaptureTimeout,
     WindowsGraphicsCapture,
@@ -209,6 +210,71 @@ def test_wgc_worker_stops_on_capture_error() -> None:
     assert camera.disconnected
 
 
+def test_wgc_worker_cleans_up_after_connect_error() -> None:
+    class _ConnectFailedCamera:
+        disconnected = False
+
+        def connect(self):
+            raise RuntimeError("simulated invalid crop")
+
+        def disconnect(self):
+            self.disconnected = True
+
+    camera = _ConnectFailedCamera()
+    worker = RheedCameraWorker(mode="screengrab", poll_interval=0.0)
+    worker._create_camera = lambda: camera
+    states = []
+    worker.state_updated.connect(states.append)
+    worker.run()
+    assert len(states) == 1
+    assert states[0].connected is False
+    assert "simulated invalid crop" in states[0].error
+    assert camera.disconnected
+
+
+def test_worker_propagates_dpi_bearing_capture_geometry_id() -> None:
+    image = np.zeros((4, 6, 3), dtype=np.uint8)
+    capture = CapturedFrame(
+        image=image,
+        captured_at_utc="2026-07-31T12:00:00.000Z",
+        captured_monotonic_ns=time.monotonic_ns(),
+        sequence=123,
+        source_hwnd=456,
+        width=6,
+        height=4,
+        backend="wgc",
+    )
+
+    class _OneFrameCamera:
+        disconnected = False
+        last_capture = capture
+        capture_geometry_id = (
+            "ksa-chrome-v2:1:75:30:applied:dpi-getdpiforwindow-144"
+        )
+
+        def connect(self):
+            return None
+
+        def read_frame(self):
+            worker.running = False
+            return image
+
+        def disconnect(self):
+            self.disconnected = True
+
+    camera = _OneFrameCamera()
+    worker = RheedCameraWorker(mode="screengrab", poll_interval=0.0)
+    worker._create_camera = lambda: camera
+    states = []
+    worker.state_updated.connect(states.append)
+    worker.run()
+    assert len(states) == 1
+    assert states[0].capture_geometry_id == camera.capture_geometry_id
+    assert states[0].source_hwnd == 456
+    assert states[0].capture_sequence == 123
+    assert camera.disconnected
+
+
 TESTS = [
     test_bgra_conversion,
     test_first_frame_and_hwnd_config,
@@ -218,6 +284,8 @@ TESTS = [
     test_first_frame_timeout,
     test_stale_and_closed_fail_closed,
     test_wgc_worker_stops_on_capture_error,
+    test_wgc_worker_cleans_up_after_connect_error,
+    test_worker_propagates_dpi_bearing_capture_geometry_id,
 ]
 
 

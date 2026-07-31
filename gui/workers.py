@@ -331,6 +331,11 @@ class RheedCameraWorker(QThread):
         except Exception as e:
             state.connected = False
             state.error = str(e)
+            if self._camera is not None:
+                try:
+                    self._camera.disconnect()
+                except Exception:
+                    pass
             self.state_updated.emit(state)
             return
 
@@ -357,6 +362,13 @@ class RheedCameraWorker(QThread):
                 state.intensity = _frame_luminance(frame)
                 state.connected = True
                 state.error = ""
+                state.capture_geometry_id = str(
+                    getattr(
+                        self._camera,
+                        "capture_geometry_id",
+                        f"{self.mode}:full-frame",
+                    )
+                )
                 capture = getattr(self._camera, "last_capture", None)
                 if capture is not None:
                     state.capture_backend = capture.backend

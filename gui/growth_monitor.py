@@ -2028,6 +2028,14 @@ class GrowthMonitor(QWidget):
     def update_rheed_qc_state(self, state: RheedQcState) -> None:
         """Render the app-owned acquisition state without inferring labels."""
         self._rheed_qc_state = state
+        if hasattr(self, "live_equalizer_tab"):
+            self.live_equalizer_tab.update_qc_context(
+                session_active=state.session_active,
+                view_segment_id=state.view_segment_id,
+                visual_history_generation=state.visual_history_generation,
+                gun_aligned=state.gun_aligned,
+                realignment_active=state.realignment_active,
+            )
         self._update_rheed_qc_controls()
 
     def _update_rheed_qc_controls(self) -> None:
@@ -2460,10 +2468,23 @@ class GrowthMonitor(QWidget):
             )
         return {
             "capture_backend": state.capture_backend,
+            "capture_geometry_id": state.capture_geometry_id,
             "captured_at_utc": state.captured_at_utc,
+            # Internal-only source clock. CSV writers intentionally ignore it;
+            # Equalizer snapshots use it to recompute age at Save time.
+            "captured_monotonic_ns": state.captured_monotonic_ns,
             "capture_sequence": state.capture_sequence,
             "frame_age_ms": frame_age_ms,
             "source_hwnd": state.source_hwnd,
+            "camera_width": state.width,
+            "camera_height": state.height,
+            "session_active": self._rheed_qc_state.session_active,
+            "view_segment_id": self._rheed_qc_state.view_segment_id,
+            "visual_history_generation": (
+                self._rheed_qc_state.visual_history_generation
+            ),
+            "gun_aligned": self._rheed_qc_state.gun_aligned,
+            "realignment_active": self._rheed_qc_state.realignment_active,
         }
 
     def set_auto_capture_status(self, text: str):

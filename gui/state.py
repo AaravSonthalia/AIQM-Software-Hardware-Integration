@@ -54,6 +54,7 @@ class CameraState:
     frame_age_ms: float = 0.0
     source_hwnd: int = 0
     captured_monotonic_ns: int = 0  # internal age calculation, not serialized
+    capture_geometry_id: str = ""  # ROI/chrome-crop identity
 
 
 @dataclass
@@ -75,6 +76,8 @@ class PyrometerState:
     error: str = ""
     device_info: str = ""
     mode: str = ""  # "modbus", "screengrab", or "dummy"
+    # Software acquisition provenance. Native source time stays blank when the
+    # driver exposes only a value; age is refreshed when the cache is logged.
 
 
 @dataclass
