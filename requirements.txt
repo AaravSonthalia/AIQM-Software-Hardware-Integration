@@ -3,6 +3,7 @@ pyqtgraph
 numpy
 matplotlib
 scikit-learn
+scipy
 Pillow
 # Windows-only (Ch-MBE Beckhoff TwinCAT ADS direct-read):
 # pyads

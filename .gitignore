@@ -19,6 +19,10 @@ logs/ocr_debug/
 
 # Test runner cache
 .pytest_cache/
+.codex-jobs/
+
+# Reproducible local validation previews
+tmp/
 
 # Local-only build outputs
 *.egg-info/
