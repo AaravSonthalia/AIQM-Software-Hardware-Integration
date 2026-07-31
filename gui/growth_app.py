@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional
@@ -384,11 +385,24 @@ class GrowthApp(QMainWindow):
             # off, kill it so the UI doesn't get updates from a stale
             # worker while showing "disabled".
             if self.classifier_worker and self.classifier_worker.isRunning():
-                self._stop_worker(self.classifier_worker)
-                self.classifier_worker = None
+                survivors = self._stop_worker(self.classifier_worker)
+                if not survivors:
+                    self.classifier_worker = None
+                else:
+                    log.error(
+                        "Classifier disable deferred because its worker is still running"
+                    )
+                    self.statusBar().showMessage(
+                        "Classifier disable pending: its worker is still stopping.",
+                        7000,
+                    )
             # Explicit "disabled" signal to the monitor so the sliders
             # show a clear message instead of just staying at "idle".
-            self.monitor.set_classifier_disabled()
+            if not (
+                self.classifier_worker
+                and self.classifier_worker.isRunning()
+            ):
+                self.monitor.set_classifier_disabled()
         elif new_camera_worker and self.classifier_worker.isRunning():
             # A fail-closed WGC worker can be re-armed while the classifier
             # thread is still alive. Wire the replacement camera worker to
@@ -429,23 +443,47 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot()
     def _on_disarm(self):
-        """Disconnect all hardware workers."""
-        self._stop_worker(self.camera_worker)
-        self.camera_worker = None
+        """Disconnect all hardware workers without serial wait stacking."""
+        worker_slots = (
+            ("camera_worker", self.camera_worker),
+            ("pyrometer_worker", self.pyrometer_worker),
+            ("mistral_worker", self.mistral_worker),
+            ("evap_worker", self.evap_worker),
+            ("classifier_worker", self.classifier_worker),
+        )
+        survivors = self._stop_workers(
+            *(worker for _name, worker in worker_slots),
+        )
 
-        self._stop_worker(self.pyrometer_worker)
-        self.pyrometer_worker = None
-
-        self._stop_worker(self.mistral_worker)
-        self.mistral_worker = None
-
-        self._stop_worker(self.evap_worker)
-        self.evap_worker = None
-
-        self._stop_worker(self.classifier_worker)
-        self.classifier_worker = None
+        # A live QThread must retain its Python/Qt owner.  Clear only workers
+        # that actually stopped; a subsequent DISARM click can retry any
+        # survivor once its polling or native I/O call returns.
+        for attribute, worker in worker_slots:
+            survived = worker is not None and any(
+                worker is survivor for survivor in survivors
+            )
+            if not survived:
+                setattr(self, attribute, None)
 
         self.monitor.reset_displays()
+        if survivors:
+            names = ", ".join(type(worker).__name__ for worker in survivors)
+            log.error(
+                "Disarm incomplete because %d worker(s) remain running: %s",
+                len(survivors),
+                names,
+            )
+            # Stay armed so the UI neither claims a clean idle state nor
+            # permits config changes while old workers still own the current
+            # hardware configuration.
+            self.monitor.set_state("armed")
+            self.monitor.start_btn.setEnabled(False)
+            self.statusBar().showMessage(
+                "Disarm incomplete: background workers are still stopping. "
+                "Wait and press DISARM again.",
+                7000,
+            )
+            return
         self.monitor.set_state("idle")
         self.statusBar().showMessage("Disarmed \u2014 idle")
 
@@ -469,7 +507,17 @@ class GrowthApp(QMainWindow):
             False, in_progress=True,
         )
         if self.camera_worker is not None and self.camera_worker.isRunning():
-            self._stop_worker(self.camera_worker)
+            survivors = self._stop_worker(self.camera_worker)
+            if survivors:
+                self.monitor.set_rheed_reconnect_required(
+                    True, in_progress=False,
+                )
+                self.statusBar().showMessage(
+                    "RHEED reconnect blocked: the previous capture worker is "
+                    "still stopping. Try again shortly.",
+                    7000,
+                )
+                return
         self.camera_worker = RheedCameraWorker(
             mode="screengrab", poll_interval=1.0,
         )
@@ -1900,6 +1948,12 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot(CameraState)
     def _on_camera_state(self, state: CameraState):
+        # QThread signals queued before closeEvent may be delivered after the
+        # session files have closed.  Do not let those frames update UI state,
+        # re-arm automation, or enter a post-session auto-capture buffer.
+        if self._shutdown_pending:
+            return
+
         self.monitor.update_camera_state(state)
         self.rheed_intensity_window.on_camera_state(state)
 
@@ -2066,6 +2120,17 @@ class GrowthApp(QMainWindow):
         dumped to ``frames/auto_event_NNN/`` so post-hoc analysis can see
         the visual evolution leading up to the trigger.
         """
+        # A signal already queued when shutdown/STOP began can arrive after
+        # GrowthLogger.end_session(), whose session directory intentionally
+        # remains available for exports.  Guard before incrementing the event
+        # counter or writing any image so that retained path cannot create an
+        # orphan, unlogged auto-event directory.
+        if self._shutdown_pending or not self.growth_log.active:
+            log.debug(
+                "Ignored auto-capture event without a writable active session"
+            )
+            return
+
         self._auto_capture_event_count += 1
         pyro_temp = (
             self.monitor._latest_pyro.temperature
@@ -2326,18 +2391,77 @@ class GrowthApp(QMainWindow):
 
     @staticmethod
     def _stop_worker(worker):
-        if worker is not None:
+        """Compatibility wrapper for call sites stopping one worker."""
+        return GrowthApp._stop_workers(worker)
+
+    @staticmethod
+    def _stop_workers(*workers, timeout_ms: int = 5000):
+        """Signal every worker first, then wait within one shared deadline.
+
+        Each worker owns a polling loop.  Stopping them serially makes the GUI
+        wait for the sum of those poll intervals and previously omitted the
+        classifier during window close.  This two-phase shutdown bounds the
+        total wait while retaining a warning if a native thread does not exit.
+
+        Returns a tuple of workers that are still running after the shared
+        deadline.  Window shutdown must treat a non-empty result as a hard
+        refusal to close so Qt objects are never destroyed under live threads.
+        """
+        active = [worker for worker in workers if worker is not None]
+        for worker in active:
             worker.stop()
-            worker.wait(5000)
+
+        deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+        for worker in active:
+            if not worker.isRunning():
+                continue
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if not worker.wait(remaining_ms):
+                log.error(
+                    "Worker did not stop within shared %d ms deadline: %r",
+                    timeout_ms,
+                    worker,
+                )
+        return tuple(worker for worker in active if worker.isRunning())
 
     # --- Shutdown ----------------------------------------------------------
 
     def closeEvent(self, event):
+        # Enter a one-way fail-closed state before signalling workers.  Worker
+        # shutdown may time out and cause this close event to be ignored, but
+        # queued frames/events must never resume acquisition or persist files.
+        self._shutdown_pending = True
+        self.auto_capture_engine.enabled = False
+        self.auto_capture_engine.reset()
         self._sensor_log_timer.stop()
         self._heartbeat_timer.stop()
+
+        # These trend windows are independent Qt top-levels.  Leaving either
+        # visible after the main window closes can keep QApplication.exec()
+        # alive.  They stay closed if shutdown is pending after a worker
+        # timeout, consistent with the one-way fail-closed state above.
+        for auxiliary_window in (
+            self.rheed_intensity_window,
+            self.pyrometer_window,
+        ):
+            auxiliary_window.close()
+
+        survivors = self._stop_workers(
+            self.camera_worker,
+            self.pyrometer_worker,
+            self.mistral_worker,
+            self.evap_worker,
+            self.classifier_worker,
+            self._movie_worker,
+        )
+        # Once shutdown has been requested, never resume a partially stopped
+        # acquisition stack.  Stop all image/log timers and close the session
+        # before either accepting the window close or showing an explicit
+        # fail-closed shutdown-pending state.
         if self.growth_log.active:
             metadata = self.monitor.get_session_metadata()
             self.growth_log.save_session_metadata(metadata)
+            self._invalidate_equalizer_calibration("GUI closed")
             self.growth_log.end_session()
             # Same auto-plot as _on_stop — also covers the "user closed
             # window mid-session" path, not just clean STOP.
@@ -2345,8 +2469,26 @@ class GrowthApp(QMainWindow):
                 self.growth_log.generate_temperature_plot(metadata)
             except Exception as e:
                 log.warning("Auto T vs t plot failed during close: %s", e)
-        self._stop_worker(self.camera_worker)
-        self._stop_worker(self.pyrometer_worker)
-        self._stop_worker(self.mistral_worker)
-        self._stop_worker(self.evap_worker)
+        if survivors:
+            names = ", ".join(type(worker).__name__ for worker in survivors)
+            log.error(
+                "GUI close refused because %d worker(s) remain running: %s",
+                len(survivors),
+                names,
+            )
+            self.monitor.set_state("armed")
+            elapsed_timer = getattr(self.monitor, "_elapsed_timer", None)
+            if elapsed_timer is not None:
+                elapsed_timer.stop()
+            arm_button = getattr(self.monitor, "arm_btn", None)
+            if arm_button is not None:
+                arm_button.setEnabled(False)
+            self.monitor.start_btn.setEnabled(False)
+            self.statusBar().showMessage(
+                "Shutdown pending: logging and session actions are stopped; "
+                "background workers are still exiting. Close again shortly.",
+                7000,
+            )
+            event.ignore()
+            return
         event.accept()

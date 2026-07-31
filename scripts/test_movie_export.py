@@ -198,6 +198,24 @@ class ExportMovieTests(unittest.TestCase):
             out_path = Path(tmp) / DEFAULT_MOVIE_NAME
             self.assertEqual(exporter.export_movie(out_path), "")
 
+    def test_cancel_removes_partial_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir, _ = _make_session_with_frames(tmp, n_frames=10)
+            exporter = MovieExporter(session_dir)
+            out_path = session_dir / DEFAULT_MOVIE_NAME
+            calls = 0
+
+            def cancel_after_first_frame() -> bool:
+                nonlocal calls
+                calls += 1
+                return calls > 1
+
+            self.assertEqual(
+                exporter.export_movie(out_path, cancel_cb=cancel_after_first_frame),
+                "",
+            )
+            self.assertFalse(out_path.exists())
+
 
 @unittest.skipUnless(HAS_CV2, "cv2 not installed")
 class MovieExportWorkerTests(unittest.TestCase):
