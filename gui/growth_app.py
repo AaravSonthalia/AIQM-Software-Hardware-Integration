@@ -10,13 +10,14 @@ import logging
 import os
 import sys
 import time
+from copy import copy
 from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt6.QtWidgets import QFileDialog, QMainWindow
-from PyQt6.QtCore import pyqtSlot, Qt, QTimer
+from PyQt6.QtWidgets import QApplication, QFileDialog, QMainWindow
+from PyQt6.QtCore import QEvent, pyqtSlot, Qt, QTimer
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,12 @@ from gui.movie_export import (
 )
 from gui.rheed_intensity_window import RheedIntensityWindow
 from gui.pyrometer_window import PyrometerWindow
+from gui.temporal_observability import (
+    process_metrics,
+    snapshot_state,
+    synchronization_summary,
+    utc_now_iso,
+)
 
 
 # Tuned against Rahim's 2022_02_04 STO trajectory.
@@ -79,32 +86,32 @@ AUTO_CAPTURE_ADAPTIVE_SIGMA = 3.0
 AUTO_CAPTURE_ADAPTIVE_FLOOR = 0.5
 
 
-def _sample_timing_snapshot(state, logged_monotonic_ns: Optional[int] = None):
+def _sample_timing_snapshot(
+    state,
+    logged_monotonic_ns: Optional[int] = None,
+    source: str = "instrument",
+):
     """Copy one state's provenance and calculate its current monotonic age."""
-    if state is None:
-        return {
-            "source": None,
-            "received": None,
-            "sequence": None,
-            "age_ms": None,
-            "read_duration_ms": None,
-        }
-    if logged_monotonic_ns is None:
-        logged_monotonic_ns = time.monotonic_ns()
-    received_ns = state.received_monotonic_ns
-    age_ms = None
-    if received_ns is not None:
-        age_ms = max(
-            0.0,
-            (logged_monotonic_ns - received_ns) / 1_000_000.0,
-        )
-    return {
-        "source": state.source_at_utc,
-        "received": state.received_at_utc,
-        "sequence": state.sample_sequence,
-        "age_ms": age_ms,
-        "read_duration_ms": state.read_duration_ms,
-    }
+    snap = snapshot_state(source, state, logged_monotonic_ns)
+    result = snap.to_dict()
+    # Compatibility aliases retained for existing timing tests/callers.
+    result.update({
+        "source": snap.source_at_utc,
+        "received": snap.received_at_utc,
+        "read_duration_ms": snap.read_duration_ms,
+    })
+    return result
+
+
+def _stamp_gui_received(state):
+    """Copy and stamp a queued State, including lightweight test doubles."""
+    received_ns = time.perf_counter_ns()
+    try:
+        return replace(state, gui_received_monotonic_ns=received_ns)
+    except TypeError:
+        snapshot = copy(state)
+        setattr(snapshot, "gui_received_monotonic_ns", received_ns)
+        return snapshot
 
 
 # Heartbeat dense-capture: every N seconds during a session, save the
@@ -223,6 +230,7 @@ class GrowthApp(QMainWindow):
         self._sensor_log_timer = QTimer(self)
         self._sensor_log_timer.setInterval(1000)
         self._sensor_log_timer.timeout.connect(self._log_sensors)
+        self._last_sensor_log_tick_ns: Optional[int] = None
 
         # Heartbeat dense-capture timer — fires every N seconds during a
         # session and saves whatever the latest RHEED frame is. See
@@ -372,6 +380,63 @@ class GrowthApp(QMainWindow):
         self._load_local_alignment_demo(
             self.monitor.config_camera_mode.currentText(),
         )
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
+    @staticmethod
+    def _trace_temporal(owner, event: str, source: str, **kwargs) -> bool:
+        """Write a trace when the logger supports temporal observability."""
+        logger = getattr(owner, "growth_log", None)
+        writer = getattr(logger, "log_temporal_event", None)
+        if not callable(writer):
+            return False
+        return bool(writer(event, source, **kwargs))
+
+    def eventFilter(self, watched, event):
+        """Measure selected GUI event-loop turns without consuming events."""
+        event_type = event.type()
+        interactive = {
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.KeyPress,
+            QEvent.Type.Resize,
+            QEvent.Type.WindowStateChange,
+        }
+        window_event = event_type in {
+            QEvent.Type.Resize, QEvent.Type.WindowStateChange,
+        }
+        if (
+            getattr(getattr(self, "growth_log", None), "active", False)
+            and event_type in interactive
+            and (not window_event or watched is self)
+        ):
+            received_ns = time.perf_counter_ns()
+            try:
+                target = watched.objectName() or watched.__class__.__name__
+            except (AttributeError, RuntimeError):
+                target = type(watched).__name__
+
+            def _record_next_turn(
+                event_name=event_type.name,
+                target_name=target,
+                started_ns=received_ns,
+            ):
+                completed_ns = time.perf_counter_ns()
+                GrowthApp._trace_temporal(self,
+                    "event_loop_turn", "gui",
+                    details={
+                        "qt_event": event_name,
+                        "target": target_name,
+                        "event_received_monotonic_ns": started_ns,
+                        "next_turn_monotonic_ns": completed_ns,
+                        "next_turn_latency_ms": (
+                            completed_ns - started_ns
+                        ) / 1_000_000.0,
+                    },
+                )
+
+            QTimer.singleShot(0, _record_next_turn)
+        return super().eventFilter(watched, event)
 
     # --- ARM / DISARM ------------------------------------------------------
 
@@ -407,7 +472,12 @@ class GrowthApp(QMainWindow):
             camera.disconnect()
 
         self._local_demo_sequence += 1
-        captured_monotonic_ns = time.monotonic_ns()
+        captured_monotonic_ns = time.perf_counter_ns()
+        captured_at_utc = (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
         self._on_camera_state(CameraState(
             frame=frame,
             frame_number=self._local_demo_sequence,
@@ -415,13 +485,13 @@ class GrowthApp(QMainWindow):
             height=int(frame.shape[0]),
             intensity=float(np.mean(frame)),
             connected=True,
+            valid=True,
             mode=mode,
             capture_backend=mode,
-            captured_at_utc=(
-                datetime.now(timezone.utc)
-                .isoformat(timespec="milliseconds")
-                .replace("+00:00", "Z")
-            ),
+            captured_at_utc=captured_at_utc,
+            received_at_utc=captured_at_utc,
+            received_monotonic_ns=captured_monotonic_ns,
+            sample_sequence=self._local_demo_sequence,
             capture_sequence=self._local_demo_sequence,
             frame_age_ms=0.0,
             source_hwnd=0,
@@ -724,6 +794,7 @@ class GrowthApp(QMainWindow):
 
         interval_ms = int(self.monitor.config_interval_spin.value() * 1000)
         self._sensor_log_timer.setInterval(interval_ms)
+        self._last_sensor_log_tick_ns = None
         self._sensor_log_timer.start()
 
         # Arm shadow-mode auto-capture for this session
@@ -774,6 +845,7 @@ class GrowthApp(QMainWindow):
     def _on_stop(self):
         """End a growth session — save metadata, auto-export, stop logging."""
         self._sensor_log_timer.stop()
+        self._last_sensor_log_tick_ns = None
         self._heartbeat_timer.stop()
 
         # Turn off scrubber live-polling — the session's CSVs will
@@ -1747,7 +1819,8 @@ class GrowthApp(QMainWindow):
         """
         frame = self.monitor.get_current_frame()
         capture_metadata = self.monitor.get_current_capture_metadata()
-        self.growth_log.record_manual_event(
+        write_started_ns = time.perf_counter_ns()
+        event_index = self.growth_log.record_manual_event(
             elapsed_s=payload.get("elapsed_s", 0.0),
             pyro_temp=payload.get("pyro_temp"),
             voltage_V=payload.get("voltage_V"),
@@ -1756,6 +1829,24 @@ class GrowthApp(QMainWindow):
             frame=frame,
             note=payload.get("note", ""),
             capture_metadata=capture_metadata,
+        )
+        write_completed_ns = time.perf_counter_ns()
+        source_ns = int(capture_metadata.get("captured_monotonic_ns") or 0)
+        GrowthApp._trace_temporal(
+            self,
+            "manual_event_saved",
+            "manual_event",
+            details={
+                "event_index": event_index,
+                "capture_sequence": capture_metadata.get("capture_sequence"),
+                "write_duration_ms": (
+                    write_completed_ns - write_started_ns
+                ) / 1_000_000.0,
+                "source_age_at_save_ms": (
+                    (write_completed_ns - source_ns) / 1_000_000.0
+                    if source_ns > 0 else None
+                ),
+            },
         )
         self.statusBar().showMessage("Event marked", 2000)
 
@@ -1833,7 +1924,7 @@ class GrowthApp(QMainWindow):
         current_a: Optional[float] = None
         psu_source = "none"
         m = self.monitor._latest_mistral
-        if m is not None and m.connected:
+        if m is not None and m.connected and m.valid:
             voltage_v = m.v_actual
             current_a = m.i_actual
             psu_source = "mistral"
@@ -1846,9 +1937,10 @@ class GrowthApp(QMainWindow):
 
         pyro_temp: Optional[float] = None
         pyro = self.monitor._latest_pyro
-        if pyro is not None and pyro.connected:
+        if pyro is not None and pyro.connected and pyro.valid:
             pyro_temp = pyro.temperature
 
+        write_started_ns = time.perf_counter_ns()
         try:
             idx = self.growth_log.record_live_label(
                 elapsed_s=self.monitor.get_elapsed_seconds(),
@@ -1869,6 +1961,22 @@ class GrowthApp(QMainWindow):
             )
             return
         if idx > 0:
+            write_completed_ns = time.perf_counter_ns()
+            GrowthApp._trace_temporal(self,
+                "equalizer_label_saved", "equalizer",
+                details={
+                    "label_index": idx,
+                    "capture_sequence": snapshot.capture_sequence,
+                    "calibration_id": calibration.calibration_id,
+                    "frame_age_at_request_ms": frame_age_ms,
+                    "source_age_at_save_ms": snapshot.age_ms(
+                        write_completed_ns,
+                    ),
+                    "write_duration_ms": (
+                        write_completed_ns - write_started_ns
+                    ) / 1_000_000.0,
+                },
+            )
             self.statusBar().showMessage(
                 f"Live label #{idx} saved", 3000,
             )
@@ -1984,23 +2092,58 @@ class GrowthApp(QMainWindow):
         if not self.growth_log.active:
             return
         pyro = self.monitor._latest_pyro
-        pyro_ok = pyro is not None and pyro.connected
+        pyro_ok = pyro is not None and pyro.connected and pyro.valid
         pyro_temp = pyro.temperature if pyro_ok else None
         pyro_temp_std = pyro.temperature_std if pyro_ok else None
         pyro_temp_n = pyro.temperature_n if pyro_ok else None
         m = self.monitor._latest_mistral
         e = self.monitor._latest_evap
-        mistral_ok = m is not None and m.connected
-        evap_ok = e is not None and e.connected
+        mistral_ok = m is not None and m.connected and m.valid
+        evap_ok = e is not None and e.connected and e.valid
         ads_cells = m.ads_cells if mistral_ok else None
         # Pressure priority: EvapControl elog (O-MBE) → ADS ion_gauge_1_P (Ch-MBE ADS mode)
         _evap_p = e.chamber_pressure_mbar if evap_ok else None
         _ads_p  = ads_cells.get("ion_gauge_1_P") if ads_cells else None
         _pressure = _evap_p if _evap_p is not None else _ads_p
-        logged_monotonic_ns = time.monotonic_ns()
-        pyro_timing = _sample_timing_snapshot(pyro, logged_monotonic_ns)
-        mistral_timing = _sample_timing_snapshot(m, logged_monotonic_ns)
-        evap_timing = _sample_timing_snapshot(e, logged_monotonic_ns)
+        snapshot_monotonic_ns = time.perf_counter_ns()
+        snapshot_at_utc = utc_now_iso()
+        previous_tick_ns = self._last_sensor_log_tick_ns
+        self._last_sensor_log_tick_ns = snapshot_monotonic_ns
+        timer_interval_ms = None
+        timer_jitter_ms = None
+        if previous_tick_ns is not None:
+            timer_interval_ms = (
+                snapshot_monotonic_ns - previous_tick_ns
+            ) / 1_000_000.0
+            timer_jitter_ms = (
+                timer_interval_ms - self._sensor_log_timer.interval()
+            )
+        camera = self.monitor._latest_camera
+        snapshots = {
+            "rheed": snapshot_state(
+                "rheed", camera, snapshot_monotonic_ns,
+            ),
+            "pyrometer": snapshot_state(
+                "pyrometer", pyro, snapshot_monotonic_ns,
+            ),
+            "mistral": snapshot_state(
+                "mistral", m, snapshot_monotonic_ns,
+            ),
+            "evap": snapshot_state(
+                "evap", e, snapshot_monotonic_ns,
+            ),
+        }
+        sync = synchronization_summary(snapshots)
+        rheed_timing = snapshots["rheed"].to_dict()
+        if camera is not None:
+            rheed_timing.update({
+                "capture_backend": camera.capture_backend,
+                "source_hwnd": camera.source_hwnd,
+            })
+        pyro_timing = snapshots["pyrometer"].to_dict()
+        mistral_timing = snapshots["mistral"].to_dict()
+        evap_timing = snapshots["evap"].to_dict()
+        write_started_ns = time.perf_counter_ns()
         self.growth_log.log_sensors(
             pyro_temp,
             self.monitor.get_elapsed_seconds(),
@@ -2028,21 +2171,50 @@ class GrowthApp(QMainWindow):
             plasma_forward_W=e.plasma_forward_W if evap_ok else None,
             plasma_reflected_W=e.plasma_reflected_W if evap_ok else None,
             ads_cells=ads_cells,
-            pyrometer_source_at_utc=pyro_timing["source"],
-            pyrometer_received_at_utc=pyro_timing["received"],
+            pyrometer_source_at_utc=pyro_timing["source_at_utc"],
+            pyrometer_received_at_utc=pyro_timing["received_at_utc"],
             pyrometer_sample_sequence=pyro_timing["sequence"],
             pyrometer_age_ms=pyro_timing["age_ms"],
             pyrometer_read_duration_ms=pyro_timing["read_duration_ms"],
-            mistral_source_at_utc=mistral_timing["source"],
-            mistral_received_at_utc=mistral_timing["received"],
+            mistral_source_at_utc=mistral_timing["source_at_utc"],
+            mistral_received_at_utc=mistral_timing["received_at_utc"],
             mistral_sample_sequence=mistral_timing["sequence"],
             mistral_age_ms=mistral_timing["age_ms"],
             mistral_read_duration_ms=mistral_timing["read_duration_ms"],
-            evap_source_at_utc=evap_timing["source"],
-            evap_received_at_utc=evap_timing["received"],
+            evap_source_at_utc=evap_timing["source_at_utc"],
+            evap_received_at_utc=evap_timing["received_at_utc"],
             evap_sample_sequence=evap_timing["sequence"],
             evap_age_ms=evap_timing["age_ms"],
             evap_read_duration_ms=evap_timing["read_duration_ms"],
+            snapshot_at_utc=snapshot_at_utc,
+            snapshot_monotonic_ns=snapshot_monotonic_ns,
+            snapshot_timer_interval_ms=timer_interval_ms,
+            snapshot_timer_jitter_ms=timer_jitter_ms,
+            sync_span_ms=sync["sync_span_ms"],
+            sync_complete=sync["sync_complete"],
+            sync_valid=sync["sync_valid"],
+            rheed_timing=rheed_timing,
+            pyrometer_timing=pyro_timing,
+            mistral_timing=mistral_timing,
+            evap_timing=evap_timing,
+        )
+        flush_completed_ns = time.perf_counter_ns()
+        GrowthApp._trace_temporal(self,
+            "sensor_snapshot", "gui",
+            details={
+                "snapshot_at_utc": snapshot_at_utc,
+                "snapshot_monotonic_ns": snapshot_monotonic_ns,
+                "timer_interval_ms": timer_interval_ms,
+                "timer_jitter_ms": timer_jitter_ms,
+                "csv_flush_duration_ms": (
+                    flush_completed_ns - write_started_ns
+                ) / 1_000_000.0,
+                **sync,
+                "sources": {
+                    name: item.to_dict() for name, item in snapshots.items()
+                },
+                "process": process_metrics(),
+            },
         )
 
         from datetime import datetime
@@ -2063,6 +2235,7 @@ class GrowthApp(QMainWindow):
         Also caches the immutable worker snapshot so auto-capture can bind it
         to the current event.
         """
+        state = _stamp_gui_received(state)
         qc = self._rheed_qc_state
         if (
             qc.session_active
@@ -2075,6 +2248,40 @@ class GrowthApp(QMainWindow):
 
         self._latest_classifier = state
         self.monitor.update_classifier_state(state)
+        if self.growth_log.active:
+            capture_to_complete_ms = None
+            if (
+                state.source_received_monotonic_ns > 0
+                and state.inference_completed_monotonic_ns > 0
+            ):
+                capture_to_complete_ms = (
+                    state.inference_completed_monotonic_ns
+                    - state.source_received_monotonic_ns
+                ) / 1_000_000.0
+            GrowthApp._trace_temporal(self,
+                "classifier_state", "classifier",
+                details={
+                    "source_capture_sequence": state.source_capture_sequence,
+                    "source_received_monotonic_ns": (
+                        state.source_received_monotonic_ns
+                    ),
+                    "inference_started_monotonic_ns": (
+                        state.inference_started_monotonic_ns
+                    ),
+                    "inference_completed_monotonic_ns": (
+                        state.inference_completed_monotonic_ns
+                    ),
+                    "worker_emitted_monotonic_ns": (
+                        state.worker_emitted_monotonic_ns
+                    ),
+                    "gui_received_monotonic_ns": (
+                        state.gui_received_monotonic_ns
+                    ),
+                    "inference_ms": state.inference_ms,
+                    "capture_to_inference_complete_ms": capture_to_complete_ms,
+                    "error": state.error,
+                },
+            )
 
         if (
             qc.session_active
@@ -2111,6 +2318,18 @@ class GrowthApp(QMainWindow):
         # re-arm automation, or enter a post-session auto-capture buffer.
         if self._shutdown_pending:
             return
+
+        state = _stamp_gui_received(state)
+        if self.growth_log.active:
+            GrowthApp._trace_temporal(self,
+                "state_received", "rheed",
+                timing=snapshot_state("rheed", state).to_dict(),
+                details={
+                    "capture_backend": state.capture_backend,
+                    "source_hwnd": state.source_hwnd,
+                    "capture_geometry_id": state.capture_geometry_id,
+                },
+            )
 
         self.monitor.update_camera_state(state)
         self.rheed_intensity_window.on_camera_state(state)
@@ -2159,6 +2378,7 @@ class GrowthApp(QMainWindow):
             )
         elif (
             state.connected
+            and getattr(state, "valid", state.connected)
             and state.frame is not None
         ):
             self._camera_capture_interrupted = False
@@ -2199,6 +2419,7 @@ class GrowthApp(QMainWindow):
             self.growth_log.active
             and state.frame is not None
             and state.connected
+            and getattr(state, "valid", state.connected)
         ):
             self.auto_capture_engine.evaluate(
                 state.frame,
@@ -2244,12 +2465,26 @@ class GrowthApp(QMainWindow):
         )
         if capture_token == self._last_heartbeat_capture_token:
             return
+        write_started_ns = time.perf_counter_ns()
         path = self.growth_log.save_heartbeat_frame(frame)
         if not path:
+            GrowthApp._trace_temporal(self,
+                "frame_write_rejected", "heartbeat",
+                details={
+                    "capture_sequence": capture_sequence,
+                    "write_duration_ms": (
+                        time.perf_counter_ns() - write_started_ns
+                    ) / 1_000_000.0,
+                },
+            )
             return  # Quality gate rejected, or save failed
         pyro_temp = (
             self.monitor._latest_pyro.temperature
-            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            if (
+                self.monitor._latest_pyro
+                and self.monitor._latest_pyro.connected
+                and self.monitor._latest_pyro.valid
+            )
             else None
         )
         self.growth_log.log_heartbeat(
@@ -2257,6 +2492,26 @@ class GrowthApp(QMainWindow):
             pyro_temp=pyro_temp,
             frame_path=path,
             capture_metadata=capture_metadata,
+        )
+        write_completed_ns = time.perf_counter_ns()
+        source_ns = int(
+            capture_metadata.get("captured_monotonic_ns") or 0,
+        )
+        GrowthApp._trace_temporal(self,
+            "frame_saved", "heartbeat",
+            details={
+                "capture_sequence": capture_sequence,
+                "frame_path": path,
+                "write_started_monotonic_ns": write_started_ns,
+                "write_completed_monotonic_ns": write_completed_ns,
+                "write_duration_ms": (
+                    write_completed_ns - write_started_ns
+                ) / 1_000_000.0,
+                "source_age_at_save_ms": (
+                    (write_completed_ns - source_ns) / 1_000_000.0
+                    if source_ns > 0 else None
+                ),
+            },
         )
         self._last_heartbeat_capture_token = capture_token
         # Bump the Monitor-tab footer counter only after a successful
@@ -2292,7 +2547,11 @@ class GrowthApp(QMainWindow):
         event_idx = self._auto_capture_event_count + 1
         pyro_temp = (
             self.monitor._latest_pyro.temperature
-            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            if (
+                self.monitor._latest_pyro
+                and self.monitor._latest_pyro.connected
+                and self.monitor._latest_pyro.valid
+            )
             else None
         )
         context_captures = self.auto_capture_engine.get_recent_captures()
@@ -2511,14 +2770,26 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot(PyrometerState)
     def _on_pyrometer_state(self, state: PyrometerState):
+        state = _stamp_gui_received(state)
+        if self.growth_log.active:
+            GrowthApp._trace_temporal(self,
+                "state_received", "pyrometer",
+                timing=snapshot_state("pyrometer", state).to_dict(),
+            )
         self.monitor.update_pyrometer_state(state)
         self.pyrometer_window.on_pyrometer_state(state)
 
     @pyqtSlot(MistralState)
     def _on_mistral_state(self, state: MistralState):
+        state = _stamp_gui_received(state)
+        if self.growth_log.active:
+            GrowthApp._trace_temporal(self,
+                "state_received", "mistral",
+                timing=snapshot_state("mistral", state).to_dict(),
+            )
         self.monitor.update_mistral_state(state)
 
-        if not self.growth_log.active or not state.connected:
+        if not self.growth_log.active or not state.connected or not state.valid:
             return
 
         # Detect operator setpoint changes (Set Voltage / Set Current button
@@ -2528,7 +2799,11 @@ class GrowthApp(QMainWindow):
         elapsed = self.monitor.get_elapsed_seconds()
         pyro_temp = (
             self.monitor._latest_pyro.temperature
-            if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
+            if (
+                self.monitor._latest_pyro
+                and self.monitor._latest_pyro.connected
+                and self.monitor._latest_pyro.valid
+            )
             else None
         )
 
@@ -2570,6 +2845,12 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot(EvapControlState)
     def _on_evap_state(self, state: EvapControlState):
+        state = _stamp_gui_received(state)
+        if self.growth_log.active:
+            GrowthApp._trace_temporal(self,
+                "state_received", "evap",
+                timing=snapshot_state("evap", state).to_dict(),
+            )
         self.monitor.update_evap_state(state)
 
     # --- Helpers -----------------------------------------------------------
@@ -2676,4 +2957,12 @@ class GrowthApp(QMainWindow):
             )
             event.ignore()
             return
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.removeEventFilter(self)
+            except (TypeError, RuntimeError):
+                # Lightweight unit-test harnesses call closeEvent without
+                # inheriting QObject and never install a Qt event filter.
+                pass
         event.accept()

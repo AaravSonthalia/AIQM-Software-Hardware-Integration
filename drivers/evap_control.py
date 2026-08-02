@@ -19,7 +19,8 @@ import logging
 import math
 import os
 import re
-from datetime import timezone
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -85,6 +86,8 @@ class EvapControl:
         self._bbox = bbox
         self._hwnd = 0
         self._connected = False
+        self._last_capture_at_utc: Optional[str] = None
+        self._last_capture_monotonic_ns: Optional[int] = None
 
     def connect(self) -> None:
         self._hwnd = find_window(self._substring)
@@ -97,6 +100,8 @@ class EvapControl:
 
     def read(self) -> dict[str, Optional[float]]:
         result: dict[str, Optional[float]] = {"chamber_pressure_mbar": None}
+        self._last_capture_at_utc = None
+        self._last_capture_monotonic_ns = None
         if not self._connected or not self._hwnd:
             return result
 
@@ -104,6 +109,10 @@ class EvapControl:
             frame = capture_window(self._hwnd)
         except Exception:
             return result
+        self._last_capture_monotonic_ns = time.perf_counter_ns()
+        self._last_capture_at_utc = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds",
+        )
 
         if self._bbox is not None:
             bbox = self._bbox
@@ -139,6 +148,15 @@ class EvapControl:
     @property
     def connected(self) -> bool:
         return self._connected
+
+    @property
+    def last_capture_at_utc(self) -> Optional[str]:
+        """Python time immediately after the OCR source screenshot."""
+        return self._last_capture_at_utc
+
+    @property
+    def last_capture_monotonic_ns(self) -> Optional[int]:
+        return self._last_capture_monotonic_ns
 
     @property
     def hwnd(self) -> int:

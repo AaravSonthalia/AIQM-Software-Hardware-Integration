@@ -93,8 +93,9 @@ Fields:
 
 Every CSV uses `csv.DictReader`-compatible headers (comma-separated,
 newline-terminated). Fields with no value are empty strings, not
-`null`. All timestamps are naive ISO-8601 (no timezone; assume local
-lab time / Chicago).
+`null`. Temporal-validation sessions write timezone-explicit UTC timestamps;
+older sessions may contain naive Chicago-local ISO-8601 values. Consumers must
+inspect the offset rather than assigning one convention to every session.
 
 ### 2.1 `sensor_log.csv`
 
@@ -118,6 +119,15 @@ Written every ~1 second by `SensorLogWriter`. See
 | `cell_HTEC2_pv_C` | float | HTEC2 cell temp PV |
 | `cell_Y_pv_C` | float | Y cell PV |
 | `cell_Sr_pv_C` | float | Sr cell PV |
+
+New temporal columns are append-only and preserve all legacy positions. Each
+source has receive time, success sequence, age, read duration and validity.
+`snapshot_at_utc` is the 1 Hz cache-snapshot time; `sync_span_ms` is the span
+between the receive times of the four referenced samples. `sync_valid=True`
+means those samples were present and valid, not that the span is physically
+acceptable. Raw `perf_counter_ns` events, Qt queue delay, classifier latency,
+resource use and file-write timing live in the unbundled session file
+`temporal_trace.jsonl`.
 | `cell_Eu_pv_C` | float | Eu cell PV |
 | `cell_Er_pv_C` | float | Er cell PV |
 | `plasma_dc_bias_V` | float | Plasma source DC bias |

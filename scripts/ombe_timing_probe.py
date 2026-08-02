@@ -27,6 +27,9 @@ from typing import Iterable, Optional
 
 
 INSTRUMENTS = {
+    "rheed": {
+        "values": ["rheed_sample_sequence"],
+    },
     "pyrometer": {
         "values": ["pyrometer_temp_C"],
     },
@@ -122,6 +125,27 @@ def _read_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
         return list(reader.fieldnames or []), list(reader)
 
 
+def _read_jsonl(path: Optional[Path]) -> tuple[list[dict], int]:
+    if path is None or not path.exists():
+        return [], 0
+    records: list[dict] = []
+    parse_errors = 0
+    with path.open(encoding="utf-8-sig") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                parse_errors += 1
+                continue
+            if isinstance(value, dict):
+                records.append(value)
+            else:
+                parse_errors += 1
+    return records, parse_errors
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -164,6 +188,7 @@ def summarize_instrument(
     ages: list[float] = []
     intervals: list[float] = []
     durations: list[float] = []
+    worker_to_gui: list[float] = []
     source_offsets: list[float] = []
     source_intervals: list[float] = []
     reused_source_timestamps = 0
@@ -197,6 +222,9 @@ def summarize_instrument(
         duration = _parse_float(row.get(duration_field))
         if duration is not None:
             durations.append(duration)
+        queue_delay = _parse_float(row.get(f"{prefix}_worker_to_gui_ms"))
+        if queue_delay is not None:
+            worker_to_gui.append(queue_delay)
 
         source = _parse_utc(row.get(source_field))
         if source is not None:
@@ -229,6 +257,18 @@ def summarize_instrument(
     def _rate(count: int) -> Optional[float]:
         return 100.0 * count / row_count if row_count else None
 
+    interval_stats = _stats(intervals)
+    interval_p95 = interval_stats["p95"]
+    stale_audit_threshold_ms = max(
+        3000.0,
+        2.0 * interval_p95 * 1000.0 if interval_p95 is not None else 0.0,
+    )
+    stale_valid_rows = sum(
+        str(row.get(f"{prefix}_valid", "")).lower() == "true"
+        and (age := _parse_float(row.get(age_field))) is not None
+        and age > stale_audit_threshold_ms
+        for row in rows
+    )
     return {
         "row_count": row_count,
         "unique_observed_samples": unique_samples,
@@ -240,12 +280,189 @@ def summarize_instrument(
         "reused_sequence_percent": _rate(reused),
         "unobserved_intermediate_samples": unobserved_intermediate,
         "sequence_resets": sequence_resets,
-        "sequence_normalized_interval_s": _stats(intervals),
+        "sequence_normalized_interval_s": interval_stats,
         "read_duration_ms": _stats(durations),
+        "worker_to_gui_ms": _stats(worker_to_gui),
         "logged_age_ms": _stats(ages),
         "source_to_receive_offset_ms": _stats(source_offsets),
         "source_update_interval_s": _stats(source_intervals),
         "reused_source_timestamp_rows": reused_source_timestamps,
+        "stale_audit_threshold_ms": stale_audit_threshold_ms,
+        "stale_valid_rows": stale_valid_rows,
+    }
+
+
+def summarize_cross_source(rows: list[dict[str, str]]) -> dict:
+    spans = [
+        value for row in rows
+        if (value := _parse_float(row.get("sync_span_ms"))) is not None
+    ]
+    intervals = [
+        value for row in rows
+        if (value := _parse_float(
+            row.get("snapshot_timer_interval_ms"),
+        )) is not None
+    ]
+    jitter = [
+        value for row in rows
+        if (value := _parse_float(
+            row.get("snapshot_timer_jitter_ms"),
+        )) is not None
+    ]
+    complete = sum(
+        str(row.get("sync_complete", "")).lower() == "true" for row in rows
+    )
+    valid = sum(
+        str(row.get("sync_valid", "")).lower() == "true" for row in rows
+    )
+    return {
+        "sync_span_ms": _stats(spans),
+        "snapshot_timer_interval_ms": _stats(intervals),
+        "snapshot_timer_jitter_ms": _stats(jitter),
+        "sync_complete_rows": complete,
+        "sync_valid_rows": valid,
+        "row_count": len(rows),
+    }
+
+
+def summarize_trace(records: list[dict], parse_errors: int) -> dict:
+    by_source: dict[str, list[int]] = {}
+    classifier_capture_ms: list[float] = []
+    classifier_inference_ms: list[float] = []
+    frame_write_ms: list[float] = []
+    frame_age_ms: list[float] = []
+    csv_flush_ms: list[float] = []
+    event_loop_ms: list[float] = []
+    rss_bytes: list[float] = []
+    os_threads: list[float] = []
+    for record in records:
+        event = str(record.get("event", ""))
+        source = str(record.get("source", ""))
+        timing = record.get("timing") or {}
+        details = record.get("details") or {}
+        if event == "state_received":
+            received = _parse_int(timing.get("received_monotonic_ns"))
+            valid = bool(timing.get("valid"))
+            if received is not None and valid:
+                by_source.setdefault(source, []).append(received)
+        elif event == "classifier_state":
+            if (value := _parse_float(
+                details.get("capture_to_inference_complete_ms"),
+            )) is not None:
+                classifier_capture_ms.append(value)
+            if (value := _parse_float(details.get("inference_ms"))) is not None:
+                classifier_inference_ms.append(value)
+        elif event == "frame_saved":
+            if (value := _parse_float(details.get("write_duration_ms"))) is not None:
+                frame_write_ms.append(value)
+            if (value := _parse_float(details.get("source_age_at_save_ms"))) is not None:
+                frame_age_ms.append(value)
+        elif event == "sensor_snapshot":
+            if (value := _parse_float(details.get("csv_flush_duration_ms"))) is not None:
+                csv_flush_ms.append(value)
+            process = details.get("process") or {}
+            if (value := _parse_float(process.get("rss_bytes"))) is not None:
+                rss_bytes.append(value)
+            if (value := _parse_float(process.get("os_thread_count"))) is not None:
+                os_threads.append(value)
+        elif event == "event_loop_turn":
+            if (value := _parse_float(
+                details.get("next_turn_latency_ms"),
+            )) is not None:
+                event_loop_ms.append(value)
+
+    nearest: dict[str, dict] = {}
+    anchors = sorted(set(by_source.get("rheed", [])))
+    for source in ("pyrometer", "mistral", "evap"):
+        candidates = sorted(set(by_source.get(source, [])))
+        deltas: list[float] = []
+        if candidates:
+            import bisect
+            for anchor in anchors:
+                pos = bisect.bisect_left(candidates, anchor)
+                neighbors = candidates[max(0, pos - 1):pos + 1]
+                if neighbors:
+                    deltas.append(
+                        min(abs(value - anchor) for value in neighbors)
+                        / 1_000_000.0
+                    )
+        nearest[source] = {
+            "matched_anchor_count": len(deltas),
+            "unmatched_anchor_count": len(anchors) - len(deltas),
+            "absolute_delta_ms": _stats(deltas),
+        }
+    return {
+        "record_count": len(records),
+        "parse_errors": parse_errors,
+        "rheed_anchor_count": len(anchors),
+        "nearest_neighbor_to_rheed": nearest,
+        "classifier_capture_to_complete_ms": _stats(classifier_capture_ms),
+        "classifier_inference_ms": _stats(classifier_inference_ms),
+        "frame_write_ms": _stats(frame_write_ms),
+        "frame_age_at_save_ms": _stats(frame_age_ms),
+        "csv_flush_ms": _stats(csv_flush_ms),
+        "event_loop_turn_ms": _stats(event_loop_ms),
+        "rss_bytes": _stats(rss_bytes),
+        "rss_first_bytes": rss_bytes[0] if rss_bytes else None,
+        "rss_last_bytes": rss_bytes[-1] if rss_bytes else None,
+        "rss_delta_bytes": (
+            rss_bytes[-1] - rss_bytes[0] if len(rss_bytes) >= 2 else None
+        ),
+        "os_thread_count": _stats(os_threads),
+    }
+
+
+def summarize_operator_actions(
+    trace_records: list[dict], actions: list[dict], parse_errors: int,
+) -> dict:
+    states: dict[str, list[tuple[int, bool, str, Optional[float], int]]] = {}
+    for record in trace_records:
+        if record.get("event") != "state_received":
+            continue
+        source = str(record.get("source", ""))
+        timing = record.get("timing") or {}
+        recorded_ns = _parse_int(record.get("recorded_monotonic_ns"))
+        if recorded_ns is None:
+            continue
+        states.setdefault(source, []).append((
+            recorded_ns,
+            bool(timing.get("valid")),
+            str(timing.get("error", "")),
+            _parse_float(timing.get("age_ms")),
+            _parse_int(timing.get("sequence")) or 0,
+        ))
+    results: list[dict] = []
+    for action in actions:
+        action_ns = _parse_int(action.get("recorded_monotonic_ns"))
+        source = str(action.get("source", ""))
+        phase = str(action.get("phase", ""))
+        target_valid = True if phase == "after" else False if phase == "before" else None
+        match = None
+        if action_ns is not None and target_valid is not None:
+            for state_ns, valid, error, age_ms, sequence in sorted(
+                states.get(source, []),
+            ):
+                if state_ns >= action_ns and valid is target_valid:
+                    match = {
+                        "state_monotonic_ns": state_ns,
+                        "latency_ms": (state_ns - action_ns) / 1_000_000.0,
+                        "valid": valid,
+                        "error": error,
+                        "retained_sample_age_ms": age_ms,
+                        "sample_sequence": sequence,
+                    }
+                    break
+        results.append({
+            "label": action.get("label", ""),
+            "phase": phase,
+            "source": source,
+            "action_monotonic_ns": action_ns,
+            "transition": match,
+        })
+    return {
+        "action_count": len(actions),
+        "parse_errors": parse_errors,
+        "transitions": results,
     }
 
 
@@ -256,6 +473,8 @@ def build_summary(
     metadata: dict,
     capture: dict,
     repo_root: Path,
+    temporal_trace: Optional[Path] = None,
+    operator_actions: Optional[Path] = None,
 ) -> dict:
     instruments = {
         prefix: summarize_instrument(rows, prefix, config["values"])
@@ -272,8 +491,10 @@ def build_summary(
             "read_duration_ms",
         )
     }
+    trace_records, trace_parse_errors = _read_jsonl(temporal_trace)
+    action_records, action_parse_errors = _read_jsonl(operator_actions)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at_utc": dt.datetime.now(
             dt.timezone.utc,
         ).isoformat(timespec="seconds"),
@@ -290,6 +511,21 @@ def build_summary(
         "capture": capture,
         "metadata": metadata,
         "instruments": instruments,
+        "cross_source": summarize_cross_source(rows),
+        "temporal_trace": {
+            "path": str(temporal_trace.resolve()) if temporal_trace else "",
+            "sha256": (
+                _file_sha256(temporal_trace)
+                if temporal_trace and temporal_trace.exists() else ""
+            ),
+            **summarize_trace(trace_records, trace_parse_errors),
+        },
+        "operator_actions": {
+            "path": str(operator_actions.resolve()) if operator_actions else "",
+            **summarize_operator_actions(
+                trace_records, action_records, action_parse_errors,
+            ),
+        },
         "interpretation": {
             "pass_fail_threshold_applied": False,
             "interval_definition": (
@@ -394,7 +630,42 @@ def render_markdown(summary: dict) -> str:
             f"| {result['reused_source_timestamp_rows']} |"
         )
 
+    stale_lines = [
+        f"- {name}: `{result['stale_valid_rows']}` valid row(s) older than "
+        f"the audit threshold `{_fmt(result['stale_audit_threshold_ms'])} ms`."
+        for name, result in summary["instruments"].items()
+    ]
     lines.extend([
+        "",
+        "### Stale-data audit",
+        "",
+        *stale_lines,
+        "",
+        "## Cross-source and GUI pipeline",
+        "",
+        f"- Sync span p50/p95/p99 (ms): "
+        f"`{_fmt(summary['cross_source']['sync_span_ms']['p50'])} / "
+        f"{_fmt(summary['cross_source']['sync_span_ms']['p95'])} / "
+        f"{_fmt(summary['cross_source']['sync_span_ms']['p99'])}`",
+        f"- Structurally valid snapshots: "
+        f"`{summary['cross_source']['sync_valid_rows']} / "
+        f"{summary['cross_source']['row_count']}`",
+        f"- Temporal trace parse errors: "
+        f"`{summary['temporal_trace']['parse_errors']}`",
+        f"- Classifier capture-to-complete p50/p95/p99 (ms): "
+        f"`{_fmt(summary['temporal_trace']['classifier_capture_to_complete_ms']['p50'])} / "
+        f"{_fmt(summary['temporal_trace']['classifier_capture_to_complete_ms']['p95'])} / "
+        f"{_fmt(summary['temporal_trace']['classifier_capture_to_complete_ms']['p99'])}`",
+        f"- CSV flush p50/p95/p99 (ms): "
+        f"`{_fmt(summary['temporal_trace']['csv_flush_ms']['p50'])} / "
+        f"{_fmt(summary['temporal_trace']['csv_flush_ms']['p95'])} / "
+        f"{_fmt(summary['temporal_trace']['csv_flush_ms']['p99'])}`",
+        f"- GUI next-turn p50/p95/p99 (ms): "
+        f"`{_fmt(summary['temporal_trace']['event_loop_turn_ms']['p50'])} / "
+        f"{_fmt(summary['temporal_trace']['event_loop_turn_ms']['p95'])} / "
+        f"{_fmt(summary['temporal_trace']['event_loop_turn_ms']['p99'])}`",
+        f"- Operator fault/recovery markers: "
+        f"`{summary['operator_actions']['action_count']}`",
         "",
         "## Interpretation notes",
         "",
@@ -463,6 +734,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--temporal-trace", type=Path,
+        help="temporal_trace.jsonl; defaults to the sensor log directory",
+    )
+    parser.add_argument(
+        "--operator-actions", type=Path,
+        help="operator_actions.jsonl; defaults to the sensor log directory",
+    )
     parser.add_argument(
         "--no-wait",
         action="store_true",
@@ -535,6 +814,14 @@ def main() -> int:
         metadata,
         capture,
         repo_root,
+        temporal_trace=(
+            args.temporal_trace.resolve()
+            if args.temporal_trace else sensor_log.parent / "temporal_trace.jsonl"
+        ),
+        operator_actions=(
+            args.operator_actions.resolve()
+            if args.operator_actions else sensor_log.parent / "operator_actions.jsonl"
+        ),
     )
 
     json_path = output_dir / "timing_summary.json"

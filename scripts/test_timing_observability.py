@@ -44,7 +44,7 @@ class StateTimingTests(unittest.TestCase):
     def test_mark_sample_received_increments_and_measures_duration(self):
         state = PyrometerState()
         with (
-            patch("gui.workers.time.monotonic_ns", return_value=2_500_000),
+            patch("gui.workers.time.perf_counter_ns", return_value=2_500_000),
             patch(
                 "gui.workers._utc_iso_now",
                 return_value="2026-07-27T12:00:00.000+00:00",
@@ -262,6 +262,25 @@ class ProbeSummaryTests(unittest.TestCase):
         )
         self.assertEqual(result["reused_source_timestamp_rows"], 1)
 
+    def test_stale_valid_row_uses_measured_interval_audit_rule(self):
+        rows = [
+            {
+                "mistral_sample_sequence": str(index),
+                "mistral_received_at_utc": (
+                    f"2026-07-27T12:00:0{index}+00:00"
+                ),
+                "mistral_age_ms": "3500" if index == 3 else "100",
+                "mistral_valid": "True",
+                "mistral_v_actual_V": "1.0",
+            }
+            for index in (1, 2, 3)
+        ]
+        result = summarize_instrument(
+            rows, "mistral", ["mistral_v_actual_V"],
+        )
+        self.assertEqual(result["stale_audit_threshold_ms"], 3000.0)
+        self.assertEqual(result["stale_valid_rows"], 1)
+
     def test_report_states_that_no_threshold_was_applied(self):
         empty_stats = {
             "p50": None,
@@ -282,6 +301,8 @@ class ProbeSummaryTests(unittest.TestCase):
             "source_to_receive_offset_ms": empty_stats,
             "source_update_interval_s": empty_stats,
             "reused_source_timestamp_rows": 0,
+            "stale_audit_threshold_ms": 3000.0,
+            "stale_valid_rows": 0,
         }
         summary = {
             "source": {
@@ -299,6 +320,18 @@ class ProbeSummaryTests(unittest.TestCase):
             "metadata": {},
             "software": {"git_commit": "commit"},
             "instruments": {"evap": instrument},
+            "cross_source": {
+                "sync_span_ms": empty_stats,
+                "sync_valid_rows": 0,
+                "row_count": 0,
+            },
+            "temporal_trace": {
+                "parse_errors": 0,
+                "classifier_capture_to_complete_ms": empty_stats,
+                "csv_flush_ms": empty_stats,
+                "event_loop_turn_ms": empty_stats,
+            },
+            "operator_actions": {"action_count": 0},
         }
         report = render_markdown(summary)
         self.assertIn("No synchronization or pass/fail threshold", report)

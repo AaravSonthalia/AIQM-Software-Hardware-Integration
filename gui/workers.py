@@ -27,7 +27,8 @@ def _mark_sample_received(
     A failed read does not call this helper, so its state retains the previous
     sequence/timestamp and downstream ``age_ms`` increases naturally.
     """
-    received_ns = time.monotonic_ns()
+    received_ns = time.perf_counter_ns()
+    state.acquire_started_monotonic_ns = read_started_ns
     state.source_at_utc = source_at_utc
     state.received_at_utc = _utc_iso_now()
     state.sample_sequence += 1
@@ -35,6 +36,31 @@ def _mark_sample_received(
         0.0, (received_ns - read_started_ns) / 1_000_000.0,
     )
     state.received_monotonic_ns = received_ns
+    state.valid = True
+
+
+def _emission_snapshot(state):
+    """Return a fresh State stamped immediately before queued emission."""
+    if not hasattr(state, "worker_emitted_monotonic_ns"):
+        return replace(state)
+    return replace(
+        state,
+        worker_emitted_monotonic_ns=time.perf_counter_ns(),
+    )
+
+
+def _mark_read_failed(
+    state, error: object, read_started_ns: Optional[int] = None,
+) -> None:
+    """Invalidate the current poll without advancing its success sequence."""
+    state.valid = False
+    state.error = str(error or "read returned no usable values")
+    if read_started_ns is not None:
+        state.acquire_started_monotonic_ns = int(read_started_ns)
+        state.read_duration_ms = max(
+            0.0,
+            (time.perf_counter_ns() - read_started_ns) / 1_000_000.0,
+        )
 
 
 def _frame_luminance(frame: np.ndarray) -> float:
@@ -252,7 +278,7 @@ class ThermocoupleWorker(QThread):
             from dracal_tmc100k import DracalTMC100k, find_dracal_sensors
         except ImportError:
             state.error = "dracal_tmc100k module not available"
-            self.state_updated.emit(state)
+            self.state_updated.emit(_emission_snapshot(state))
             return
 
         # Auto-detect port if not specified
@@ -268,7 +294,7 @@ class ThermocoupleWorker(QThread):
 
         if not port:
             state.error = "No Dracal TMC100k sensor detected."
-            self.state_updated.emit(state)
+            self.state_updated.emit(_emission_snapshot(state))
             return
 
         # Connect
@@ -361,7 +387,7 @@ class RheedCameraWorker(QThread):
                     self._camera.disconnect()
                 except Exception:
                     pass
-            self.state_updated.emit(state)
+            self.state_updated.emit(_emission_snapshot(state))
             return
 
         frame_count = 0
@@ -369,6 +395,7 @@ class RheedCameraWorker(QThread):
         fps_frame_count = 0
 
         while self.running:
+            read_started_ns = time.perf_counter_ns()
             try:
                 frame = self._camera.read_frame()
                 frame_count += 1
@@ -412,24 +439,39 @@ class RheedCameraWorker(QThread):
                     state.capture_sequence = frame_count
                     state.frame_age_ms = 0.0
                     state.source_hwnd = 0
-                    state.captured_monotonic_ns = time.monotonic_ns()
+                    state.captured_monotonic_ns = time.perf_counter_ns()
+
+                read_finished_ns = time.perf_counter_ns()
+                state.acquire_started_monotonic_ns = read_started_ns
+                state.received_at_utc = state.captured_at_utc
+                state.received_monotonic_ns = state.captured_monotonic_ns
+                state.sample_sequence = state.capture_sequence
+                state.read_duration_ms = max(
+                    0.0, (read_finished_ns - read_started_ns) / 1_000_000.0,
+                )
+                state.valid = True
 
             except Exception as e:
-                state.error = str(e)
+                _mark_read_failed(state, e)
+                state.acquire_started_monotonic_ns = read_started_ns
+                state.read_duration_ms = max(
+                    0.0,
+                    (time.perf_counter_ns() - read_started_ns) / 1_000_000.0,
+                )
                 state.frame = None
                 # A failed read is never a connected/usable observation.
                 # Recovering backends may retry on the next loop; a later
                 # successful frame sets ``connected=True`` again.
                 state.connected = False
                 if self.mode == "screengrab":
-                    self.state_updated.emit(replace(state))
+                    self.state_updated.emit(_emission_snapshot(state))
                     self.running = False
                     break
 
             # CameraState is a Python object carried through a queued Qt
             # signal. Emit a fresh dataclass snapshot so the next worker
             # iteration cannot mutate image provenance before the GUI reads it.
-            self.state_updated.emit(replace(state))
+            self.state_updated.emit(_emission_snapshot(state))
             time.sleep(self.poll_interval)
 
         # Cleanup
@@ -511,12 +553,12 @@ class PyrometerWorker(QThread):
             else:
                 state.device_info = self.mode
 
-            self.state_updated.emit(replace(state))
+            self.state_updated.emit(_emission_snapshot(state))
 
         except Exception as e:
             state.connected = False
             state.error = str(e)
-            self.state_updated.emit(replace(state))
+            self.state_updated.emit(_emission_snapshot(state))
             return
 
         while self.running:
@@ -524,21 +566,32 @@ class PyrometerWorker(QThread):
             # emitted state carries a mean ± std rather than a single
             # noisy point estimate. Polybot-inspired statistical
             # consistency without a second analysis pass.
-            read_started_ns = time.monotonic_ns()
+            read_started_ns = time.perf_counter_ns()
             readings: list[float] = []
+            subread_ns: list[int] = []
+            read_error: Optional[Exception] = None
             for _ in range(self.samples_per_poll):
                 try:
                     readings.append(self._sensor.read_temperature())
+                    subread_ns.append(time.perf_counter_ns())
                 except Exception as e:
-                    state.error = str(e)
+                    read_error = e
                     break
-            if readings:
+            complete_batch = len(readings) == self.samples_per_poll
+            if complete_batch:
                 arr = np.asarray(readings, dtype=float)
                 state.temperature = float(arr.mean())
                 state.temperature_std = float(arr.std(ddof=0)) if arr.size > 1 else 0.0
                 state.temperature_n = int(arr.size)
                 state.connected = True
                 state.error = ""
+                state.subread_monotonic_ns = tuple(subread_ns)
+                state.sample_span_ms = (
+                    (subread_ns[-1] - subread_ns[0]) / 1_000_000.0
+                    if len(subread_ns) > 1 else 0.0
+                )
+            else:
+                _mark_read_failed(state, read_error, read_started_ns)
 
             # Emissivity is a slow-moving config value — single read is fine.
             if hasattr(self._sensor, "read_emissivity"):
@@ -547,12 +600,12 @@ class PyrometerWorker(QThread):
                 except Exception:
                     pass
 
-            if readings:
+            if complete_batch:
                 _mark_sample_received(state, read_started_ns)
             # PyQt queues custom Python objects by reference. Emit a fresh
             # dataclass so the next poll cannot mutate timing provenance
             # before the GUI/logger consumes this sample.
-            self.state_updated.emit(replace(state))
+            self.state_updated.emit(_emission_snapshot(state))
             time.sleep(self.poll_interval)
 
         # Cleanup
@@ -614,12 +667,12 @@ class MistralWorker(QThread):
                 except Exception as e:
                     state.connected = False
                     state.error = str(e)
-                    self.state_updated.emit(replace(state))
+                    self.state_updated.emit(_emission_snapshot(state))
                     time.sleep(self.poll_interval)
                     continue
 
             try:
-                read_started_ns = time.monotonic_ns()
+                read_started_ns = time.perf_counter_ns()
                 vals = self._driver.read()
                 state.v_set = vals.get("v_set")
                 state.v_actual = vals.get("v_actual")
@@ -629,13 +682,33 @@ class MistralWorker(QThread):
                 # (Ch-MBE Beckhoff TwinCAT ADS). Includes cell{1..7}_T,
                 # ion gauge pressure, turbo RPM, etc. None in other modes.
                 state.ads_cells = vals if self.mode == "ads" else None
+                state.capture_completed_at_utc = getattr(
+                    self._driver, "last_capture_at_utc", None,
+                )
+                state.capture_completed_monotonic_ns = getattr(
+                    self._driver, "last_capture_monotonic_ns", None,
+                )
                 state.connected = True
-                state.error = ""
-                _mark_sample_received(state, read_started_ns)
+                if any(vals.get(key) is not None for key in (
+                    "v_set", "v_actual", "i_set", "i_actual",
+                )):
+                    state.error = ""
+                    _mark_sample_received(state, read_started_ns)
+                    if state.capture_completed_monotonic_ns:
+                        state.processing_duration_ms = max(
+                            0.0,
+                            (state.received_monotonic_ns
+                             - state.capture_completed_monotonic_ns)
+                            / 1_000_000.0,
+                        )
+                else:
+                    _mark_read_failed(
+                        state, "read returned no MISTRAL values", read_started_ns,
+                    )
             except Exception as e:
-                state.error = str(e)
+                _mark_read_failed(state, e, read_started_ns)
 
-            self.state_updated.emit(replace(state))
+            self.state_updated.emit(_emission_snapshot(state))
             time.sleep(self.poll_interval)
 
         if self._driver is not None:
@@ -712,12 +785,12 @@ class EvapControlWorker(QThread):
                 except Exception as e:
                     state.connected = False
                     state.error = str(e)
-                    self.state_updated.emit(replace(state))
+                    self.state_updated.emit(_emission_snapshot(state))
                     time.sleep(self.poll_interval)
                     continue
 
             try:
-                read_started_ns = time.monotonic_ns()
+                read_started_ns = time.perf_counter_ns()
                 vals = self._driver.read()
                 # Pressure: populated by both screengrab and elog modes.
                 state.chamber_pressure_mbar = vals.get("chamber_pressure_mbar")
@@ -735,19 +808,37 @@ class EvapControlWorker(QThread):
                 state.plasma_dc_bias_V = vals.get("plasma_dc_bias_V")
                 state.plasma_forward_W = vals.get("plasma_forward_W")
                 state.plasma_reflected_W = vals.get("plasma_reflected_W")
-                state.connected = True
-                state.error = ""
-                _mark_sample_received(
-                    state,
-                    read_started_ns,
-                    source_at_utc=getattr(
-                        self._driver, "last_source_at_utc", None,
-                    ),
+                state.capture_completed_at_utc = getattr(
+                    self._driver, "last_capture_at_utc", None,
                 )
+                state.capture_completed_monotonic_ns = getattr(
+                    self._driver, "last_capture_monotonic_ns", None,
+                )
+                state.connected = True
+                if any(value is not None for value in vals.values()):
+                    state.error = ""
+                    _mark_sample_received(
+                        state,
+                        read_started_ns,
+                        source_at_utc=getattr(
+                            self._driver, "last_source_at_utc", None,
+                        ),
+                    )
+                    if state.capture_completed_monotonic_ns:
+                        state.processing_duration_ms = max(
+                            0.0,
+                            (state.received_monotonic_ns
+                             - state.capture_completed_monotonic_ns)
+                            / 1_000_000.0,
+                        )
+                else:
+                    _mark_read_failed(
+                        state, "read returned no EvapControl values", read_started_ns,
+                    )
             except Exception as e:
-                state.error = str(e)
+                _mark_read_failed(state, e, read_started_ns)
 
-            self.state_updated.emit(replace(state))
+            self.state_updated.emit(_emission_snapshot(state))
             time.sleep(self.poll_interval)
 
         if self._driver is not None:
@@ -834,6 +925,8 @@ class ClassifierWorker(QThread):
         self._latest_frame: Optional[np.ndarray] = None
         self._latest_frame_number = -1
         self._latest_frame_key: Optional[tuple] = None
+        self._latest_capture_sequence = 0
+        self._latest_received_monotonic_ns = 0
 
         # Per-cycle state carried across iterations.
         self._smoothed: dict[str, float] = {}   # float internal for EMA math
@@ -865,6 +958,7 @@ class ClassifierWorker(QThread):
         Reusing one mutable dataclass lets a later inference overwrite a
         reset/ready state before the GUI event loop consumes it.
         """
+        state.worker_emitted_monotonic_ns = time.perf_counter_ns()
         self.state_updated.emit(deepcopy(state))
 
     def _stamp_current_view(self, state: ClassifierState) -> None:
@@ -890,9 +984,17 @@ class ClassifierWorker(QThread):
                 self._latest_frame = None
                 self._latest_frame_number = -1
                 self._latest_frame_key = None
+                self._latest_capture_sequence = 0
+                self._latest_received_monotonic_ns = 0
             else:
                 self._latest_frame = camera_state.frame
                 self._latest_frame_number = camera_state.frame_number
+                self._latest_capture_sequence = int(
+                    camera_state.capture_sequence or 0,
+                )
+                self._latest_received_monotonic_ns = int(
+                    camera_state.captured_monotonic_ns or 0,
+                )
                 if camera_state.captured_monotonic_ns:
                     self._latest_frame_key = (
                         "capture",
@@ -1045,6 +1147,8 @@ class ClassifierWorker(QThread):
                 frame = self._latest_frame
                 frame_number = self._latest_frame_number
                 frame_key = self._latest_frame_key
+                source_capture_sequence = self._latest_capture_sequence
+                source_received_monotonic_ns = self._latest_received_monotonic_ns
                 gun_aligned = self._gun_aligned
                 view_segment_id = self._view_segment_id
                 view_epoch = self._view_epoch
@@ -1074,6 +1178,10 @@ class ClassifierWorker(QThread):
                 state.is_ood = False
                 state.has_confident_data = False
                 state.inference_ms = 0.0
+                state.source_capture_sequence = 0
+                state.source_received_monotonic_ns = 0
+                state.inference_started_monotonic_ns = 0
+                state.inference_completed_monotonic_ns = 0
                 state.gun_aligned = gun_aligned
                 state.view_segment_id = view_segment_id
                 state.visual_history_generation = view_epoch
@@ -1096,10 +1204,13 @@ class ClassifierWorker(QThread):
                 continue
 
             # Classify — the heavy work happens here in this worker's thread
-            t0 = time.time()
+            inference_started_ns = time.perf_counter_ns()
             try:
                 result = bridge.classify(frame)
-                inference_ms = (time.time() - t0) * 1000.0
+                inference_completed_ns = time.perf_counter_ns()
+                inference_ms = (
+                    inference_completed_ns - inference_started_ns
+                ) / 1_000_000.0
                 self._consecutive_failures = 0
             except Exception as e:
                 self._consecutive_failures += 1
@@ -1169,6 +1280,10 @@ class ClassifierWorker(QThread):
             state.is_ood = is_ood
             state.has_confident_data = self._has_confident_data
             state.inference_ms = inference_ms
+            state.source_capture_sequence = source_capture_sequence
+            state.source_received_monotonic_ns = source_received_monotonic_ns
+            state.inference_started_monotonic_ns = inference_started_ns
+            state.inference_completed_monotonic_ns = inference_completed_ns
             state.model_version = self._model_version
             state.gun_aligned = True
             state.view_segment_id = view_segment_id

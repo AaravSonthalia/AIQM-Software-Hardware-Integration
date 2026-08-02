@@ -60,6 +60,7 @@ def _make_evap_state(
     return EvapControlState(
         mode=mode,
         connected=connected,
+        valid=connected,
         error="",
         chamber_pressure_mbar=chamber_pressure_mbar,
         substrate_temp_pv_C=substrate_temp_pv_C,
@@ -278,6 +279,7 @@ class DirectReadTabTests(unittest.TestCase):
         screengrab_state = EvapControlState(
             mode="screengrab",
             connected=True,
+            valid=True,
             error="",
             chamber_pressure_mbar=1e-9,
             # All elog-direct fields left at their None defaults.

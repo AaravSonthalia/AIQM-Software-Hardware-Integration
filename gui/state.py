@@ -55,6 +55,22 @@ class CameraState:
     source_hwnd: int = 0
     captured_monotonic_ns: int = 0  # internal age calculation, not serialized
     capture_geometry_id: str = ""  # ROI/chrome-crop identity
+    acquire_started_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    received_at_utc: Optional[str] = None
+    received_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    sample_sequence: int = 0
+    read_duration_ms: Optional[float] = None
+    worker_emitted_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    gui_received_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    valid: bool = False
 
 
 @dataclass
@@ -82,8 +98,22 @@ class PyrometerState:
     received_at_utc: Optional[str] = None
     sample_sequence: int = 0
     read_duration_ms: Optional[float] = None
+    acquire_started_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
     received_monotonic_ns: Optional[int] = field(
         default=None, repr=False, compare=False,
+    )
+    worker_emitted_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    gui_received_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    valid: bool = False
+    sample_span_ms: Optional[float] = None
+    subread_monotonic_ns: tuple[int, ...] = field(
+        default_factory=tuple, repr=False, compare=False,
     )
 
 
@@ -109,9 +139,24 @@ class MistralState:
     received_at_utc: Optional[str] = None
     sample_sequence: int = 0
     read_duration_ms: Optional[float] = None
+    acquire_started_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
     received_monotonic_ns: Optional[int] = field(
         default=None, repr=False, compare=False,
     )
+    worker_emitted_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    gui_received_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    valid: bool = False
+    capture_completed_at_utc: Optional[str] = None
+    capture_completed_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    processing_duration_ms: Optional[float] = None
 
 
 @dataclass
@@ -153,9 +198,24 @@ class EvapControlState:
     received_at_utc: Optional[str] = None
     sample_sequence: int = 0
     read_duration_ms: Optional[float] = None
+    acquire_started_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
     received_monotonic_ns: Optional[int] = field(
         default=None, repr=False, compare=False,
     )
+    worker_emitted_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    gui_received_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    valid: bool = False
+    capture_completed_at_utc: Optional[str] = None
+    capture_completed_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    processing_duration_ms: Optional[float] = None
 
 
 @dataclass
@@ -213,6 +273,22 @@ class ClassifierState:
 
     # Perf
     inference_ms: float = 0.0
+    source_capture_sequence: int = 0
+    source_received_monotonic_ns: int = field(
+        default=0, repr=False, compare=False,
+    )
+    inference_started_monotonic_ns: int = field(
+        default=0, repr=False, compare=False,
+    )
+    inference_completed_monotonic_ns: int = field(
+        default=0, repr=False, compare=False,
+    )
+    worker_emitted_monotonic_ns: int = field(
+        default=0, repr=False, compare=False,
+    )
+    gui_received_monotonic_ns: int = field(
+        default=0, repr=False, compare=False,
+    )
 
     # Model identity — filename + mtime of best_model.pth, set once at
     # bridge-load time and repeated on every emission. Non-empty means

@@ -1442,18 +1442,18 @@ class GrowthMonitor(QWidget):
 
     def update_pyrometer_state(self, state: PyrometerState):
         self._latest_pyro = state
-        if state.connected:
+        if state.connected and state.valid:
             self.temp_display.value.setText(f"{state.temperature:.0f} \u2103")
         else:
             self.temp_display.value.setText("---")
 
     def update_mistral_state(self, state: MistralState):
         self._latest_mistral = state
-        if state.connected and state.v_actual is not None:
+        if state.connected and state.valid and state.v_actual is not None:
             self.voltage_display.set_value(state.v_actual)
         else:
             self.voltage_display.value.setText("---")
-        if state.connected and state.i_actual is not None:
+        if state.connected and state.valid and state.i_actual is not None:
             self.current_display.set_value(state.i_actual)
         else:
             self.current_display.value.setText("---")
@@ -1461,7 +1461,7 @@ class GrowthMonitor(QWidget):
         # Overrides the elog-based update in update_evap_state() for cells
         # whose state_field is None (all Ch-MBE cells). No-op on O-MBE
         # where ads_cells is None.
-        if state.ads_cells:
+        if state.valid and state.ads_cells:
             for i, display in enumerate(self._cell_displays, start=1):
                 t = state.ads_cells.get(f"cell{i}_T")
                 if t is None:
@@ -1474,7 +1474,7 @@ class GrowthMonitor(QWidget):
         # Monitor-tab pressure display (kept as-is; both screengrab
         # and elog modes source it).
         p = state.chamber_pressure_mbar
-        if state.connected and p is not None:
+        if state.connected and state.valid and p is not None:
             self.pressure_display.value.setText(f"{p:.2e} mbar")
         else:
             self.pressure_display.value.setText("---")
@@ -1488,7 +1488,7 @@ class GrowthMonitor(QWidget):
         # "screengrab" mode which only sources pressure, or "elog"
         # mode with the variable absent from the elog schema), same
         # "---".
-        connected = state.connected
+        connected = state.connected and state.valid
         # Cell displays: driven by EvapControlState fields when state_field
         # is set (O-MBE elog path). Ch-MBE cells have state_field=None and
         # are updated from ads_cells in update_mistral_state() instead.
@@ -2555,13 +2555,17 @@ class GrowthMonitor(QWidget):
         import time
 
         state = self._latest_camera
-        if state is None or state.frame is None or not state.connected:
+        if (
+            state is None or state.frame is None
+            or not state.connected or not state.valid
+        ):
             return {}
         frame_age_ms = state.frame_age_ms
         if state.captured_monotonic_ns:
             frame_age_ms = max(
                 0.0,
-                (time.monotonic_ns() - state.captured_monotonic_ns) / 1_000_000,
+                (time.perf_counter_ns() - state.captured_monotonic_ns)
+                / 1_000_000,
             )
         return {
             "capture_backend": state.capture_backend,

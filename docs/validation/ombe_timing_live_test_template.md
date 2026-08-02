@@ -1,66 +1,113 @@
-# O-MBE Timing Observability Live Test
+# O-MBE GUI Temporal Performance Validation
 
-This test measures the timing of values already read by Growth Monitor. It is
-passive: do not change instrument setpoints, disconnect cables, or power down
-equipment for this branch.
+This protocol is read-only. Growth Monitor records when data reaches Python;
+it does not change setpoints or instrument polling rates. WGC time is a Python
+callback time, not camera exposure time. Only Elog currently supplies a native
+source timestamp.
 
-## Before the run
+## Run manifest
 
-Record:
-
-- Operator and date:
-- Bulbasaur Windows version and display DPI:
-- GUI commit:
-- Pyrometer, MISTRAL, and EvapControl modes:
-- Exact window titles:
-- GUI logging interval and worker settings:
-- EvapControl/MISTRAL/TemperaSure versions:
+- Operator/date:
+- GUI commit and branch:
+- Windows build, timezone, DPI and `w32tm /query /status` result:
+- RHEED/Pyrometer/MISTRAL/EvapControl modes:
+- Default-software versions and exact window titles:
+- Worker and logging intervals:
 - Session directory:
+- External result directory:
 
-Confirm the GUI is using real O-MBE modes rather than `dummy`. ARM the
-instruments, START a session, and locate its live `sensor_log.csv`.
+Use `D:\Environment_Cache\conda_envs\ai4mbe-gui\python.exe`. Keep raw images,
+CSV and JSONL on the workstation; commit only small summaries and SHA-256.
 
-## One-hour probe
+## Local preflight (no instruments)
 
-Run the passive watcher in a second terminal. Long runs must use the repository's
-managed-job launcher so they survive a Codex tool timeout:
+Run this before moving the branch to Bulbasaur:
 
 ```powershell
-$manager = "$env:USERPROFILE\.codex\skills\managed-long-jobs\scripts\managed_job.cmd"
-$python = "C:\Users\Yao_Yufan\.conda\envs\ai4mbe-gui\python.exe"
-
-& $manager launch `
-  --output-dir D:\AIQM-timing-job `
-  --cwd D:\AI4MBE\AIQM-Software-Hardware-Integration `
-  -- $python scripts\ombe_timing_probe.py `
-  D:\path\to\growth_SESSION\sensor_log.csv `
-  --duration-seconds 3600 `
-  --output-dir D:\AIQM-timing-results `
-  --operator "NAME" `
-  --windows-dpi "Windows BUILD; DPI SCALE" `
-  --gui-modes "pyrometer=MODE;mistral=MODE;evap=elog" `
-  --window-titles "TemperaSure=...;MISTRAL=...;EvapControl=..." `
-  --sampling-settings "sensor_log=1Hz;pyrometer=0.5s/5 reads;mistral=1s;evap=1s" `
-  --software-versions "Growth Monitor=...;EvapControl=..."
+$python = 'D:\Environment_Cache\conda_envs\ai4mbe-gui\python.exe'
+& $python scripts\ombe_temporal_offline_smoke.py `
+  --output-dir D:\OMBE_Temporal\offline_smoke_001
 ```
 
-Poll `& $manager status --output-dir D:\AIQM-timing-job` about every 30
-seconds. Read stdout/stderr as soon as `result_available=true`. Use new job and
-result directories for every run; the probe refuses to overwrite results.
-Do not move generated raw logs into Git.
+This creates a deterministic four-source session, analyzes it, and runs the
+durability validator. `scripts\test_modbus_pyrometer.py` and
+`scripts\test_exactus_pyrometer.py` use fakes and are safe offline.
+`scripts\test_pyrometer.py` opens a real serial port and is live-only.
 
-## Evidence review
+## A. Per-interface baselines
 
-Keep `timing_summary.json`, `timing_report.md`, the original `sensor_log.csv`,
-and its SHA-256 together on the workstation. Review:
+Warm up each mode for two minutes, then record at least ten minutes. Serial
+pyrometer modes are mutually exclusive.
 
-- sequence-normalized interval p50/p95/p99;
-- read-duration and logged-age p50/p95/p99;
-- rows missing provenance or all instrument values;
-- repeated sequence rows and unobserved intermediate samples;
-- Elog source-to-Python-receive offset.
-- Elog embedded-record update interval and repeated source timestamps.
+1. RHEED WGC; repeat with `screengrab_mss` only as a diagnostic.
+2. Pyrometer Exactus, Modbus and TemperaSure UIA.
+3. MISTRAL OCR; test JSON-RPC separately and record connected-but-None.
+4. EvapControl Elog and OCR. If possible, compare overlapping Elog/OCR values.
 
-Do not declare synchronization sufficient or insufficient from a single scalar.
-Document pauses, window changes, clock adjustments, and any application errors.
-The generated report intentionally applies no pass/fail threshold.
+Do not treat a row timestamp as simultaneous acquisition. Review sequence
+interval, read duration, worker-to-GUI delay, logged age, missing/invalid rate,
+repeated sequence, skipped samples and longest gap.
+
+## B. Combined one-hour run
+
+Start Growth Monitor interactively in production modes and START a session.
+Launch the passive analyzer with the managed-job wrapper:
+
+```powershell
+$manager = 'C:\Users\Yao_Yufan\.codex\skills\managed-long-jobs\scripts\managed_job.cmd'
+$python = 'D:\Environment_Cache\conda_envs\ai4mbe-gui\python.exe'
+& $manager launch --output-dir D:\OMBE_Temporal\job_001 `
+  --cwd D:\AI4MBE\AIQM-Software-Hardware-Integration -- `
+  $python scripts\ombe_timing_probe.py `
+  D:\path\to\session\sensor_log.csv --duration-seconds 3600 `
+  --output-dir D:\OMBE_Temporal\run_001 --operator NAME `
+  --windows-dpi 'BUILD; SCALE' --gui-modes 'rheed=wgc;pyro=...;mistral=...;evap=...'
+```
+
+Poll the managed job about every 30 seconds. Exercise tab changes, buttons,
+window moves, foreground/background, resize and DPI during labeled segments.
+Record classifier and continuous-capture on/off intervals in the notes. Review
+cross-source `sync_span_ms`, nearest-neighbor delta to RHEED, Qt next-turn
+latency, classifier capture-to-complete, CSV/image write time, RSS and threads.
+
+## C. Fault and recovery markers
+
+The operator performs all physical actions under the instrument safety
+procedure. Immediately bracket each action with markers on the same computer:
+
+```powershell
+$python scripts\ombe_temporal_marker.py `
+  D:\path\to\session\operator_actions.jsonl mistral_close `
+  --source mistral --phase before
+# Manually close the MISTRAL window.
+$python scripts\ombe_temporal_marker.py `
+  D:\path\to\session\operator_actions.jsonl mistral_reopen `
+  --source mistral --phase after
+```
+
+Repeat as authorized for window occlusion/minimize/close/frozen display,
+serial/network disconnection, instrument power loss and recovery. Never change
+setpoints. Test normal GUI close, forced process termination, and—only with
+explicit facility approval—computer power interruption. Record whether recovery
+requires ARM/reconnect and whether classification or image writes continued.
+
+The audit flag for retained stale data is
+`max(2 * measured p95 update interval, 3 s)`. It is not a production threshold.
+
+## D. Durability check and evidence
+
+After every run, including a forced exit:
+
+```powershell
+$python scripts\validate_temporal_session.py D:\path\to\session `
+  --output D:\OMBE_Temporal\run_001\session_validation.json
+```
+
+The validator fails on malformed CSV/JSONL, negative ages, valid samples without
+provenance, inconsistent RHEED capture identity or orphan heartbeat images.
+Retain `timing_summary.json`, `timing_report.md`, session validation, raw files
+and hashes together.
+
+No 500 ms or 1 s synchronization gate is assumed in the first run. Choose the
+final permissible skew only after relating measured p95/p99 span to the maximum
+physical change rate relevant to the experiment.

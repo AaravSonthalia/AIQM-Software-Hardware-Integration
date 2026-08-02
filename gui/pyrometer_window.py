@@ -48,7 +48,7 @@ class PyrometerWindow(QMainWindow):
         self.setCentralWidget(central)
 
     def on_pyrometer_state(self, state: PyrometerState) -> None:
-        if not state.connected:
+        if not state.connected or not state.valid:
             return
         now = time.monotonic()
         if self._t0 is None:

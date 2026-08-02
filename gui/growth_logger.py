@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import tempfile
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -141,6 +142,24 @@ class GrowthLogger:
         "mistral_read_duration_ms",
         "evap_source_at_utc", "evap_received_at_utc",
         "evap_sample_sequence", "evap_age_ms", "evap_read_duration_ms",
+        # Cross-source temporal snapshot. ``sync_valid`` is structural only:
+        # all required samples are present and valid; it does not assert that
+        # the measured span is physically sufficient for growth analysis.
+        "snapshot_at_utc", "snapshot_monotonic_ns",
+        "snapshot_timer_interval_ms", "snapshot_timer_jitter_ms",
+        "sync_span_ms", "sync_complete", "sync_valid",
+        "rheed_mode", "rheed_source_at_utc", "rheed_received_at_utc",
+        "rheed_sample_sequence",
+        "rheed_age_ms", "rheed_read_duration_ms", "rheed_worker_to_gui_ms",
+        "rheed_valid", "rheed_error", "rheed_capture_backend",
+        "rheed_source_hwnd",
+        "pyrometer_mode", "pyrometer_worker_to_gui_ms",
+        "pyrometer_valid", "pyrometer_error", "pyrometer_sample_span_ms",
+        "mistral_mode", "mistral_worker_to_gui_ms",
+        "mistral_valid", "mistral_error", "mistral_capture_at_utc",
+        "mistral_processing_duration_ms",
+        "evap_mode", "evap_worker_to_gui_ms", "evap_valid", "evap_error",
+        "evap_capture_at_utc", "evap_processing_duration_ms",
     ]
     COMMIT_FIELDS = [
         "timestamp", "time_display", "elapsed_s", "sample_id", "grower",
@@ -1888,6 +1907,7 @@ class GrowthLogger:
         self._live_label_file = None
         self._live_label_writer = None
         self._equalizer_calibration_file = None
+        self._temporal_trace_file = None
         self._calibration_journal_trusted = True
         self._commit_counter = 0
         self._heartbeat_counter = 0
@@ -2024,6 +2044,14 @@ class GrowthLogger:
         self._equalizer_calibration_file = open(
             calibration_path, "a", encoding="utf-8", newline="\n",
         )
+        self._temporal_trace_file = open(
+            self._session_dir / "temporal_trace.jsonl",
+            "a", encoding="utf-8", newline="\n",
+        )
+        self.log_temporal_event(
+            "session_start", "gui",
+            details={"session_dir": str(self._session_dir)},
+        )
 
         self._commit_counter = 0
         self._heartbeat_counter = 0
@@ -2065,6 +2093,11 @@ class GrowthLogger:
         evap_source_at_utc=None, evap_received_at_utc=None,
         evap_sample_sequence=None, evap_age_ms=None,
         evap_read_duration_ms=None,
+        snapshot_at_utc=None, snapshot_monotonic_ns=None,
+        snapshot_timer_interval_ms=None, snapshot_timer_jitter_ms=None,
+        sync_span_ms=None, sync_complete=False, sync_valid=False,
+        rheed_timing=None, pyrometer_timing=None,
+        mistral_timing=None, evap_timing=None,
     ):
         """Append a row to sensor_log.csv. All values may be None.
 
@@ -2086,8 +2119,12 @@ class GrowthLogger:
         def _sci(val):
             return f"{val:.3e}" if val is not None else ""
 
+        rheed_timing = dict(rheed_timing or {})
+        pyrometer_timing = dict(pyrometer_timing or {})
+        mistral_timing = dict(mistral_timing or {})
+        evap_timing = dict(evap_timing or {})
         self._sensor_writer.writerow({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "elapsed_s": f"{elapsed_s:.2f}",
             "pyrometer_temp_C":     _f(pyro_temp, 1),
             "pyrometer_temp_std_C": _f(pyro_temp_std, 2),
@@ -2144,9 +2181,97 @@ class GrowthLogger:
             ),
             "evap_age_ms": _f(evap_age_ms, 3),
             "evap_read_duration_ms": _f(evap_read_duration_ms, 3),
+            "snapshot_at_utc": snapshot_at_utc or "",
+            "snapshot_monotonic_ns": (
+                snapshot_monotonic_ns if snapshot_monotonic_ns is not None else ""
+            ),
+            "snapshot_timer_interval_ms": _f(snapshot_timer_interval_ms, 3),
+            "snapshot_timer_jitter_ms": _f(snapshot_timer_jitter_ms, 3),
+            "sync_span_ms": _f(sync_span_ms, 3),
+            "sync_complete": bool(sync_complete),
+            "sync_valid": bool(sync_valid),
+            "rheed_mode": rheed_timing.get("mode", ""),
+            "rheed_source_at_utc": rheed_timing.get("source_at_utc") or "",
+            "rheed_received_at_utc": rheed_timing.get("received_at_utc") or "",
+            "rheed_sample_sequence": rheed_timing.get("sequence") or "",
+            "rheed_age_ms": _f(rheed_timing.get("age_ms"), 3),
+            "rheed_read_duration_ms": _f(
+                rheed_timing.get("read_duration_ms"), 3,
+            ),
+            "rheed_worker_to_gui_ms": _f(
+                rheed_timing.get("worker_to_gui_ms"), 3,
+            ),
+            "rheed_valid": bool(rheed_timing.get("valid", False)),
+            "rheed_error": rheed_timing.get("error", ""),
+            "rheed_capture_backend": rheed_timing.get("capture_backend", ""),
+            "rheed_source_hwnd": rheed_timing.get("source_hwnd", ""),
+            "pyrometer_mode": pyrometer_timing.get("mode", ""),
+            "pyrometer_worker_to_gui_ms": _f(
+                pyrometer_timing.get("worker_to_gui_ms"), 3,
+            ),
+            "pyrometer_valid": bool(pyrometer_timing.get("valid", False)),
+            "pyrometer_error": pyrometer_timing.get("error", ""),
+            "pyrometer_sample_span_ms": _f(
+                pyrometer_timing.get("sample_span_ms"), 3,
+            ),
+            "mistral_mode": mistral_timing.get("mode", ""),
+            "mistral_worker_to_gui_ms": _f(
+                mistral_timing.get("worker_to_gui_ms"), 3,
+            ),
+            "mistral_valid": bool(mistral_timing.get("valid", False)),
+            "mistral_error": mistral_timing.get("error", ""),
+            "mistral_capture_at_utc": (
+                mistral_timing.get("capture_completed_at_utc") or ""
+            ),
+            "mistral_processing_duration_ms": _f(
+                mistral_timing.get("processing_duration_ms"), 3,
+            ),
+            "evap_mode": evap_timing.get("mode", ""),
+            "evap_worker_to_gui_ms": _f(
+                evap_timing.get("worker_to_gui_ms"), 3,
+            ),
+            "evap_valid": bool(evap_timing.get("valid", False)),
+            "evap_error": evap_timing.get("error", ""),
+            "evap_capture_at_utc": (
+                evap_timing.get("capture_completed_at_utc") or ""
+            ),
+            "evap_processing_duration_ms": _f(
+                evap_timing.get("processing_duration_ms"), 3,
+            ),
         })
         self._sensor_file.flush()
         self._sensor_row_counter += 1
+
+    def log_temporal_event(
+        self,
+        event: str,
+        source: str,
+        *,
+        timing: Optional[Mapping[str, object]] = None,
+        details: Optional[Mapping[str, object]] = None,
+    ) -> bool:
+        """Append and flush one parseable temporal trace record."""
+        stream = self._temporal_trace_file
+        if stream is None or stream.closed:
+            return False
+        record = {
+            "schema_version": 1,
+            "event": str(event),
+            "source": str(source),
+            "recorded_at_utc": datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds",
+            ),
+            "recorded_monotonic_ns": time.perf_counter_ns(),
+            "timing": dict(timing or {}),
+            "details": dict(details or {}),
+        }
+        try:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+            stream.flush()
+        except (OSError, TypeError, ValueError) as exc:
+            log.error("Could not append temporal trace: %s", exc)
+            return False
+        return True
 
     def log_commit(self, entry: dict):
         """Append a row to commit_log.csv and accumulate for export."""
@@ -2221,7 +2346,7 @@ class GrowthLogger:
             return
         self._set_change_counter += 1
         self._set_change_writer.writerow({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "elapsed_s": f"{elapsed_s:.2f}",
             "event_idx": self._set_change_counter,
             "channel": channel,
@@ -2294,7 +2419,7 @@ class GrowthLogger:
                     pass
 
         self._manual_event_writer.writerow({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "elapsed_s": f"{elapsed_s:.2f}",
             "event_idx": idx,
             "pyrometer_temp_C": (
@@ -2406,7 +2531,7 @@ class GrowthLogger:
             previous_segment_value = _value("previous_view_segment_id")
 
         self._rheed_view_event_writer.writerow({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "elapsed_s": f"{elapsed_s:.2f}",
             "event_idx": idx,
             "event_type": event_type,
@@ -3030,7 +3155,7 @@ class GrowthLogger:
         # snapshot.
         idx = max([self._live_label_counter, *persisted_indices]) + 1
         row = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "elapsed_s": f"{float(elapsed_s):.2f}",
             "label_idx": idx,
             **equalizer_columns,
@@ -3157,7 +3282,7 @@ class GrowthLogger:
         if not self._heartbeat_writer:
             return
         self._heartbeat_writer.writerow({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "elapsed_s": f"{elapsed_s:.2f}",
             "heartbeat_idx": self._heartbeat_counter,
             "pyrometer_temp_C": (
@@ -3210,7 +3335,7 @@ class GrowthLogger:
             EVENT_STATE_AUTO_SKIPPED,
         }:
             raise ValueError("invalid auto-capture event state")
-        stamp = timestamp or datetime.now().isoformat()
+        stamp = timestamp or datetime.now(timezone.utc).isoformat()
         raw = {
             "timestamp": stamp,
             "elapsed_s": f"{elapsed_s:.2f}",
@@ -3627,7 +3752,7 @@ class GrowthLogger:
         # Close the writer's file handle so we can rewrite in-place.
         self._close_auto_capture_stream()
 
-        timestamp = datetime.now().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         found = False
         for row in rows:
             if str(row.get("event_idx", "")) == str(event_idx):
@@ -4259,6 +4384,10 @@ class GrowthLogger:
 
     def end_session(self):
         """Close CSV files. Preserves session_dir and entries for post-stop export."""
+        self.log_temporal_event(
+            "session_end", "gui",
+            details={"sensor_row_count": self._sensor_row_counter},
+        )
         for f in (
             self._sensor_file, self._commit_file,
             self._auto_capture_file, self._heartbeat_file,
@@ -4266,6 +4395,7 @@ class GrowthLogger:
             self._rheed_view_event_file,
             self._live_label_file,
             self._equalizer_calibration_file,
+            self._temporal_trace_file,
         ):
             if f and not f.closed:
                 f.close()
@@ -4286,6 +4416,7 @@ class GrowthLogger:
         self._live_label_file = None
         self._live_label_writer = None
         self._equalizer_calibration_file = None
+        self._temporal_trace_file = None
         # NOTE: _session_dir and _entries intentionally preserved
         # so Export Growth Log works after STOP.
 
