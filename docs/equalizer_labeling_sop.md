@@ -61,6 +61,13 @@ zero.
 
 Every Save creates a new `label_idx`; it does not overwrite an earlier label.
 
+Equalizer values are **visual basis-fit coefficients**, not normalized
+Classifier2 win rates, surface-area fractions, or human primary labels. Save
+records raw least-squares coefficients (when Auto-fit was used), final slider
+values, a separately normalized copy, fit mode, whether Normalize was applied,
+pixel RMS residual, valid-mask coverage, calibration validity, labeler and
+confidence. `equalizer_argmax` is diagnostic only.
+
 ## Calibration Acceptance and Lifecycle
 
 `GrowthApp` is the sole owner of an accepted calibration. The Equalizer tab
@@ -94,14 +101,32 @@ kind, image path, and SHA-256 as one required provenance unit.
    this exact event frame before fitting or saving.
 4. Adjust the four active sliders and save. The Equalizer update references
    the already captured frame and is written to the existing
-   `events_labels.csv` row for that `event_idx`; the logger never creates an
-   untracked fallback image.
+    `events_labels.csv` row for that `event_idx`; the logger never creates an
+    untracked fallback image.
+
+Saving Equalizer data never writes or replaces `primary_reconstruction` or
+`human_primary_reconstruction`. For a gold primary judgment, first enter an
+explicit **Blind labeling mode** with a non-empty labeler name. The GUI hides
+and disables classifier and Equalizer results and persists that state in
+`human_labeling_state.json`. If either result was already displayed, the audit
+state is missing/malformed, or the GUI restarted without a current explicit
+blind entry, the submission is saved as `human_assisted_primary` and the
+training importer rejects it.
+
+Every primary submission is appended to `human_primary_labels.csv` with a
+unique `annotation_id`, monotonic `label_idx`, labeler, source, blindness
+flags, run/capture/view identity, and exact `rgb-array-v1` SHA-256. This retains
+multiple experts and later corrections. Capture identity includes backend,
+UTC capture time, `gun_aligned`, and `realignment_active`; these are stored in
+the dedicated row rather than inferred later. `events_labels.csv` contains only the
+latest per-event display summary and must not be used as the gold-label table.
 
 Legacy buffers without a complete manifest, stale/incompatible calibration
 IDs, ambiguous filenames, or invalid QC context are rejected for Equalizer
 labeling. The application must not silently use raw or previously aligned
-basis images. Ordinary event notes and reconstruction dropdowns remain
-available separately, including `change_from` and `change_to` for transitions.
+basis images. Primary gold labels also require an exact manifest-backed frame;
+ordinary notes and `change_from`/`change_to` transition summaries remain
+available for legacy buffers.
 
 ## Saved Provenance
 
@@ -112,6 +137,12 @@ Live and Events rows retain the reconstruction fields and append:
 - `capture_backend`, `captured_at_utc`, `capture_sequence`, `frame_age_ms`,
   `source_hwnd`, and `capture_geometry_id`;
 - the saved or selected `frame_path`.
+- `equalizer_raw_*`, `equalizer_final_*`, and `equalizer_normalized_*`, plus
+  `equalizer_source`, fit diagnostics, and exact-frame SHA-256.
+
+Human primary labels do not share this upsert lifecycle: their source of truth
+is the append-only `human_primary_labels.csv`; Events rows merely link the
+newest `human_primary_annotation_id` and `human_primary_label_idx`.
 
 The label snapshot is an immutable image-plus-metadata unit. This prevents the
 image from one callback being combined with the timestamp or sequence of
@@ -121,12 +152,13 @@ landmarks, residuals, basis hash, the complete basis manifest once per bundle,
 evidence kind/path/SHA-256, acceptance, and
 invalidation reason.
 
-Live label image/CSV writes and calibration evidence/journal writes are
-recoverable transactions. If Windows, Python, or workstation power stops
-between commits, the next logger startup uses the pending WAL to complete the
-exact committed pair or remove the uncommitted image. Malformed, conflicting,
-or journal-untrusted state remains fail-closed. Never delete an unresolved WAL
-by hand; preserve it for diagnosis.
+Live label image/CSV writes, calibration evidence/journal writes, and
+auto-capture buffer/CSV writes are recoverable transactions. If Windows,
+Python, or workstation power stops between commits, the next logger startup
+uses the pending WAL to complete the exact committed pair or remove the
+uncommitted image or buffer directory. Malformed, conflicting, or
+journal-untrusted state remains fail-closed. Never delete an unresolved WAL by
+hand; preserve it for diagnosis.
 
 ## Disabled Legacy Entry Point
 

@@ -21,7 +21,9 @@ data for classifier training, active-comparisons pipelines
       manual_events.csv     # grower MARK EVENT clicks (Jul 10+)
       heartbeat_log.csv     # continuous-capture frames
       rheed_view_events.csv # alignment, view-segment, history, and QC events
-      events_labels.csv     # per-event labels (Events tab)
+      events_labels.csv     # mutable per-event display summary; not gold
+      human_primary_labels.csv # append-only independent human judgments
+      human_labeling_state.json # persisted blind-mode proof state
       live_labels.csv       # Live Equalizer save labels (Jul 10+)
       set_change_events.csv # PSU / valve setpoint changes
       session_metadata.json # from GrowthLogger.start_session
@@ -82,7 +84,7 @@ Fields:
 | `counts` | dict | Row counts per CSV — useful for filtering |
 | `quality_flags` | list[str] | See §5 |
 | `has_classifier_data` | bool | Any commit has non-empty `classifier_recon_1x1` |
-| `has_grower_labels` | bool | Any of: events_labels rows, live_labels rows, `grower_corrected=True` commit |
+| `has_grower_labels` | bool | Any human-primary, Equalizer, transition, or corrected-commit record; not proof of gold eligibility |
 | `path_rel` | str | Path relative to `sessions/` in the bundle |
 
 ---
@@ -139,7 +141,8 @@ Key columns:
 | `sample_id`, `grower` | str | Copied from Session tab |
 | `pyrometer_temp_C`, `voltage_V`, `current_A` | float | Sensor snapshot at commit |
 | `psu_source` | enum | `"mistral"` / `"direct"` / `"none"` — how V/I were sourced |
-| `recon_1x1`, `recon_Twinned (2x1)`, `recon_c(6x2)`, `recon_rt13xrt13`, `recon_HTR` | float [0,100] | GROWER's slider values at commit. Sum to 100 iff `grower_corrected=True` |
+| `recon_1x1`, `recon_Twinned (2x1)`, `recon_c(6x2)`, `recon_rt13xrt13`, `recon_HTR` | float [0,100] or empty | Human slider values only when `grower_corrected=True`; blank otherwise |
+| `recon_label_source`, `recon_labeler`, `recon_confidence` | str | Human-label provenance; blank for classifier-mirrored display |
 | `classifier_recon_*` | float [0,100] | CLASSIFIER's smoothed_percent — one column per class. Always populated if classifier was OK for the session |
 | `grower_corrected` | str "True"/"False"/"" | Was `✎ Correct` active? Empty = classifier disabled entirely |
 | `classifier_status` | enum | `OK` means inference completed, not that advice is safe/actionable; other values are `LOADING` / `ERROR` / `DISABLED` |
@@ -151,10 +154,10 @@ Key columns:
 | `frame_path` | str | Absolute path to the LOG-ENTRY frame BMP (`frames/log_<n>.bmp`) |
 | `frame_quality_pass` | str "True"/"False"/"" | Did the frame pass the black/saturation/uniform gate? |
 
-**The `recon_*` / `classifier_recon_*` pairing is the primary
-training signal for Yuxin's #1 active-comparisons pipeline** — for
-every `grower_corrected=True` commit, the two vectors disagree, and
-that disagreement is a labeled training example.
+Never treat `grower_corrected=False` as a label. The GUI may display
+classifier values in its sliders, but commit `recon_*` cells are blank unless
+the grower explicitly enables correction. Even corrected values are human UI
+measurements, not Equalizer coefficients or class probabilities.
 
 ### 2.3 `auto_capture_events.csv`
 
@@ -212,19 +215,50 @@ tables, compute content hashes, and export the fail-closed global-QC dataset.
 
 ### 2.7 `events_labels.csv`
 
-Grower labels applied via Events tab (post-hoc). See
+Mutable Events-tab display summary (post-hoc). See
 `EVENT_LABEL_FIELDS` in `gui/growth_logger.py:166-182`.
+
+This file is keyed by `event_idx`, so a later edit replaces the prior summary.
+It is **not** the source of truth for primary-model training. Use
+`human_primary_labels.csv` below; never train from `primary_reconstruction`.
 
 | Column | Type | Meaning |
 |---|---|---|
 | `event_idx` | int | Join key to `auto_capture_events.csv` / `manual_events.csv` |
-| `primary_reconstruction` | enum | One of RECON_LABELS + `"unknown"` / `"artifact"` |
+| `primary_reconstruction` | enum | Legacy latest-summary field; source is not implied |
+| `human_primary_reconstruction` | enum | Exact-frame human label: `none/weak`, four superstructures, `unknown`, or `artifact` |
+| `human_label_source`, `human_labeler`, `human_confidence` | | Human provenance |
+| `human_blind_to_model`, `human_blind_to_equalizer` | bool-like | Whether either aid had been revealed for this exact frame |
+| `human_primary_annotation_id`, `human_primary_label_idx` | | Link to the newest append-only annotation represented by this summary |
 | `change_from`, `change_to` | enum | Transition labels (Jul 15+) — see §4 |
 | `notes` | str | Grower free-text |
 | `label_timestamp_iso` | ISO-8601 | When the label was applied |
-| `recon_1x1`, `recon_tw`, `recon_c6x2`, `recon_rt13`, `recon_HTR` | float [0,1] | Equalizer mixture (May 19+, if grower used Label with Equalizer) |
+| `equalizer_argmax` | enum | Diagnostic visual-basis argmax; never a human primary label |
+| `equalizer_raw_*`, `equalizer_final_*`, `equalizer_normalized_*` | float/empty | Separate coefficient stages; every HTR field is empty |
+| `equalizer_source`, `equalizer_fit_mode`, `equalizer_fit_residual`, `equalizer_valid_coverage` | | Fit provenance and QC |
+| `recon_1x1`, `recon_tw`, `recon_c6x2`, `recon_rt13`, `recon_HTR` | float [0,1]/empty | Legacy aliases of final Equalizer sliders; HTR empty |
 
-### 2.8 `live_labels.csv` *(Jul 10+ sessions only)*
+### 2.8 `human_primary_labels.csv`
+
+Append-only source of truth: one row per human submission, including repeated
+labels from different experts. Required columns are `annotation_id`, monotonic
+`label_idx`, UTC timestamp, `session_id`/`acquisition_run`, exact `frame_path`,
+decoded RGB SHA-256 and algorithm, capture sequence, view segment, label,
+capture backend/timestamp, `gun_aligned`, `realignment_active`, labeler,
+confidence, source, blindness flags, and optional `qc_label`.
+
+Only rows satisfying all of the following are gold:
+
+- `human_label_source == "human_blind_primary"`;
+- both blindness flags are `True`;
+- labeler and exact-frame provenance are non-empty and the SHA recomputes;
+- reconstruction is `none/weak` or one of the four superstructures;
+- QC does not reject the frame.
+
+`human_assisted_primary`, `unknown`, and `artifact` rows remain useful for
+audit/review but must be rejected by the primary-model training loader.
+
+### 2.9 `live_labels.csv` *(Jul 10+ sessions only)*
 
 Live Equalizer tab save events. See `LIVE_LABEL_FIELDS`.
 
@@ -232,8 +266,9 @@ Live Equalizer tab save events. See `LIVE_LABEL_FIELDS`.
 `recon_c6x2`, `recon_rt13`, `recon_HTR`, `pyrometer_temp_C`,
 `voltage_V`, `current_A`, `psu_source`, `frame_path`.
 
-Slider values are in `[0, 1]`, not `[0, 100]` like commit_log —
-the grower isn't required to Normalize before Save.
+Use the `equalizer_*` fields rather than interpreting legacy `recon_*` aliases
+as win rates or primary-type probabilities. Rows also bind calibration, basis,
+view/capture identity, and an exact decoded-frame SHA-256.
 
 ---
 
@@ -258,12 +293,15 @@ themselves.
 
 ## 4. Reconstruction class labels
 
-The five canonical class strings (defined in
-`gui/recon_labels.py`):
+The primary-probability model uses these five mutually exclusive outputs:
 
 ```
-["1x1", "Twinned (2x1)", "c(6x2)", "rt13xrt13", "HTR"]
+["none/weak", "Twinned (2x1)", "c(6x2)", "rt13xrt13", "HTR"]
 ```
+
+`1x1` remains visible evidence and an Equalizer basis, but maps to the
+`none/weak` presence state rather than competing with the four superstructures.
+Legacy transition/slider schemas may still contain the string `1x1`.
 
 Notes on conventions:
 - ASCII `x` (not Unicode `×`)
@@ -301,9 +339,9 @@ Applied by `assess_quality()` in `scripts/build_cs_dataset.py`.
 
 Flags are **tags, not filters** — every session gets zero or more,
 and the CS team decides which combinations mean "include" for their
-pipeline. `real_growth + has_labels` is a strong training-data
-combination; `dummy + startup_test` is what you probably want to
-exclude.
+pipeline. `real_growth + has_labels` is only a review candidate; primary-model
+training still requires the blind/source/SHA checks in §2.8. `dummy +
+startup_test` is what you probably want to exclude.
 
 ---
 
@@ -312,18 +350,19 @@ exclude.
 **Labeled frames for classifier training:**
 
 ```python
-# Frame + primary reconstruction label per auto-capture event
-labels = read_csv("events_labels.csv")
-events = read_csv("auto_capture_events.csv")
-frames_by_event = {}  # event_idx → list of BMP paths
-for e in events:
-    frames_by_event[e["event_idx"]] = sorted(
-        glob(f"{e['buffer_dir']}/*.bmp")
-    )
-
-for label in labels:
-    for frame_path in frames_by_event.get(label["event_idx"], []):
-        yield frame_path, label["primary_reconstruction"]
+# One exact frame per independent, auditable blind judgment.
+for label in read_csv("human_primary_labels.csv"):
+    if label["human_label_source"] != "human_blind_primary":
+        continue
+    if label["human_blind_to_model"] != "True":
+        continue
+    if label["human_blind_to_equalizer"] != "True":
+        continue
+    if label["human_primary_reconstruction"] in {"unknown", "artifact"}:
+        continue
+    frame_path = resolve_session_frame(label["frame_path"])
+    require_recomputed_sha(frame_path, label["frame_sha256"], "rgb-array-v1")
+    yield frame_path, label["human_primary_reconstruction"], label["human_labeler"]
 ```
 
 **Grower-vs-classifier disagreement (Yuxin's #1):**
@@ -353,13 +392,24 @@ for label in read_csv("events_labels.csv"):
 ## 7. Loader stub — PyTorch `Dataset`
 
 ```python
-import csv, json
+import csv, hashlib, json
 from pathlib import Path
+import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
 
-RECON_LABELS = ["1x1", "Twinned (2x1)", "c(6x2)", "rt13xrt13", "HTR"]
+PRIMARY_LABELS = [
+    "none/weak", "Twinned (2x1)", "c(6x2)", "rt13xrt13", "HTR",
+]
+
+def rgb_array_sha(path):
+    arr = np.ascontiguousarray(np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8))
+    digest = hashlib.sha256()
+    digest.update(str(arr.shape).encode("ascii"))
+    digest.update(arr.dtype.str.encode("ascii"))
+    digest.update(arr.tobytes(order="C"))
+    return digest.hexdigest()
 
 class AIQMLabeledFrameDataset(Dataset):
     """Frame + primary reconstruction label from an AIQM bundle."""
@@ -374,40 +424,38 @@ class AIQMLabeledFrameDataset(Dataset):
             self._collect_pairs(session_dir, entry)
 
     def _collect_pairs(self, session_dir, entry):
-        labels_path = session_dir / "events_labels.csv"
+        labels_path = session_dir / "human_primary_labels.csv"
         if not labels_path.exists():
             return
-        events_path = session_dir / "auto_capture_events.csv"
-        events_by_idx = {}
-        with events_path.open() as f:
-            for row in csv.DictReader(f):
-                events_by_idx[row["event_idx"]] = row
         with labels_path.open() as f:
             for label in csv.DictReader(f):
-                if not label["primary_reconstruction"]:
+                if label["human_label_source"] != "human_blind_primary":
                     continue
-                event = events_by_idx.get(label["event_idx"])
-                if not event:
+                if not (
+                    label["human_blind_to_model"] == "True"
+                    and label["human_blind_to_equalizer"] == "True"
+                ):
                     continue
-                buffer_dir = Path(event["buffer_dir"])
-                # If --include-frames was passed, frames live under
-                # session_dir / "frames". Else use frame_manifest.json
-                # to resolve to the source repo.
-                for bmp in sorted(buffer_dir.glob("*.bmp")):
-                    class_idx = RECON_LABELS.index(label["primary_reconstruction"])
-                    self.pairs.append((bmp, class_idx))
+                name = label["human_primary_reconstruction"]
+                if name not in PRIMARY_LABELS:
+                    continue
+                path = session_dir / label["frame_path"]
+                if rgb_array_sha(path) != label["frame_sha256"]:
+                    raise ValueError(f"Exact-frame SHA mismatch: {path}")
+                self.pairs.append((path, PRIMARY_LABELS.index(name)))
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, idx):
         path, class_idx = self.pairs[idx]
-        img = Image.open(path).convert("L")  # 12-bit mono
-        return torch.tensor(list(img.getdata()), dtype=torch.float32), class_idx
+        rgb = np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
+        image = torch.from_numpy(rgb.copy()).permute(2, 0, 1).float() / 255.0
+        return image, class_idx
 ```
 
-Substitute your preferred transforms; the above just reads raw
-grayscale bytes into a flat tensor so you can see the pipe.
+Use run-disjoint splitting and your registered image transforms after this
+fail-closed provenance filter.
 
 ---
 
@@ -415,6 +463,7 @@ grayscale bytes into a flat tensor so you can see the pipe.
 
 | Bundle date | Change |
 |---|---|
+| Aug 2 2026 | Added append-only human-primary labels and auditable blind mode |
 | Jul 29 2026 | Added `rheed_view_events.csv` alignment/history/global-QC contract |
 | Jul 14 2026 | v1 — initial CS-team schema doc, matches AIQM commit `9125c9d` |
 

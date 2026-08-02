@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 import sys
 import unittest
@@ -478,6 +479,27 @@ class CalibrationRecordTests(unittest.TestCase):
             accepted.orientation_evidence_path,
             f"frames/equalizer_calibration_{accepted.calibration_id}_orientation.png",
         )
+
+    def test_dummy_record_can_be_accepted_without_session_qc_provenance(self) -> None:
+        pending = replace(
+            self._record(),
+            capture_backend="dummy_tw",
+            session_id="",
+            view_segment_id=0,
+            gun_aligned=False,
+        )
+        accepted = self._accepted(pending)
+        self.assertTrue(accepted.grower_accepted)
+        self.assertEqual(accepted.capture_backend, "dummy_tw")
+
+    def test_real_record_still_rejects_missing_session_qc_provenance(self) -> None:
+        pending = replace(
+            self._record(),
+            session_id="",
+            gun_aligned=False,
+        )
+        with self.assertRaisesRegex(ValueError, "stable session/QC"):
+            self._accepted(pending)
 
     def test_invalidated_record_cannot_be_revived(self) -> None:
         invalidated = self._accepted(self._record()).invalidated(

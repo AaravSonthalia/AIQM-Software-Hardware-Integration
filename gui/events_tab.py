@@ -93,6 +93,19 @@ RECON_LABEL_OPTIONS = [
     "unknown",
     "artifact",
 ]
+PRIMARY_LABEL_OPTIONS = [
+    # Kept as a legacy UI alias so historical rows remain editable.  Exact
+    # human labels convert this choice to ``none/weak`` below; ``1x1`` is not
+    # part of the new five-output training contract.
+    "1x1",
+    "none/weak",
+    "Twinned (2x1)",
+    "c(6x2)",
+    "rt13xrt13",
+    "HTR",
+    "unknown",
+    "artifact",
+]
 # Sentinel data value for "no label assigned" — distinguishable from any
 # valid reconstruction name in the dropdown's itemData.
 RECON_UNLABELED = ""
@@ -181,6 +194,9 @@ class EventsTab(QWidget):
     retrospective_calibration_accept_requested = pyqtSignal(object)
     retrospective_calibration_invalidation_requested = pyqtSignal(object)
     retrospective_calibration_resolve_requested = pyqtSignal(object)
+    # GrowthMonitor suppresses its live classifier panel and Live Equalizer
+    # tab while this auditable labeling-only mode is active.
+    blind_labeling_mode_changed = pyqtSignal(bool)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -209,6 +225,9 @@ class EventsTab(QWidget):
         # Tracks which event the labeling form is currently bound to, so
         # form-change handlers know which event_idx to write under.
         self._currently_displayed_event_idx: Optional[int] = None
+        self._labeler = ""
+        self._blind_labeling_mode = False
+        self._blind_state_reason = "No labeling session is attached."
         # Debounce notes-text writes — saving on every keystroke would
         # both spam disk and persist garbage like "substrate fla". Save
         # 500ms after the user stops typing, or immediately on selection
@@ -382,14 +401,44 @@ class EventsTab(QWidget):
         form.setContentsMargins(10, 16, 10, 8)
         form.setSpacing(6)
 
+        blind_row = QHBoxLayout()
+        blind_row.setSpacing(6)
+        self._blind_mode_button = QPushButton("Enter blind labeling mode")
+        self._blind_mode_button.setCheckable(True)
+        self._blind_mode_button.setToolTip(
+            "Explicitly hide classifier and Equalizer outputs before assigning "
+            "gold labels. The mode and any prior output exposure are persisted "
+            "in the growth session."
+        )
+        self._blind_mode_button.toggled.connect(
+            self._on_blind_labeling_toggled,
+        )
+        blind_row.addWidget(self._blind_mode_button)
+        self._blind_mode_status = QLabel("assisted / not auditable")
+        self._blind_mode_status.setWordWrap(True)
+        self._blind_mode_status.setStyleSheet("font-size: 10px; color: #d97706;")
+        blind_row.addWidget(self._blind_mode_status, 1)
+        form.addRow("Labeling provenance:", blind_row)
+
         self._primary_recon_combo = QComboBox()
         self._primary_recon_combo.addItem("(unlabeled)", RECON_UNLABELED)
-        for name in RECON_LABEL_OPTIONS:
-            self._primary_recon_combo.addItem(name, name)
+        for name in PRIMARY_LABEL_OPTIONS:
+            display_name = (
+                "1x1 (legacy → none/weak)" if name == "1x1" else name
+            )
+            self._primary_recon_combo.addItem(display_name, name)
         self._primary_recon_combo.activated.connect(
             self._on_primary_recon_activated,
         )
         form.addRow("Primary reconstruction:", self._primary_recon_combo)
+
+        self._primary_confidence_combo = QComboBox()
+        self._primary_confidence_combo.setObjectName("primaryLabelConfidence")
+        self._primary_confidence_combo.addItem("not rated", "")
+        self._primary_confidence_combo.addItem("low", "0.5")
+        self._primary_confidence_combo.addItem("medium", "0.75")
+        self._primary_confidence_combo.addItem("high", "1.0")
+        form.addRow("Primary confidence:", self._primary_confidence_combo)
 
         # Change from → to (Jul 15 2026). Same RECON_LABEL_OPTIONS list
         # as the primary dropdown; growers get familiar visual + kbd
@@ -471,12 +520,134 @@ class EventsTab(QWidget):
 
         return box
 
+    def _set_blind_button_checked(self, checked: bool) -> None:
+        self._blind_mode_button.blockSignals(True)
+        self._blind_mode_button.setChecked(bool(checked))
+        self._blind_mode_button.blockSignals(False)
+
+    def _apply_blind_mode_ui(
+        self, active: bool, *, gold_eligible: bool, reason: str,
+    ) -> None:
+        """Make model-derived answers unavailable while blind mode is active."""
+        self._blind_labeling_mode = bool(active)
+        self._blind_state_reason = str(reason)
+        self._set_blind_button_checked(active)
+        self._blind_mode_button.setText(
+            "Exit blind labeling mode" if active
+            else "Enter blind labeling mode"
+        )
+        if active and gold_eligible:
+            self._blind_mode_status.setText("blind gold eligible")
+            self._blind_mode_status.setStyleSheet(
+                "font-size: 10px; color: #16a34a; font-weight: bold;"
+            )
+        elif active:
+            self._blind_mode_status.setText("outputs hidden; labels remain assisted")
+            self._blind_mode_status.setStyleSheet(
+                "font-size: 10px; color: #d97706; font-weight: bold;"
+            )
+        else:
+            self._blind_mode_status.setText("assisted / not blind")
+            self._blind_mode_status.setStyleSheet(
+                "font-size: 10px; color: #d97706;"
+            )
+        self._blind_mode_status.setToolTip(reason)
+        self._classify_button.setEnabled(not active)
+        self._classifier_result_label.setVisible(not active)
+        self._equalizer_button.setEnabled(not active)
+        if active and self._equalizer_window is not None:
+            self._equalizer_window.close()
+            self._equalizer_window = None
+        self.blind_labeling_mode_changed.emit(bool(active))
+
+    @pyqtSlot(bool)
+    def _on_blind_labeling_toggled(self, checked: bool) -> None:
+        logger = self._growth_logger
+        if logger is None or self._session_dir is None:
+            self._set_blind_button_checked(False)
+            QMessageBox.warning(
+                self, "Blind labeling unavailable",
+                "Attach a growth session before entering blind labeling mode.",
+            )
+            return
+        if checked and not self._labeler:
+            self._set_blind_button_checked(False)
+            QMessageBox.warning(
+                self, "Labeler required",
+                "Enter the grower/labeler name before blind labeling.",
+            )
+            return
+        try:
+            status = logger.set_human_blind_labeling_mode(
+                checked, labeler=self._labeler,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self._set_blind_button_checked(False)
+            self._apply_blind_mode_ui(
+                False, gold_eligible=False, reason=str(exc),
+            )
+            QMessageBox.warning(self, "Blind labeling unavailable", str(exc))
+            return
+        self._apply_blind_mode_ui(
+            bool(status["blind_mode_active"]),
+            gold_eligible=bool(status["gold_eligible"]),
+            reason=str(status["reason"]),
+        )
+
+    def record_classifier_output_visible(
+        self, frame_path: Optional[Path] = None,
+    ) -> bool:
+        """Persist classifier exposure; it can never be undone in-session."""
+        logger = self._growth_logger
+        if logger is None:
+            return True
+        record_exposure = getattr(
+            logger, "record_human_label_output_exposure", None,
+        )
+        if not callable(record_exposure):
+            return True
+        if not record_exposure(
+            "classifier", frame_path=frame_path,
+        ):
+            return False
+        self._apply_blind_mode_ui(
+            False,
+            gold_eligible=False,
+            reason="Classifier output was displayed in this session.",
+        )
+        return True
+
+    def record_equalizer_output_visible(
+        self, frame_path: Optional[Path] = None,
+    ) -> bool:
+        """Persist Equalizer exposure; it can never be undone in-session."""
+        logger = self._growth_logger
+        if logger is None:
+            return True
+        record_exposure = getattr(
+            logger, "record_human_label_output_exposure", None,
+        )
+        if not callable(record_exposure):
+            return True
+        if not record_exposure(
+            "equalizer", frame_path=frame_path,
+        ):
+            return False
+        self._apply_blind_mode_ui(
+            False,
+            gold_eligible=False,
+            reason="Equalizer output was displayed in this session.",
+        )
+        return True
+
     # =====================================================================
     # === SESSION LIFECYCLE ===
     # === (public API used by GrowthApp) ===
     # =====================================================================
 
-    def attach_session(self, growth_logger: Optional[GrowthLogger]) -> None:
+    def attach_session(
+        self, growth_logger: Optional[GrowthLogger], *, labeler: str = "",
+    ) -> None:
         """Point the tab at the active session's logger and reload the list.
 
         Call from GrowthApp._on_start after GrowthLogger.start_session.
@@ -501,10 +672,31 @@ class EventsTab(QWidget):
         self._pending_retrospective_resolve_context = None
 
         self._growth_logger = growth_logger
+        self._labeler = str(labeler or "").strip()
         self._session_dir = (
             growth_logger.session_dir
             if growth_logger is not None and growth_logger.session_dir is not None
             else None
+        )
+        begin_review = getattr(
+            growth_logger, "begin_human_labeling_review", None,
+        )
+        if (
+            growth_logger is not None
+            and self._session_dir is not None
+            and callable(begin_review)
+        ):
+            blind_status = begin_review(self._labeler)
+        else:
+            blind_status = {
+                "blind_mode_active": False,
+                "gold_eligible": False,
+                "reason": "No labeling session is attached.",
+            }
+        self._apply_blind_mode_ui(
+            bool(blind_status["blind_mode_active"]),
+            gold_eligible=bool(blind_status["gold_eligible"]),
+            reason=str(blind_status["reason"]),
         )
         self._last_seen_event_idx = 0
         self.events_table.setRowCount(0)
@@ -1064,9 +1256,9 @@ class EventsTab(QWidget):
             self._labels_cache.get(event_idx)
             if event_idx is not None else None
         )
-        primary = (label or {}).get(
-            "primary_reconstruction", RECON_UNLABELED,
-        )
+        primary = (label or {}).get("human_primary_reconstruction") or (
+            label or {}
+        ).get("primary_reconstruction", RECON_UNLABELED)
         change_from = (label or {}).get("change_from", RECON_UNLABELED)
         change_to = (label or {}).get("change_to", RECON_UNLABELED)
         notes = (label or {}).get("notes", "")
@@ -1084,6 +1276,11 @@ class EventsTab(QWidget):
         self._notes_input.blockSignals(True)
         self._notes_input.setText(notes)
         self._notes_input.blockSignals(False)
+        confidence = (label or {}).get("human_confidence", "")
+        confidence_idx = self._primary_confidence_combo.findData(confidence)
+        self._primary_confidence_combo.setCurrentIndex(
+            confidence_idx if confidence_idx >= 0 else 0
+        )
 
     @pyqtSlot(int)
     def _on_primary_recon_activated(self, idx: int) -> None:
@@ -1100,18 +1297,87 @@ class EventsTab(QWidget):
             or self._growth_logger is None
         ):
             return
-        primary = self._primary_recon_combo.itemData(idx)
-        self._growth_logger.update_event_label(
+        selected_primary = self._primary_recon_combo.itemData(idx)
+        if not selected_primary:
+            # Clearing the mutable event summary never erases an earlier
+            # append-only annotation. Corrections must be submitted as a new
+            # explicit label so the full vote history remains auditable.
+            kwargs: dict[str, object] = {
+                "primary_reconstruction": "",
+                "human_primary_reconstruction": "",
+            }
+        else:
+            if not self._labeler:
+                QMessageBox.warning(
+                    self, "Labeler required",
+                    "A grower/labeler name is required. No human label was saved.",
+                )
+                self._populate_label_form(self._currently_displayed_event_idx)
+                return
+            frame_idx = self._slider.value()
+            if not (0 <= frame_idx < len(self._cached_paths)):
+                QMessageBox.warning(
+                    self, "Exact frame required",
+                    "Select one captured frame before assigning a primary label.",
+                )
+                self._populate_label_form(self._currently_displayed_event_idx)
+                return
+            frame_path = self._cached_paths[frame_idx]
+            metadata = self._capture_metadata_by_filename.get(frame_path.name)
+            if metadata is None:
+                QMessageBox.warning(
+                    self, "Exact frame provenance required",
+                    "This buffer has no complete capture_manifest.csv record. "
+                    "No human label was saved.",
+                )
+                self._populate_label_form(self._currently_displayed_event_idx)
+                return
+            # 1x1 is a legacy UI alias for the none/weak presence state, not
+            # one of the four conditional superstructure classes.
+            primary = (
+                "none/weak" if selected_primary == "1x1"
+                else selected_primary
+            )
+            try:
+                provenance = self._growth_logger.human_primary_provenance(
+                    frame_path=frame_path,
+                    labeler=self._labeler,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                QMessageBox.warning(self, "Primary label blocked", str(exc))
+                self._populate_label_form(self._currently_displayed_event_idx)
+                return
+            kwargs = {
+                "human_primary_reconstruction": primary,
+                "human_label_source": provenance["human_label_source"],
+                "human_labeler": self._labeler,
+                "human_confidence": (
+                    self._primary_confidence_combo.currentData() or ""
+                ),
+                "human_blind_to_model": provenance["human_blind_to_model"],
+                "human_blind_to_equalizer": provenance[
+                    "human_blind_to_equalizer"
+                ],
+                "human_frame_path": str(frame_path),
+                "human_capture_metadata": metadata,
+                "human_annotation_id": uuid.uuid4().hex,
+            }
+        try:
+            saved = self._growth_logger.update_event_label(
+                self._currently_displayed_event_idx,
+                **kwargs,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            saved = False
+            QMessageBox.warning(self, "Primary label blocked", str(exc))
+        if not saved:
+            self._populate_label_form(self._currently_displayed_event_idx)
+            return
+        refreshed = self._growth_logger.read_event_labels().get(
             self._currently_displayed_event_idx,
-            primary_reconstruction=primary,
         )
-        cached = self._labels_cache.setdefault(
-            self._currently_displayed_event_idx,
-            {f: "" for f in GrowthLogger.EVENT_LABEL_FIELDS},
-        )
-        cached["event_idx"] = str(self._currently_displayed_event_idx)
-        cached["primary_reconstruction"] = primary
-        cached["label_timestamp_iso"] = datetime.now().isoformat()
+        if refreshed is not None:
+            self._labels_cache[self._currently_displayed_event_idx] = refreshed
         self._refresh_unreviewed_badge()
 
     @pyqtSlot(int)
@@ -1300,6 +1566,8 @@ class EventsTab(QWidget):
         button while inferring (single-threaded; classifier is fast enough
         on CPU that the brief UI freeze is acceptable for an MVP).
         """
+        if self._blind_labeling_mode:
+            return
         if not self._cached_paths:
             self._classifier_result_label.setText(
                 "<span style='color: #c33;'>no frame loaded</span>"
@@ -1309,6 +1577,7 @@ class EventsTab(QWidget):
         if not (0 <= idx < len(self._cached_paths)):
             return
         frame_path = self._cached_paths[idx]
+        # Exposure is persisted only if a classifier result is actually shown.
 
         classifier = self._get_classifier()
         if classifier is None:
@@ -1323,13 +1592,18 @@ class EventsTab(QWidget):
             from PIL import Image
             arr = np.asarray(Image.open(frame_path).convert("RGB"))
             result = classifier.classify(arr)
+            if not self.record_classifier_output_visible(frame_path):
+                raise OSError(
+                    "classifier result withheld because exposure provenance "
+                    "could not be persisted"
+                )
             self._render_classifier_result(result)
         except Exception as e:
             self._classifier_result_label.setText(
                 f"<span style='color: #c33;'>error: {e}</span>"
             )
         finally:
-            self._classify_button.setEnabled(True)
+            self._classify_button.setEnabled(not self._blind_labeling_mode)
 
     # --- Experimental: Equalizer integration -------------------------------
 
@@ -1353,12 +1627,15 @@ class EventsTab(QWidget):
 
     def _on_open_equalizer(self) -> None:
         """Open the selected historical frame in the shared Equalizer panel."""
+        if self._blind_labeling_mode:
+            return
         if not self._cached_paths:
             return
         idx = self._slider.value()
         if not (0 <= idx < len(self._cached_paths)):
             return
         frame_path = self._cached_paths[idx]
+        # Exposure is persisted only after the Equalizer window is ready.
         event_idx = self._currently_displayed_event_idx
         if event_idx is None:
             return
@@ -1492,13 +1769,13 @@ class EventsTab(QWidget):
             )
         )
         panel.live_label_save_requested.connect(
-            lambda weights: self._save_retrospective_equalizer_label(
+            lambda payload: self._save_retrospective_equalizer_label(
                 panel=panel,
                 provenance_label=provenance_label,
                 logger=logger,
                 event_idx=event_idx,
                 frame_path=frame_path,
-                weights=weights,
+                payload=payload,
             )
         )
 
@@ -1519,6 +1796,15 @@ class EventsTab(QWidget):
                 self._pending_retrospective_resolve_context = None
 
         window.destroyed.connect(_forget_window)
+        if not self.record_equalizer_output_visible(frame_path):
+            window.close()
+            self._equalizer_window = None
+            QMessageBox.warning(
+                self, "Equalizer withheld",
+                "The Equalizer was not shown because its exposure could not "
+                "be persisted in the labeling audit state.",
+            )
+            return
         window.show()
         window.raise_()
         window.activateWindow()
@@ -1802,7 +2088,7 @@ class EventsTab(QWidget):
         logger: GrowthLogger,
         event_idx: int,
         frame_path: Path,
-        weights: dict,
+        payload: dict,
     ) -> None:
         """Save four active weights with the exact frame/calibration DTOs."""
         if logger is not self._growth_logger:
@@ -1827,6 +2113,12 @@ class EventsTab(QWidget):
             )
             return
 
+        weights = payload.get("final_weights") if isinstance(payload, dict) else None
+        if not isinstance(weights, dict):
+            QMessageBox.warning(
+                self, "Equalizer save blocked", "Invalid Equalizer payload.",
+            )
+            return
         columns = {
             "1x1": "recon_1x1",
             "Tw(2x1)": "recon_tw",
@@ -1846,22 +2138,16 @@ class EventsTab(QWidget):
             )
             return
 
-        winning_label = max(columns, key=lambda label: values[columns[label]])
-        primary_names = {
-            "1x1": "1x1",
-            "Tw(2x1)": "Twinned (2x1)",
-            "c(6x2)": "c(6x2)",
-            "RT13": "rt13xrt13",
-        }
         try:
             saved = logger.update_event_label(
                 event_idx,
-                primary_reconstruction=primary_names[winning_label],
                 **values,
                 recon_HTR=None,
                 calibration=calibration,
                 snapshot=snapshot,
                 frame_path=str(frame_path),
+                equalizer_payload=payload,
+                equalizer_labeler=self._labeler,
             )
         except (OSError, TypeError, ValueError) as exc:
             QMessageBox.critical(
@@ -1886,7 +2172,7 @@ class EventsTab(QWidget):
             cached.update({key: f"{value:.4f}" for key, value in values.items()})
             cached.update({
                 "event_idx": str(event_idx),
-                "primary_reconstruction": primary_names[winning_label],
+                "equalizer_argmax": str(payload.get("argmax", "")),
                 "recon_HTR": "",
                 "calibration_id": calibration.calibration_id,
                 "frame_path": str(frame_path),
@@ -1896,7 +2182,8 @@ class EventsTab(QWidget):
         self._refresh_unreviewed_badge()
         provenance_label.setText(
             f"Saved event #{event_idx} with calibration "
-            f"{calibration.calibration_id}; HTR remains unavailable."
+            f"{calibration.calibration_id}; Equalizer argmax is diagnostic only "
+            "and HTR remains unavailable."
         )
 
     def _render_classifier_result(self, result: dict) -> None:

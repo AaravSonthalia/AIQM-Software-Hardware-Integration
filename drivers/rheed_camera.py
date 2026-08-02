@@ -22,6 +22,7 @@ where a kSA tooltip appeared inside a captured RHEED frame).
 import logging
 import threading
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
@@ -1006,34 +1007,132 @@ class ScreenGrabCamera(RheedCamera):
 
 
 class DummyCamera(RheedCamera):
-    """Test camera that returns synthetic frames. Useful for GUI development."""
+    """Stable experimental STO frames for manual Equalizer development.
 
-    def __init__(self, width: int = 656, height: int = 492):
+    The image is shown without an orientation transform: the camera pane stays
+    the reference and calibration warps the simulator basis to match it.
+    """
+
+    PRESETS: dict[str, str] = {
+        "dummy": "1x1",
+        "dummy_c6x2": "c6x2",
+        "dummy_tw": "Twinned2x1",
+        "dummy_rt13_tilted": "RT13",
+    }
+    SOURCE_FILENAMES: dict[str, str] = {
+        "dummy_rt13_tilted": "RT13_20.png",
+    }
+    ROTATION_DEGREES: dict[str, float] = {
+        "dummy_rt13_tilted": 15.0,
+    }
+    DEFAULT_PRESET = "dummy"
+
+    def __init__(
+        self,
+        width: int = 656,
+        height: int = 492,
+        preset: Optional[str] = None,
+        data_root: Optional[Path] = None,
+    ):
         self._width = width
         self._height = height
         self._connected = False
         self._frame_count = 0
+        self._preset = (
+            preset if preset in self.PRESETS else self.DEFAULT_PRESET
+        )
+        self._data_class = self.PRESETS[self._preset]
+        self._data_root = (
+            Path(data_root)
+            if data_root is not None
+            else Path(__file__).resolve().parents[2] / "RHEEDClassify" / "data"
+        )
+        self._source_image: Optional[np.ndarray] = None
+        self._source_path: Optional[Path] = None
+
+    @property
+    def preset(self) -> str:
+        return self._preset
+
+    @property
+    def source_path(self) -> Optional[Path]:
+        return self._source_path
+
+    def _find_data_dir(self) -> Optional[Path]:
+        directory = self._data_root / f"STO_ideal_{self._data_class}"
+        return directory if directory.is_dir() else None
+
+    def _load_image(self) -> None:
+        if self._source_image is not None:
+            return
+        directory = self._find_data_dir()
+        if directory is None:
+            return
+        source_filename = self.SOURCE_FILENAMES.get(self._preset)
+        if source_filename:
+            candidates = [directory / source_filename]
+            candidates = [path for path in candidates if path.is_file()]
+        else:
+            candidates = sorted(directory.glob("*.bmp"))
+        if not candidates:
+            return
+        try:
+            from PIL import Image
+
+            with Image.open(candidates[0]) as image:
+                self._source_image = np.asarray(
+                    image.convert("L"), dtype=np.uint8,
+                ).copy()
+            self._source_path = candidates[0]
+        except (ImportError, OSError, ValueError) as exc:
+            log.warning(
+                "Could not load DummyCamera preset %s from %s: %s",
+                self._preset,
+                candidates[0],
+                exc,
+            )
 
     def connect(self) -> None:
         self._connected = True
         self._frame_count = 0
+        self._load_image()
 
     def read_frame(self) -> np.ndarray:
         if not self._connected:
             raise RuntimeError("Dummy camera not connected.")
-
-        # Generate a test pattern with a moving bright spot
+        self._load_image()
         frame = np.zeros((self._height, self._width, 3), dtype=np.uint8)
 
-        # Moving Gaussian spot to simulate RHEED oscillations
-        cx = self._width // 2
-        cy = self._height // 2
-        intensity = int(128 + 100 * np.sin(self._frame_count * 0.1))
+        if self._source_image is None:
+            # Portable fallback when the sibling RHEEDClassify data checkout is
+            # unavailable. It is intentionally stable so calibration does not
+            # race a changing synthetic frame.
+            cx = self._width // 2
+            cy = self._height // 2
+            y, x = np.ogrid[:self._height, :self._width]
+            r2 = (x - cx) ** 2 + (y - cy) ** 2
+            display = np.clip(
+                200 * np.exp(-r2 / (2 * 50**2)), 0, 255,
+            ).astype(np.uint8)
+        else:
+            from PIL import Image
 
-        y, x = np.ogrid[:self._height, :self._width]
-        r2 = (x - cx) ** 2 + (y - cy) ** 2
-        spot = np.clip(intensity * np.exp(-r2 / (2 * 50**2)), 0, 255).astype(np.uint8)
-        frame[:, :, 1] = spot  # green channel
+            rendered = Image.fromarray(self._source_image).resize(
+                (self._width, self._height),
+                Image.Resampling.BILINEAR,
+            )
+            rotation_degrees = self.ROTATION_DEGREES.get(self._preset, 0.0)
+            if rotation_degrees:
+                rendered = rendered.rotate(
+                    rotation_degrees,
+                    resample=Image.Resampling.BICUBIC,
+                    expand=False,
+                    fillcolor=0,
+                )
+            display = np.asarray(rendered, dtype=np.uint8)
+
+        frame[:, :, 1] = display
+        frame[:, :, 2] = (display // 3).astype(np.uint8)
 
         self._frame_count += 1
         return frame

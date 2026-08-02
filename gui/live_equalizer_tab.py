@@ -49,6 +49,10 @@ from gui.equalizer_alignment import (
     validate_manual_landmarks,
     warp_basis_bundle,
 )
+from gui.equalizer_label_contract import (
+    build_equalizer_payload,
+    fit_residual_rms,
+)
 from gui.state import ClassifierState
 
 
@@ -122,6 +126,9 @@ class LiveEqualizerTab(QWidget):
         self._zoom = 1.0
         self._brightness = 0.0
         self._contrast = 1.0
+        self._fit_mode = "manual"
+        self._raw_fit_weights: Optional[dict[str, float]] = None
+        self._normalization_applied = False
 
         self._build_ui()
         self._load_basis()
@@ -443,6 +450,14 @@ class LiveEqualizerTab(QWidget):
         self._clear_cal_btn.hide()
         buttons.addWidget(self._clear_cal_btn)
         buttons.addStretch(1)
+        buttons.addWidget(QLabel("Confidence:"))
+        self._label_confidence_combo = QComboBox()
+        self._label_confidence_combo.setObjectName("equalizerLabelConfidence")
+        self._label_confidence_combo.addItem("not rated", "")
+        self._label_confidence_combo.addItem("low", "0.5")
+        self._label_confidence_combo.addItem("medium", "0.75")
+        self._label_confidence_combo.addItem("high", "1.0")
+        buttons.addWidget(self._label_confidence_combo)
         self._save_btn = QPushButton("Save label")
         self._save_btn.setObjectName("saveLiveLabelButton")
         self._save_btn.clicked.connect(self._on_save)
@@ -668,6 +683,12 @@ class LiveEqualizerTab(QWidget):
 
     def _on_slider_changed(self) -> None:
         if not self._adjusting:
+            if self._fit_mode == "least_squares":
+                self._fit_mode = "least_squares_then_manual"
+            elif self._fit_mode != "least_squares_then_manual":
+                self._fit_mode = "manual"
+                self._raw_fit_weights = None
+            self._normalization_applied = False
             self._refresh_slider_labels()
             self._update_reconstruction()
 
@@ -699,6 +720,9 @@ class LiveEqualizerTab(QWidget):
     def _reset_to_uniform(self) -> None:
         uniform = 1.0 / len(ACTIVE_SIMULATOR_LABELS)
         self._set_weights({label: uniform for label in ACTIVE_SIMULATOR_LABELS})
+        self._fit_mode = "manual"
+        self._raw_fit_weights = None
+        self._normalization_applied = False
 
     def _on_normalize(self) -> None:
         weights = self._current_weights()
@@ -708,6 +732,7 @@ class LiveEqualizerTab(QWidget):
                 label: float(weights[label] or 0.0) / total
                 for label in ACTIVE_SIMULATOR_LABELS
             })
+            self._normalization_applied = True
 
     def _update_reconstruction(self) -> None:
         if not self._warped_basis:
@@ -725,17 +750,43 @@ class LiveEqualizerTab(QWidget):
         if not ok or self._current_snapshot is None or not self._warped_basis:
             self._update_button_states()
             return
-        from scripts.equalizer_ui import auto_fit
+        from scripts.equalizer_ui import auto_fit_details
 
-        fitted = auto_fit(self._warped_basis, self._current_snapshot.grayscale)
-        active_total = sum(max(0.0, float(fitted.get(label, 0.0))) for label in ACTIVE_SIMULATOR_LABELS)
-        if active_total <= 0:
-            self._reset_to_uniform()
-        else:
-            self._set_weights({
-                label: max(0.0, float(fitted.get(label, 0.0))) / active_total
-                for label in ACTIVE_SIMULATOR_LABELS
-            })
+        raw, fitted = auto_fit_details(
+            self._warped_basis, self._current_snapshot.grayscale,
+        )
+        self._set_weights(fitted)
+        self._raw_fit_weights = {
+            label: max(0.0, float(raw.get(label, 0.0)))
+            for label in ACTIVE_SIMULATOR_LABELS
+        }
+        self._fit_mode = "least_squares"
+        self._normalization_applied = True
+
+    def _equalizer_label_payload(self) -> dict[str, object]:
+        """Bind UI values and fit diagnostics without assigning a primary type."""
+        if (
+            self._current_snapshot is None
+            or self._warped_basis is None
+            or self._valid_mask is None
+        ):
+            raise ValueError("Equalizer payload requires a calibrated frozen frame")
+        weights = self._current_weights()
+        residual = fit_residual_rms(
+            self._warped_basis,
+            self._current_snapshot.grayscale,
+            weights,
+            self._valid_mask,
+        )
+        return build_equalizer_payload(
+            raw_weights=self._raw_fit_weights,
+            final_weights=weights,
+            fit_mode=self._fit_mode,
+            normalization_applied=self._normalization_applied,
+            residual_rms=residual,
+            valid_coverage=float(np.mean(self._valid_mask)),
+            confidence=self._label_confidence_combo.currentData() or "",
+        )
 
     def _on_save(self) -> None:
         ok, reason = self._action_gate(require_calibration=True)
@@ -743,7 +794,12 @@ class LiveEqualizerTab(QWidget):
             self._set_status(reason, error=True)
             self._update_button_states()
             return
-        self.live_label_save_requested.emit(self._current_weights())
+        try:
+            payload = self._equalizer_label_payload()
+        except (TypeError, ValueError) as exc:
+            self._set_status(f"Label payload invalid: {exc}", error=True)
+            return
+        self.live_label_save_requested.emit(payload)
 
     def _on_pause_toggled(self, checked: bool) -> None:
         self._paused = bool(checked)
@@ -867,6 +923,12 @@ class LiveEqualizerTab(QWidget):
     def clear_calibration(self) -> None:
         self.invalidate_calibration("calibration cleared by grower", emit=True)
 
+    @staticmethod
+    def _is_local_demo_snapshot(snapshot: RheedFrameSnapshot) -> bool:
+        """Return whether a frame comes from a repository-backed dummy camera."""
+        backend = str(snapshot.capture_backend or "")
+        return backend == "dummy" or backend.startswith("dummy_")
+
     def _record_staleness(
         self,
         record: CalibrationRecord,
@@ -875,9 +937,10 @@ class LiveEqualizerTab(QWidget):
         snapshot = self._current_snapshot if snapshot is None else snapshot
         if snapshot is None or self._basis_bundle is None:
             return True, "camera snapshot or basis unavailable"
-        if self._qc_context["gun_aligned"] is not True:
+        local_demo = self._is_local_demo_snapshot(snapshot)
+        if not local_demo and self._qc_context["gun_aligned"] is not True:
             return True, "gun alignment not confirmed"
-        if self._qc_context["realignment_active"]:
+        if not local_demo and self._qc_context["realignment_active"]:
             return True, "gun realignment active"
         return calibration_is_stale(
             record,
@@ -886,17 +949,28 @@ class LiveEqualizerTab(QWidget):
             camera_height=snapshot.camera_height,
             capture_backend=snapshot.capture_backend,
             capture_geometry_id=snapshot.capture_geometry_id,
-            view_segment_id=self._qc_context["view_segment_id"],
-            visual_history_generation=int(
-                self._qc_context["visual_history_generation"],
+            view_segment_id=(
+                snapshot.view_segment_id
+                if local_demo else self._qc_context["view_segment_id"]
             ),
-            session_id=self._session_id,
+            visual_history_generation=(
+                snapshot.visual_history_generation
+                if local_demo
+                else int(self._qc_context["visual_history_generation"])
+            ),
+            session_id=snapshot.session_id if local_demo else self._session_id,
             basis_bundle_id=self._basis_bundle.bundle_id,
-            gun_aligned=self._qc_context["gun_aligned"] is True,
-            realignment_active=bool(self._qc_context["realignment_active"]),
+            gun_aligned=(
+                snapshot.gun_aligned
+                if local_demo else self._qc_context["gun_aligned"] is True
+            ),
+            realignment_active=(
+                snapshot.realignment_active
+                if local_demo else bool(self._qc_context["realignment_active"])
+            ),
             session_active=(
                 True
-                if self._retrospective
+                if self._retrospective or local_demo
                 else bool(self._qc_context["session_active"])
             ),
         )
@@ -974,18 +1048,23 @@ class LiveEqualizerTab(QWidget):
         snapshot = self._current_snapshot
         if snapshot is None:
             return False, "fresh RHEED frame required"
-        if not self._retrospective and snapshot.age_ms() > MAX_SNAPSHOT_AGE_MS:
+        local_demo = self._is_local_demo_snapshot(snapshot)
+        if (
+            not self._retrospective
+            and not local_demo
+            and snapshot.age_ms() > MAX_SNAPSHOT_AGE_MS
+        ):
             return False, "RHEED frame is stale"
         if self._retrospective:
             if not self._session_id:
                 return False, "historical frame session ID required"
-        elif require_session and (
+        elif not local_demo and require_session and (
             not self._session_save_enabled or not self._qc_context["session_active"]
         ):
             return False, "active growth session required"
-        if self._qc_context["gun_aligned"] is not True:
+        if not local_demo and self._qc_context["gun_aligned"] is not True:
             return False, "gun alignment must be confirmed"
-        if self._qc_context["realignment_active"]:
+        if not local_demo and self._qc_context["realignment_active"]:
             return False, "gun realignment is active"
         if require_calibration:
             if self._accepted_calibration is None:
@@ -1320,7 +1399,16 @@ class LiveEqualizerTab(QWidget):
             review_active and selected_valid and evidence_selected
         )
         self._auto_fit_btn.setEnabled(calibrated_ok and not self._calibrating)
-        self._save_btn.setEnabled(calibrated_ok and not self._calibrating)
+        save_context_ok = bool(
+            self._retrospective
+            or (
+                self._session_save_enabled
+                and self._qc_context["session_active"]
+            )
+        )
+        self._save_btn.setEnabled(
+            calibrated_ok and save_context_ok and not self._calibrating
+        )
         self._normalize_btn.setEnabled(bool(self._basis))
         self._reset_btn.setEnabled(bool(self._basis))
 

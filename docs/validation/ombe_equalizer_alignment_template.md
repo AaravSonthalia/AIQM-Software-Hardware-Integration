@@ -98,8 +98,8 @@ Record one row for each accepted or rejected candidate.
 - Close method and timestamp:
 - [ ] CSV and JSONL files remained parsable to their last complete record.
 - [ ] No image existed without its corresponding CSV row.
-- [ ] Any pending Live-label WAL was automatically completed or rolled back;
-  the same held for calibration evidence/journal WALs, while
+- [ ] Any pending Live-label, calibration evidence/journal, and auto-capture
+  buffer/event-row WAL was automatically completed or rolled back, while
   malformed/conflicting WAL state failed closed and was retained.
 - [ ] Capture, classifier, and sensor workers exited within the expected
   shutdown deadline; no orphan process/thread remained.

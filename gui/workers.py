@@ -427,7 +427,8 @@ class RheedCameraWorker(QThread):
             return ScreenGrabCamera.legacy_mss()
         else:
             from drivers.rheed_camera import DummyCamera
-            return DummyCamera()
+            preset = self.mode if self.mode in DummyCamera.PRESETS else None
+            return DummyCamera(preset=preset)
 
     def stop(self):
         """Stop the camera worker thread."""

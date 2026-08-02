@@ -149,9 +149,12 @@ class ChangeFromToDropdownTests(unittest.TestCase):
         # BOTH values, not just the last-touched one. Guard against a
         # subtle bug where update_event_label's None-preserving
         # semantics get accidentally overridden.
-        primary_idx = self.tab._primary_recon_combo.findData("c(6x2)")
-        self.tab._primary_recon_combo.setCurrentIndex(primary_idx)
-        self.tab._on_primary_recon_activated(primary_idx)
+        # Seed the mutable legacy summary directly. The primary dropdown now
+        # represents an exact-frame human submission and correctly refuses a
+        # labeler-less, manifest-less test fixture.
+        self.logger.update_event_label(
+            1, primary_reconstruction="c(6x2)",
+        )
 
         from_idx = self.tab._change_from_combo.findData("1x1")
         self.tab._change_from_combo.setCurrentIndex(from_idx)

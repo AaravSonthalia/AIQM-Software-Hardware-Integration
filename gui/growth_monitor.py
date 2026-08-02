@@ -358,6 +358,10 @@ class GrowthMonitor(QWidget):
         # can pair the classifier's smoothed_percent with the grower's slider
         # values in every log entry (for Yuxin's #1 active-comparisons signal).
         self._latest_classifier: Optional[ClassifierState] = None
+        self._blind_labeling_mode = False
+        self._live_classifier_widgets: list[QWidget] = []
+        self._classifier_output_exposure_recorded = False
+        self._equalizer_output_exposure_recorded = False
         # Operator-known acquisition state is independent of classifier
         # Bad/OOD predictions and remains available when live classification
         # is disabled.
@@ -518,6 +522,7 @@ class GrowthMonitor(QWidget):
         recon_header.setContentsMargins(0, 0, 0, 0)
         recon_label = QLabel("Live Classification (%)")
         recon_label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        self._live_classifier_widgets.append(recon_label)
         recon_header.addWidget(recon_label, 1)
 
         self.correction_btn = QPushButton("✎ Correct")
@@ -539,6 +544,7 @@ class GrowthMonitor(QWidget):
             "correction is a fresh decision."
         )
         self.correction_btn.clicked.connect(self._on_correction_toggled)
+        self._live_classifier_widgets.append(self.correction_btn)
         recon_header.addWidget(self.correction_btn, 0)
         right.addLayout(recon_header)
 
@@ -552,6 +558,7 @@ class GrowthMonitor(QWidget):
             lbl = QLabel(name)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.setStyleSheet("font-size: 11px;")
+            self._live_classifier_widgets.append(lbl)
             col.addWidget(lbl)
             slider = QSlider(Qt.Orientation.Vertical)
             slider.setRange(0, 100)
@@ -561,10 +568,12 @@ class GrowthMonitor(QWidget):
             slider.setTickInterval(25)
             slider.setFixedHeight(90)
             slider.setStyleSheet(self._SLIDER_STYLE_LIVE)
+            self._live_classifier_widgets.append(slider)
             col.addWidget(slider, alignment=Qt.AlignmentFlag.AlignHCenter)
             val_lbl = QLabel("0%")
             val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             val_lbl.setStyleSheet("font-size: 11px; color: #0d9488;")
+            self._live_classifier_widgets.append(val_lbl)
             col.addWidget(val_lbl)
             recon_grid.addLayout(col)
             self._recon_sliders[name] = slider
@@ -587,6 +596,7 @@ class GrowthMonitor(QWidget):
         self._recon_status_label = QLabel("Classifier idle")
         self._recon_status_label.setStyleSheet("font-size: 10px; color: #888;")
         self._recon_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._live_classifier_widgets.append(self._recon_status_label)
         right.addWidget(self._recon_status_label)
 
         # Note input
@@ -920,6 +930,9 @@ class GrowthMonitor(QWidget):
         self.events_tab.unreviewed_count_changed.connect(
             self._on_unreviewed_count_changed,
         )
+        self.events_tab.blind_labeling_mode_changed.connect(
+            self._on_blind_labeling_mode_changed,
+        )
 
     def _on_unreviewed_count_changed(self, count: int):
         """Repaint the Events tab header with the unreviewed-event count.
@@ -946,7 +959,37 @@ class GrowthMonitor(QWidget):
         surfaces (Events, Scrubber) with admin (Session) at the end.
         """
         self.live_equalizer_tab = LiveEqualizerTab()
-        self._tabs.addTab(self.live_equalizer_tab, "Live Equalizer")
+        self._live_equalizer_tab_index = self._tabs.addTab(
+            self.live_equalizer_tab, "Live Equalizer",
+        )
+        self._tabs.currentChanged.connect(self._on_main_tab_changed)
+
+    def _on_blind_labeling_mode_changed(self, active: bool) -> None:
+        """Suppress every in-app model/Equalizer answer during blind review."""
+        self._blind_labeling_mode = bool(active)
+        for widget in self._live_classifier_widgets:
+            widget.setVisible(not active)
+            if active:
+                widget.setEnabled(False)
+        if hasattr(self, "_live_equalizer_tab_index"):
+            self._tabs.setTabEnabled(self._live_equalizer_tab_index, not active)
+        if active and hasattr(self, "live_equalizer_tab"):
+            self.live_equalizer_tab.update_classifier_state(None)
+        elif not active:
+            self._apply_state()
+
+    def _on_main_tab_changed(self, index: int) -> None:
+        """Persist that the operator opened the model-assisted Equalizer UI."""
+        if (
+            self._blind_labeling_mode
+            or self._equalizer_output_exposure_recorded
+            or index != getattr(self, "_live_equalizer_tab_index", -1)
+        ):
+            return
+        recorded = self.events_tab.record_equalizer_output_visible()
+        self._equalizer_output_exposure_recorded = bool(recorded)
+        if not recorded:
+            self._tabs.setCurrentIndex(self._events_tab_index)
 
     # ----- Scrubber Tab ----------------------------------------------------
 
@@ -1051,14 +1094,38 @@ class GrowthMonitor(QWidget):
 
         self.config_camera_mode = QComboBox()
         self.config_camera_mode.addItems(
-            ["dummy", "screengrab", "screengrab_mss", "vimba"]
+            [
+                "dummy",
+                "dummy_c6x2",
+                "dummy_tw",
+                "dummy_rt13_tilted",
+                "screengrab",
+                "screengrab_mss",
+                "vimba",
+            ]
+        )
+        self.config_camera_mode.setItemData(
+            0,
+            "Stable experimental STO 1x1 frame for Equalizer alignment.",
         )
         self.config_camera_mode.setItemData(
             1,
-            "Windows Graphics Capture of the detached kSA Live Video window.",
+            "Stable experimental STO c(6x2) frame for Equalizer alignment.",
         )
         self.config_camera_mode.setItemData(
             2,
+            "Stable experimental STO Twinned (2x1) frame for alignment.",
+        )
+        self.config_camera_mode.setItemData(
+            3,
+            "RT13_20 experimental frame rotated 15 degrees for alignment demo.",
+        )
+        self.config_camera_mode.setItemData(
+            4,
+            "Windows Graphics Capture of the detached kSA Live Video window.",
+        )
+        self.config_camera_mode.setItemData(
+            5,
             "Legacy monitor-pixel capture; overlays can contaminate frames.",
         )
         config_form.addRow("Camera mode:", self.config_camera_mode)
@@ -1571,6 +1638,25 @@ class GrowthMonitor(QWidget):
         # even when correction mode has suppressed slider updates.
         self._latest_classifier = state
 
+        if self._blind_labeling_mode:
+            return
+        if (
+            state.has_confident_data
+            and not state.loading
+            and not state.error
+            and not self._classifier_output_exposure_recorded
+        ):
+            recorded = self.events_tab.record_classifier_output_visible()
+            self._classifier_output_exposure_recorded = bool(recorded)
+            if not recorded:
+                self._recon_status_label.setText(
+                    "Classifier result withheld: audit state write failed"
+                )
+                self._recon_status_label.setStyleSheet(
+                    self._RECON_STATUS_STYLE_ERROR
+                )
+                return
+
         if self._correction_active:
             return
 
@@ -1710,6 +1796,8 @@ class GrowthMonitor(QWidget):
     ) -> None:
         """Clear cached scores at a START/STOP generation boundary."""
         self._latest_classifier = None
+        self._classifier_output_exposure_recorded = False
+        self._equalizer_output_exposure_recorded = False
         if self._correction_active:
             self.correction_btn.setChecked(False)
             self._on_correction_toggled(False)
@@ -2287,7 +2375,16 @@ class GrowthMonitor(QWidget):
         # correction is on, these are the grower's belief — Pattern A
         # keeps their sum at 100.
         for name, slider in self._recon_sliders.items():
-            entry[f"recon_{name}"] = str(slider.value())
+            entry[f"recon_{name}"] = (
+                str(slider.value()) if self._correction_active else ""
+            )
+        entry["recon_label_source"] = (
+            "human_corrected" if self._correction_active else ""
+        )
+        entry["recon_labeler"] = (
+            self.grower_input.text().strip() if self._correction_active else ""
+        )
+        entry["recon_confidence"] = ""
 
         # Snapshot the classifier's live prediction alongside the
         # grower's slider values so every log entry becomes a paired

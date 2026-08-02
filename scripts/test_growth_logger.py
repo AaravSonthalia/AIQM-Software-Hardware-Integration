@@ -80,6 +80,18 @@ def _dark_frame() -> np.ndarray:
             .astype(np.uint8))
 
 
+def _classifier_snapshot(event_idx: int = 1, score: float = 2.5) -> dict:
+    return {
+        "timestamp_iso": "2026-07-31T12:00:01.000000",
+        "event_idx": event_idx,
+        "event_score": score,
+        "elapsed_s": 1.0,
+        "capture_sequence": 102,
+        "predicted_class": "1x1",
+        "quality": 0.8,
+    }
+
+
 def _equalizer_context(
     session_id: str,
     *,
@@ -316,21 +328,37 @@ class CaptureProvenanceTests(unittest.TestCase):
                 }
                 for i in range(2)
             ]
-            count, rel_dir = logger.save_auto_capture_buffer(
+            result = logger.record_auto_capture_event(
                 event_idx=1,
+                score=2.5,
+                elapsed_s=1.0,
                 frames=[_good_frame(), _good_frame()],
-                capture_metadata=metadata,
+                frame_capture_metadata=metadata,
+                event_capture_metadata=metadata[-1],
+                classifier_snapshot=_classifier_snapshot(),
             )
-            event_dir = logger.session_dir / rel_dir
+            event_dir = logger.session_dir / result.buffer_dir
+            csv_path = logger.session_dir / "auto_capture_events.csv"
             logger.end_session()
 
-            self.assertEqual(count, 2)
+            self.assertTrue(result.committed)
+            self.assertTrue(result.writer_ready)
+            self.assertEqual(result.buffer_count, 2)
             self.assertEqual(
                 list((logger.session_dir / "frames").glob("*.pending")),
                 [],
             )
             with open(event_dir / "capture_manifest.csv", newline="") as stream:
                 rows = list(csv.DictReader(stream))
+            with open(csv_path, newline="") as stream:
+                event_row = next(csv.DictReader(stream))
+            self.assertEqual(event_row["event_idx"], "1")
+            self.assertEqual(event_row["buffer_count"], "2")
+            self.assertEqual(event_row["buffer_dir"], result.buffer_dir)
+            self.assertEqual(
+                json.loads((event_dir / "classifier_state.json").read_text()),
+                _classifier_snapshot(),
+            )
             self.assertEqual(len(rows), 2)
             self.assertEqual(
                 [row["capture_sequence"] for row in rows],
@@ -359,31 +387,51 @@ class CaptureProvenanceTests(unittest.TestCase):
             logger = GrowthLogger(base_dir=tmp)
             logger.start_session("BUFFER_ENCODER_FAIL")
             with patch.object(logger, "_save_rgb_bmp", return_value=False):
-                count, rel_dir = logger.save_auto_capture_buffer(
+                result = logger.record_auto_capture_event(
                     event_idx=1,
+                    score=2.5,
+                    elapsed_s=1.0,
                     frames=[_good_frame()],
-                    capture_metadata=[{"capture_sequence": 1}],
+                    frame_capture_metadata=[{"capture_sequence": 1}],
                 )
-            event_dir = logger.session_dir / rel_dir
+            frames_dir = logger.session_dir / "frames"
+            csv_path = logger.session_dir / "auto_capture_events.csv"
             logger.end_session()
 
-            self.assertEqual(count, 0)
-            self.assertFalse((event_dir / "capture_manifest.csv").exists())
-            self.assertEqual(list(event_dir.glob("*.bmp")), [])
+            self.assertFalse(result.committed)
+            self.assertEqual(result.buffer_count, 0)
+            self.assertEqual(result.buffer_dir, "")
+            self.assertEqual(list(frames_dir.rglob("*.bmp")), [])
+            self.assertFalse(
+                (logger.session_dir / GrowthLogger.AUTO_CAPTURE_TRANSACTION_FILE).exists()
+            )
+            with open(csv_path, newline="") as stream:
+                self.assertEqual(list(csv.DictReader(stream)), [])
 
     def test_auto_capture_manifest_failure_removes_new_images(self):
         with tempfile.TemporaryDirectory() as tmp:
             logger = GrowthLogger(base_dir=tmp)
             logger.start_session("BUFFER_MANIFEST_FAIL")
-            with patch.object(logger, "_atomic_write_csv", return_value=False):
-                count, rel_dir = logger.save_auto_capture_buffer(
+            original_write = logger._atomic_write_csv
+
+            def fail_manifest(path, *args, **kwargs):
+                if Path(path).name == "capture_manifest.csv":
+                    return False
+                return original_write(path, *args, **kwargs)
+
+            with patch.object(logger, "_atomic_write_csv", side_effect=fail_manifest):
+                result = logger.record_auto_capture_event(
                     event_idx=1,
+                    score=2.5,
+                    elapsed_s=1.0,
                     frames=[_good_frame()],
                 )
             frames_dir = logger.session_dir / "frames"
             logger.end_session()
 
-            self.assertEqual((count, rel_dir), (0, ""))
+            self.assertEqual(result.buffer_count, 0)
+            self.assertEqual(result.buffer_dir, "")
+            self.assertFalse(result.committed)
             self.assertEqual(list(frames_dir.rglob("*.bmp")), [])
             self.assertEqual(list(frames_dir.glob("*.pending")), [])
 
@@ -412,6 +460,315 @@ class CaptureProvenanceTests(unittest.TestCase):
             with open(csv_path, newline="") as stream:
                 rows = list(csv.DictReader(stream))
             self.assertEqual([row["event_idx"] for row in rows], ["1", "2"])
+
+
+class AutoCaptureTransactionTests(unittest.TestCase):
+    def test_committed_event_reports_reopen_failure_and_decision_recovers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("AUTO_REOPEN")
+            csv_path = logger.session_dir / "auto_capture_events.csv"
+
+            with patch.object(
+                logger, "_open_auto_capture_stream_for_append", return_value=False,
+            ):
+                result = logger.record_auto_capture_event(
+                    event_idx=1,
+                    score=2.5,
+                    elapsed_s=1.0,
+                    frames=[_good_frame()],
+                )
+
+            self.assertTrue(result.committed)
+            self.assertFalse(result.writer_ready)
+            self.assertIsNone(logger._auto_capture_file)
+            self.assertIsNone(logger._auto_capture_writer)
+            self.assertTrue(
+                logger.update_auto_capture_state(1, "discarded")
+            )
+            self.assertTrue(logger._auto_capture_stream_ready())
+            logger.end_session()
+            with open(csv_path, newline="") as stream:
+                row = next(csv.DictReader(stream))
+            self.assertEqual(row["event_state"], "discarded")
+            self.assertTrue(row["state_changed_at"])
+
+    def test_zero_frame_event_commits_auto_skipped_without_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("AUTO_ZERO")
+            result = logger.record_auto_capture_event(
+                event_idx=1,
+                score=2.5,
+                elapsed_s=1.0,
+                frames=[_dark_frame()],
+            )
+            csv_path = logger.session_dir / "auto_capture_events.csv"
+            final_dir = logger.session_dir / "frames" / "auto_event_001"
+            logger.end_session()
+
+            self.assertEqual(result.buffer_count, 0)
+            self.assertEqual(result.buffer_dir, "")
+            self.assertTrue(result.committed)
+            self.assertFalse(final_dir.exists())
+            with open(csv_path, newline="") as stream:
+                row = next(csv.DictReader(stream))
+            self.assertEqual(row["buffer_count"], "0")
+            self.assertEqual(row["buffer_dir"], "")
+            self.assertEqual(row["event_state"], "auto_skipped")
+            self.assertNotEqual(row["state_changed_at"], "")
+
+    def test_power_loss_before_csv_commit_rolls_back_event_directory_on_restart(self):
+        class SimulatedPowerLoss(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("AUTO_CRASH_BEFORE_CSV")
+            session_dir = logger.session_dir
+            marker = logger._auto_capture_transaction_path(session_dir)
+            final_dir = session_dir / "frames" / "auto_event_001"
+            csv_path = session_dir / "auto_capture_events.csv"
+            original_write = logger._atomic_write_csv
+
+            def crash_on_event_csv(path, *args, **kwargs):
+                if Path(path).name == "auto_capture_events.csv":
+                    raise SimulatedPowerLoss("power lost before event CSV commit")
+                return original_write(path, *args, **kwargs)
+
+            with patch.object(logger, "_atomic_write_csv", side_effect=crash_on_event_csv):
+                with self.assertRaises(SimulatedPowerLoss):
+                    logger.record_auto_capture_event(
+                        event_idx=1,
+                        score=2.5,
+                        elapsed_s=1.0,
+                        frames=[_good_frame()],
+                        classifier_snapshot=_classifier_snapshot(),
+                    )
+            self.assertTrue(marker.exists())
+            self.assertTrue(final_dir.is_dir())
+            with open(csv_path, newline="") as stream:
+                self.assertEqual(list(csv.DictReader(stream)), [])
+            logger.end_session()
+
+            restarted = GrowthLogger(base_dir=tmp)
+            self.assertFalse(marker.exists())
+            self.assertFalse(final_dir.exists())
+            self.assertTrue(restarted.set_base_dir(tmp))
+
+    def test_power_loss_after_csv_commit_finalizes_event_on_restart(self):
+        class SimulatedPowerLoss(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("AUTO_CRASH_AFTER_CSV")
+            session_dir = logger.session_dir
+            marker = logger._auto_capture_transaction_path(session_dir)
+            final_dir = session_dir / "frames" / "auto_event_001"
+            csv_path = session_dir / "auto_capture_events.csv"
+            original_unlink = Path.unlink
+
+            def crash_before_wal_clear(path, *args, **kwargs):
+                if Path(path) == marker:
+                    raise SimulatedPowerLoss("power lost before auto-capture WAL clear")
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(Path, "unlink", new=crash_before_wal_clear):
+                with self.assertRaises(SimulatedPowerLoss):
+                    logger.record_auto_capture_event(
+                        event_idx=1,
+                        score=2.5,
+                        elapsed_s=1.0,
+                        frames=[_good_frame()],
+                        classifier_snapshot=_classifier_snapshot(),
+                    )
+            self.assertTrue(marker.exists())
+            self.assertTrue(final_dir.is_dir())
+            with open(csv_path, newline="") as stream:
+                rows_before = list(csv.DictReader(stream))
+            self.assertEqual(len(rows_before), 1)
+            logger.end_session()
+
+            restarted = GrowthLogger(base_dir=tmp)
+            self.assertFalse(marker.exists())
+            self.assertTrue(final_dir.is_dir())
+            self.assertEqual(
+                json.loads((final_dir / "classifier_state.json").read_text()),
+                _classifier_snapshot(),
+            )
+            with open(csv_path, newline="") as stream:
+                rows_after = list(csv.DictReader(stream))
+            self.assertEqual(rows_after, rows_before)
+            self.assertTrue(restarted.set_base_dir(tmp))
+
+    def test_power_loss_before_directory_promote_cleans_pending_on_restart(self):
+        class SimulatedPowerLoss(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("AUTO_CRASH_PENDING")
+            session_dir = logger.session_dir
+            marker = logger._auto_capture_transaction_path(session_dir)
+            final_dir = session_dir / "frames" / "auto_event_001"
+            csv_path = session_dir / "auto_capture_events.csv"
+            original_replace = __import__("os").replace
+
+            def crash_on_directory_promote(source, destination):
+                source_path = Path(source)
+                destination_path = Path(destination)
+                if (
+                    source_path.name.startswith(".auto_event_001.")
+                    and source_path.name.endswith(".pending")
+                    and destination_path == final_dir
+                ):
+                    raise SimulatedPowerLoss("power lost before event directory promote")
+                return original_replace(source, destination)
+
+            with patch("gui.growth_logger.os.replace", side_effect=crash_on_directory_promote):
+                with self.assertRaises(SimulatedPowerLoss):
+                    logger.record_auto_capture_event(
+                        event_idx=1,
+                        score=2.5,
+                        elapsed_s=1.0,
+                        frames=[_good_frame()],
+                    )
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            staging_dir = session_dir / payload["staging_dir"]
+            self.assertTrue(staging_dir.is_dir())
+            self.assertFalse(final_dir.exists())
+            with open(csv_path, newline="") as stream:
+                self.assertEqual(list(csv.DictReader(stream)), [])
+            logger.end_session()
+
+            restarted = GrowthLogger(base_dir=tmp)
+            self.assertFalse(marker.exists())
+            self.assertFalse(staging_dir.exists())
+            self.assertFalse(final_dir.exists())
+            self.assertTrue(restarted.set_base_dir(tmp))
+
+    def test_wal_is_durable_and_exact_before_first_image_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("AUTO_WAL_ORDER")
+            marker = logger._auto_capture_transaction_path(logger.session_dir)
+            original_save = logger._save_rgb_bmp
+            observed = []
+
+            def inspect_wal_before_save(frame, path):
+                self.assertTrue(marker.is_file())
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+                self.assertEqual(payload["event_idx"], 1)
+                self.assertEqual(payload["row"]["event_idx"], "1")
+                self.assertEqual(payload["row"]["buffer_count"], "1")
+                self.assertEqual(
+                    payload["row"]["buffer_dir"], "frames/auto_event_001",
+                )
+                self.assertEqual(len(payload["manifest_rows"]), 1)
+                self.assertEqual(
+                    payload["manifest_rows"][0]["frame_path"], Path(path).name,
+                )
+                self.assertEqual(
+                    set(payload["row"]), set(GrowthLogger.AUTO_CAPTURE_FIELDS),
+                )
+                self.assertEqual(
+                    set(payload["manifest_rows"][0]),
+                    set(GrowthLogger.AUTO_CAPTURE_MANIFEST_FIELDS),
+                )
+                snapshot_text = payload["classifier_snapshot_json"]
+                self.assertEqual(json.loads(snapshot_text), _classifier_snapshot())
+                self.assertEqual(
+                    payload["classifier_snapshot_sha256"],
+                    hashlib.sha256(snapshot_text.encode("utf-8")).hexdigest(),
+                )
+                observed.append(True)
+                return original_save(frame, path)
+
+            with patch.object(logger, "_save_rgb_bmp", side_effect=inspect_wal_before_save):
+                result = logger.record_auto_capture_event(
+                    event_idx=1,
+                    score=2.5,
+                    elapsed_s=1.0,
+                    frames=[_good_frame()],
+                    classifier_snapshot=_classifier_snapshot(),
+                )
+            logger.end_session()
+
+            self.assertEqual(result.buffer_count, 1)
+            self.assertTrue(result.committed)
+            self.assertEqual(observed, [True])
+
+    def test_malformed_auto_capture_wal_is_retained_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("AUTO_BAD_WAL")
+            marker = logger._auto_capture_transaction_path(logger.session_dir)
+            marker.write_text('{"schema_version":1', encoding="utf-8")
+            logger.end_session()
+
+            restarted = GrowthLogger(base_dir=tmp)
+            self.assertTrue(marker.exists())
+            self.assertFalse(restarted.set_base_dir(tmp))
+
+    def test_conflicting_same_index_wal_is_retained_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("AUTO_CONFLICT_WAL")
+            result = logger.record_auto_capture_event(
+                event_idx=1,
+                score=2.5,
+                elapsed_s=1.0,
+                frames=[_dark_frame()],
+            )
+            self.assertEqual(result.buffer_count, 0)
+            self.assertEqual(result.buffer_dir, "")
+            self.assertTrue(result.committed)
+            marker = logger._auto_capture_transaction_path(logger.session_dir)
+            conflicting_row = logger._build_auto_capture_row(
+                event_idx=1,
+                score=9.0,
+                elapsed_s=1.0,
+                buffer_count=0,
+                event_state="auto_skipped",
+            )
+            marker.write_text(json.dumps({
+                "schema_version": logger.AUTO_CAPTURE_TRANSACTION_SCHEMA_VERSION,
+                "event_idx": 1,
+                "staging_dir": "",
+                "final_dir": "",
+                "row": conflicting_row,
+                "manifest_rows": [],
+            }), encoding="utf-8")
+            logger.end_session()
+
+            restarted = GrowthLogger(base_dir=tmp)
+            self.assertTrue(marker.exists())
+            self.assertFalse(restarted.set_base_dir(tmp))
+
+    def test_zero_frame_event_refuses_preexisting_same_index_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = GrowthLogger(base_dir=tmp)
+            logger.start_session("AUTO_ZERO_CONFLICT")
+            final_dir = logger.session_dir / "frames" / "auto_event_001"
+            final_dir.mkdir()
+            result = logger.record_auto_capture_event(
+                event_idx=1,
+                score=2.5,
+                elapsed_s=1.0,
+                frames=[_dark_frame()],
+            )
+            marker = logger._auto_capture_transaction_path(logger.session_dir)
+            csv_path = logger.session_dir / "auto_capture_events.csv"
+            logger.end_session()
+
+            self.assertEqual(result.buffer_count, 0)
+            self.assertEqual(result.buffer_dir, "")
+            self.assertFalse(result.committed)
+            self.assertTrue(final_dir.is_dir())
+            self.assertFalse(marker.exists())
+            with open(csv_path, newline="") as stream:
+                self.assertEqual(list(csv.DictReader(stream)), [])
 
 
 class EqualizerCalibrationJournalTests(unittest.TestCase):

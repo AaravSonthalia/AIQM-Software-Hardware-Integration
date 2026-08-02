@@ -38,6 +38,7 @@ from gui.equalizer_alignment import (  # noqa: E402
 )
 from gui.growth_app import GrowthApp  # noqa: E402
 from gui.state import RheedQcState  # noqa: E402
+from gui.equalizer_label_contract import build_equalizer_payload  # noqa: E402
 from scripts.equalizer_ui import load_basis_bundle  # noqa: E402
 
 
@@ -48,6 +49,28 @@ VISUAL_HISTORY_GENERATION = 7
 _TEST_BASIS_BUNDLE = load_basis_bundle()
 BASIS_BUNDLE_ID = _TEST_BASIS_BUNDLE.bundle_id
 CAPTURE_GEOMETRY_ID = "ksa-chrome-v1:1:75:30"
+
+
+def _equalizer_payload(
+    weights: dict[str, float] | None = None,
+) -> dict[str, object]:
+    final = {
+        "1x1": 1.0,
+        "Tw(2x1)": 0.0,
+        "c(6x2)": 0.0,
+        "RT13": 0.0,
+        "HTR": None,
+    }
+    if weights:
+        final.update(weights)
+    return build_equalizer_payload(
+        raw_weights=None,
+        final_weights=final,
+        fit_mode="manual",
+        normalization_applied=False,
+        residual_rms=0.0,
+        valid_coverage=1.0,
+    )
 
 
 class _StatusBar:
@@ -247,13 +270,14 @@ class _AppHarness:
 
 def _stable_qc_state(
     *,
+    session_active: bool = True,
     view_segment_id: int = VIEW_SEGMENT_ID,
     visual_history_generation: int = VISUAL_HISTORY_GENERATION,
     gun_aligned: bool | None = True,
     realignment_active: bool = False,
 ) -> RheedQcState:
     return RheedQcState(
-        session_active=True,
+        session_active=session_active,
         view_segment_id=view_segment_id,
         visual_history_generation=visual_history_generation,
         gun_aligned=gun_aligned,
@@ -266,6 +290,9 @@ def _snapshot(
     source_hwnd: int = SOURCE_HWND,
     received_monotonic_ns: int | None = None,
     retrospective: bool = False,
+    capture_backend: str = "wgc",
+    session_id: str = SESSION_ID,
+    gun_aligned: bool = True,
 ) -> RheedFrameSnapshot:
     if received_monotonic_ns is None:
         received_monotonic_ns = time.monotonic_ns()
@@ -276,14 +303,14 @@ def _snapshot(
         received_monotonic_ns=received_monotonic_ns,
         capture_sequence=91,
         source_hwnd=source_hwnd,
-        capture_backend="wgc",
+        capture_backend=capture_backend,
         capture_geometry_id=CAPTURE_GEOMETRY_ID,
         camera_width=128,
         camera_height=96,
-        session_id=SESSION_ID,
+        session_id=session_id,
         view_segment_id=VIEW_SEGMENT_ID,
         visual_history_generation=VISUAL_HISTORY_GENERATION,
-        gun_aligned=True,
+        gun_aligned=gun_aligned,
         realignment_active=False,
         source_frame_age_ms=5.0 if retrospective else None,
         retrospective=retrospective,
@@ -386,13 +413,64 @@ class EqualizerAppIntegrationTests(unittest.TestCase):
         self.assertEqual(app.monitor.live_equalizer_tab.accepted, [journaled])
         self.assertIn("Equalizer calibrated", app._status_bar.messages[-1])
 
+    def test_dummy_accepts_in_memory_without_active_session_or_journal(self) -> None:
+        snapshot = _snapshot(
+            source_hwnd=0,
+            capture_backend="dummy_tw",
+            session_id="",
+            gun_aligned=False,
+        )
+        pending = _calibration(snapshot, grower_accepted=False)
+        app = _AppHarness(
+            snapshot,
+            None,
+            qc_state=_stable_qc_state(
+                session_active=False,
+                gun_aligned=False,
+            ),
+        )
+        app.growth_log.active = False
+        app.growth_log.session_dir = None
+
+        GrowthApp._on_equalizer_calibration_accept(app, pending)
+
+        app.growth_log.record_calibration.assert_not_called()
+        self.assertIsNotNone(app._equalizer_calibration)
+        self.assertEqual(len(app.monitor.live_equalizer_tab.accepted), 1)
+        self.assertIn("Local alignment demo active", app._status_bar.messages[-1])
+
+    def test_real_camera_accept_still_rejects_inactive_session(self) -> None:
+        snapshot = _snapshot()
+        pending = _calibration(snapshot, grower_accepted=False)
+        app = _AppHarness(
+            snapshot,
+            None,
+            qc_state=_stable_qc_state(
+                session_active=False,
+                gun_aligned=False,
+            ),
+        )
+        app.growth_log.active = False
+
+        GrowthApp._on_equalizer_calibration_accept(app, pending)
+
+        app.growth_log.record_calibration.assert_not_called()
+        self.assertIsNone(app._equalizer_calibration)
+        self.assertIn(
+            "running, gun-aligned session",
+            app.monitor.live_equalizer_tab.invalidations[-1][0],
+        )
+
     def test_live_save_passes_exact_app_calibration_and_tab_snapshot(self) -> None:
         snapshot = _snapshot()
         calibration = _calibration(snapshot, grower_accepted=True)
         app = _AppHarness(snapshot, calibration)
-        weights = {"1x1": 0.8, "Tw(2x1)": 0.1, "c(6x2)": 0.1, "RT13": 0.0}
+        payload = _equalizer_payload({
+            "1x1": 0.8, "Tw(2x1)": 0.1, "c(6x2)": 0.1, "RT13": 0.0,
+        })
+        weights = payload["final_weights"]
 
-        GrowthApp._on_live_label_save(app, weights)
+        GrowthApp._on_live_label_save(app, payload)
 
         app.growth_log.record_live_label.assert_called_once()
         kwargs = app.growth_log.record_live_label.call_args.kwargs
@@ -429,7 +507,7 @@ class EqualizerAppIntegrationTests(unittest.TestCase):
         for label, current_snapshot, current_calibration in cases:
             with self.subTest(label=label):
                 app = _AppHarness(current_snapshot, current_calibration)
-                GrowthApp._on_live_label_save(app, {"1x1": 1.0})
+                GrowthApp._on_live_label_save(app, _equalizer_payload())
                 app.growth_log.record_live_label.assert_not_called()
 
     def test_live_save_rejects_stale_frame_without_write(self) -> None:
@@ -439,7 +517,7 @@ class EqualizerAppIntegrationTests(unittest.TestCase):
         calibration = _calibration(stale_snapshot, grower_accepted=True)
         app = _AppHarness(stale_snapshot, calibration)
 
-        GrowthApp._on_live_label_save(app, {"1x1": 1.0})
+        GrowthApp._on_live_label_save(app, _equalizer_payload())
 
         app.growth_log.record_live_label.assert_not_called()
         self.assertIn("frame is stale", app._status_bar.messages[-1])
@@ -450,7 +528,7 @@ class EqualizerAppIntegrationTests(unittest.TestCase):
         calibration = _calibration(calibration_snapshot, grower_accepted=True)
         app = _AppHarness(incompatible_snapshot, calibration)
 
-        GrowthApp._on_live_label_save(app, {"1x1": 1.0})
+        GrowthApp._on_live_label_save(app, _equalizer_payload())
 
         app.growth_log.record_live_label.assert_not_called()
         app.growth_log.record_calibration_invalidation.assert_called_once()
@@ -467,7 +545,7 @@ class EqualizerAppIntegrationTests(unittest.TestCase):
         for state in unstable_states:
             with self.subTest(state=state):
                 app = _AppHarness(snapshot, calibration, qc_state=state)
-                GrowthApp._on_live_label_save(app, {"1x1": 1.0})
+                GrowthApp._on_live_label_save(app, _equalizer_payload())
                 app.growth_log.record_live_label.assert_not_called()
                 app.growth_log.record_calibration_invalidation.assert_called_once()
                 self.assertIsNone(app._equalizer_calibration)

@@ -63,13 +63,15 @@ ID. Capture timestamps must be timezone-qualified ISO-8601 UTC values.
 
 Live label writes use a durable pending transaction marker, a staged image,
 and atomic CSV replacement. Calibration acceptance likewise writes its WAL
-before the evidence PNG and journal line. On restart, a committed record keeps
-its hash-verified image; an uncommitted transaction is rolled back. Events
-labels only reference an existing selected frame under the session `frames/`
-tree and never create a fallback image. Malformed or conflicting recovery
-state remains fail-closed for operator inspection. Growth Monitor applies and
-scans the configured workstation log root before START; unresolved recovery
-blocks a new session instead of being missed under the constructor default.
+before the evidence PNG and journal line. Auto-capture writes one WAL before
+any context image, then commits the exact `auto_capture_events.csv` row and
+buffer manifest as a unit. On restart, a committed row keeps or finishes its
+verified buffer; an uncommitted transaction is rolled back. Events labels only
+reference an existing selected frame under the session `frames/` tree and
+never create a fallback image. Malformed or conflicting recovery state remains
+fail-closed for operator inspection. Growth Monitor applies and scans the
+configured workstation log root before START; unresolved recovery blocks a new
+session instead of being missed under the constructor default.
 
 `scripts/equalizer_ui.py` is an import-only helper module for canonical basis
 loading, display palettes, and fitting math. Its legacy window cannot save and

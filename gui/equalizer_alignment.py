@@ -798,12 +798,9 @@ class CalibrationRecord:
         )
         if not valid:
             raise ValueError(f"Calibration geometry is invalid: {reason}")
+        local_demo = str(self.capture_backend or "").startswith("dummy")
         if self.grower_accepted and (
-            not self.session_id
-            or self.view_segment_id is None
-            or not self.gun_aligned
-            or self.realignment_active
-            or not self.captured_at_utc
+            not self.captured_at_utc
             or self.capture_sequence <= 0
             or self.received_monotonic_ns <= 0
             or not self.capture_backend
@@ -811,6 +808,13 @@ class CalibrationRecord:
             or self.camera_width <= 0
             or self.camera_height <= 0
             or not all(evidence_fields)
+        ):
+            raise ValueError("Accepted calibration lacks capture/evidence provenance")
+        if self.grower_accepted and not local_demo and (
+            not self.session_id
+            or self.view_segment_id is None
+            or not self.gun_aligned
+            or self.realignment_active
         ):
             raise ValueError("Accepted calibration lacks stable session/QC provenance")
 

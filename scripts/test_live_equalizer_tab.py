@@ -233,6 +233,42 @@ class ConstructionAndHtrTests(EqualizerTabCase):
         )
 
 
+class LocalDemoGateTests(EqualizerTabCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.tab.set_session_id("")
+        self.tab.set_save_enabled(False)
+        self.tab.update_qc_context(
+            session_active=False,
+            view_segment_id=0,
+            visual_history_generation=0,
+            gun_aligned=False,
+            realignment_active=False,
+        )
+
+    def test_dummy_frame_allows_calibration_without_session_or_alignment(self) -> None:
+        self.tab.update_camera_frame(
+            _rgb(),
+            _metadata(
+                backend="dummy_c6x2",
+                hwnd=0,
+                monotonic_ns=1,
+                geometry_id="dummy:full",
+            ),
+        )
+        self.assertTrue(self.tab._calibrate_btn.isEnabled())
+
+        record = self.accepted_record()
+        self.assertTrue(self.tab.set_accepted_calibration(record))
+        self.assertTrue(self.tab._auto_fit_btn.isEnabled())
+        self.assertFalse(self.tab._save_btn.isEnabled())
+
+    def test_real_camera_still_requires_session_and_alignment(self) -> None:
+        self.tab.update_camera_frame(_rgb(), _metadata(backend="wgc"))
+        self.assertFalse(self.tab._calibrate_btn.isEnabled())
+        self.assertIn("session", self.tab._cal_status_label.text())
+
+
 class SnapshotAtomicityTests(EqualizerTabCase):
     def test_camera_update_copies_source_arrays(self) -> None:
         self.make_live()
@@ -523,8 +559,11 @@ class SaveAndQcGateTests(EqualizerTabCase):
         self.tab.live_label_save_requested.connect(emitted.append)
         self.tab._save_btn.click()
         self.assertEqual(len(emitted), 1)
-        self.assertIsNone(emitted[0]["HTR"])
-        self.assertEqual(set(emitted[0]), set(CLASS_LABELS))
+        self.assertIsNone(emitted[0]["final_weights"]["HTR"])
+        self.assertIsNone(emitted[0]["normalized_weights"]["HTR"])
+        self.assertEqual(emitted[0]["schema_version"], 1)
+        self.assertEqual(emitted[0]["label_source"], "equalizer_manual")
+        self.assertGreaterEqual(emitted[0]["residual_rms"], 0.0)
 
     def test_qc_view_segment_change_invalidates_and_emits(self) -> None:
         self.activate_calibration()

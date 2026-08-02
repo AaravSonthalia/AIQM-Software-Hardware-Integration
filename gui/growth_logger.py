@@ -12,7 +12,9 @@ import logging
 import math
 import os
 import tempfile
+import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
@@ -24,6 +26,12 @@ from .equalizer_alignment import (
     CalibrationRecord,
     RheedFrameSnapshot,
     normalize_utc_timestamp,
+)
+from .equalizer_label_contract import (
+    ACTIVE_LABELS as EQUALIZER_ACTIVE_LABELS,
+    CSV_SUFFIX as EQUALIZER_CSV_SUFFIX,
+    frame_rgb_sha256,
+    validate_equalizer_payload,
 )
 
 
@@ -43,6 +51,16 @@ EVENT_STATE_KEPT_EXPLICIT = "kept_explicit"
 EVENT_STATE_KEPT_DEFAULT = "kept_default"
 EVENT_STATE_DISCARDED = "discarded"
 EVENT_STATE_AUTO_SKIPPED = "auto_skipped"
+
+
+@dataclass(frozen=True)
+class AutoCaptureCommitResult:
+    """Durable auto-event outcome, separate from append-stream readiness."""
+
+    buffer_count: int = 0
+    buffer_dir: str = ""
+    committed: bool = False
+    writer_ready: bool = False
 
 # Structured RHEED view/QC event types. These are deliberately separate
 # from ``manual_events.csv``: reconstruction-change marks and acquisition
@@ -74,6 +92,25 @@ class GrowthLogger:
     LIVE_LABEL_TRANSACTION_SCHEMA_VERSION = 1
     CALIBRATION_TRANSACTION_FILE = ".equalizer_calibration.pending.json"
     CALIBRATION_TRANSACTION_SCHEMA_VERSION = 1
+    AUTO_CAPTURE_TRANSACTION_FILE = ".auto_capture_transaction.pending.json"
+    AUTO_CAPTURE_TRANSACTION_SCHEMA_VERSION = 2
+    HUMAN_LABELING_STATE_FILE = "human_labeling_state.json"
+    HUMAN_LABELING_STATE_SCHEMA_VERSION = 1
+
+    # Source of truth for independent human primary judgments.  Unlike
+    # events_labels.csv this file is never rewritten or keyed by event_idx:
+    # every click is a distinct annotation that can participate in a vote.
+    HUMAN_PRIMARY_LABEL_FIELDS = [
+        "schema_version", "annotation_id", "label_idx",
+        "label_timestamp_iso", "session_id", "acquisition_run",
+        "frame_path", "frame_sha256", "frame_sha256_algorithm",
+        "capture_sequence", "view_segment_id", "capture_backend",
+        "captured_at_utc", "gun_aligned", "realignment_active",
+        "human_primary_reconstruction", "human_label_source",
+        "human_labeler", "human_confidence",
+        "human_blind_to_model", "human_blind_to_equalizer",
+        "qc_label",
+    ]
 
     SENSOR_FIELDS = [
         "timestamp", "elapsed_s",
@@ -120,6 +157,7 @@ class GrowthLogger:
         # adjustment enforces it), and can differ from ``classifier_recon_*``.
         "recon_1x1", "recon_Twinned (2x1)", "recon_c(6x2)",
         "recon_rt13xrt13", "recon_HTR",
+        "recon_label_source", "recon_labeler", "recon_confidence",
         # Classifier's smoothed_percent at LOG time — always populated when a
         # classifier state has been received this session, regardless of
         # correction toggle. Empty when the classifier is disabled or the
@@ -235,15 +273,33 @@ class GrowthLogger:
     # surface + rate. Downstream analyses can join on timestamp.
     LIVE_LABEL_FIELDS = [
         "timestamp", "elapsed_s", "label_idx",
+        "equalizer_schema_version", "equalizer_source",
+        "equalizer_labeler", "equalizer_confidence", "equalizer_argmax",
+        "equalizer_fit_mode", "equalizer_normalization_applied",
+        "equalizer_final_is_normalized", "equalizer_final_sum",
+        "equalizer_fit_residual", "equalizer_valid_coverage",
+        "equalizer_calibration_valid",
+        *[f"equalizer_raw_{suffix}" for suffix in EQUALIZER_CSV_SUFFIX.values()],
+        "equalizer_raw_HTR",
+        *[f"equalizer_final_{suffix}" for suffix in EQUALIZER_CSV_SUFFIX.values()],
+        "equalizer_final_HTR",
+        *[
+            f"equalizer_normalized_{suffix}"
+            for suffix in EQUALIZER_CSV_SUFFIX.values()
+        ],
+        "equalizer_normalized_HTR",
         "recon_1x1", "recon_tw", "recon_c6x2",
         "recon_rt13", "recon_HTR",
         "pyrometer_temp_C",
         "voltage_V", "current_A", "psu_source",
         "frame_path",
         "capture_backend", "captured_at_utc", "capture_sequence",
-        "frame_age_ms", "source_hwnd", "capture_geometry_id",
+        "captured_monotonic_ns", "frame_age_ms", "source_hwnd",
+        "capture_geometry_id", "session_id", "gun_aligned",
+        "realignment_active",
         "calibration_id", "basis_bundle_id", "equalizer_active_classes",
         "view_segment_id", "visual_history_generation",
+        "equalizer_frame_sha256", "equalizer_frame_sha256_algorithm",
     ]
     # Event labels written by the Events tab labeling form. The from/to
     # columns are reserved for the deferred reconstruction-transition
@@ -252,14 +308,36 @@ class GrowthLogger:
     EVENT_LABEL_FIELDS = [
         "event_idx",
         "primary_reconstruction",
+        "human_primary_reconstruction", "human_label_source",
+        "human_labeler", "human_confidence",
+        "human_blind_to_model", "human_blind_to_equalizer",
+        "human_primary_annotation_id", "human_primary_label_idx",
+        "human_primary_frame_path", "human_primary_frame_sha256",
+        "human_primary_frame_sha256_algorithm",
+        "human_primary_capture_backend", "human_primary_captured_at_utc",
+        "human_primary_capture_sequence", "human_primary_view_segment_id",
+        "human_primary_visual_history_generation", "human_primary_session_id",
         "change_from",
         "change_to",
         "notes",
         "label_timestamp_iso",
-        # Mixture-label columns written by the Equalizer (May 19 2026 sprint).
-        # Each is a float in [0, 1]; ideally sum to ~1 after normalization.
-        # primary_reconstruction stays populated as argmax for back-compat and
-        # quick filtering by single-class users.
+        # Equalizer is an independent visual-basis measurement.  Its argmax
+        # and weights must never populate either human-primary column.
+        "equalizer_schema_version", "equalizer_source",
+        "equalizer_labeler", "equalizer_confidence", "equalizer_argmax",
+        "equalizer_fit_mode", "equalizer_normalization_applied",
+        "equalizer_final_is_normalized", "equalizer_final_sum",
+        "equalizer_fit_residual", "equalizer_valid_coverage",
+        "equalizer_calibration_valid",
+        *[f"equalizer_raw_{suffix}" for suffix in EQUALIZER_CSV_SUFFIX.values()],
+        "equalizer_raw_HTR",
+        *[f"equalizer_final_{suffix}" for suffix in EQUALIZER_CSV_SUFFIX.values()],
+        "equalizer_final_HTR",
+        *[
+            f"equalizer_normalized_{suffix}"
+            for suffix in EQUALIZER_CSV_SUFFIX.values()
+        ],
+        "equalizer_normalized_HTR",
         "recon_1x1",
         "recon_tw",
         "recon_c6x2",
@@ -272,6 +350,8 @@ class GrowthLogger:
         "frame_age_ms", "source_hwnd", "capture_geometry_id",
         "captured_monotonic_ns",
         "gun_aligned", "realignment_active",
+        "session_id",
+        "equalizer_frame_sha256", "equalizer_frame_sha256_algorithm",
     ]
 
     AUTO_CAPTURE_MANIFEST_FIELDS = [
@@ -317,6 +397,575 @@ class GrowthLogger:
         if not values or len(set(values)) != len(values):
             raise ValueError("Equalizer active classes must be unique and non-empty")
         return json.dumps(values, separators=(",", ":"))
+
+    @staticmethod
+    def _equalizer_record_columns(
+        payload: Optional[Mapping[str, object]],
+        *,
+        labeler: str,
+        rgb: Optional[np.ndarray],
+        calibration_valid: bool,
+    ) -> dict[str, object]:
+        """Flatten a validated measurement payload for either Equalizer CSV."""
+        columns: dict[str, object] = {
+            "equalizer_schema_version": "",
+            "equalizer_source": "legacy_unqualified",
+            "equalizer_labeler": str(labeler or "").strip(),
+            "equalizer_confidence": "",
+            "equalizer_argmax": "",
+            "equalizer_fit_mode": "",
+            "equalizer_normalization_applied": "",
+            "equalizer_final_is_normalized": "",
+            "equalizer_final_sum": "",
+            "equalizer_fit_residual": "",
+            "equalizer_valid_coverage": "",
+            "equalizer_calibration_valid": str(bool(calibration_valid)),
+            "equalizer_frame_sha256": (
+                frame_rgb_sha256(rgb) if rgb is not None else ""
+            ),
+            "equalizer_frame_sha256_algorithm": (
+                "rgb-array-v1" if rgb is not None else ""
+            ),
+        }
+        for family in ("raw", "final", "normalized"):
+            for suffix in EQUALIZER_CSV_SUFFIX.values():
+                columns[f"equalizer_{family}_{suffix}"] = ""
+            columns[f"equalizer_{family}_HTR"] = ""
+        if payload is None:
+            return columns
+
+        canonical = validate_equalizer_payload(payload)
+        columns.update({
+            "equalizer_schema_version": canonical["schema_version"],
+            "equalizer_source": canonical["label_source"],
+            "equalizer_confidence": canonical["confidence"],
+            "equalizer_argmax": canonical["argmax"],
+            "equalizer_fit_mode": canonical["fit_mode"],
+            "equalizer_normalization_applied": str(
+                bool(canonical["normalization_applied"])
+            ),
+            "equalizer_final_is_normalized": str(
+                bool(canonical["final_is_normalized"])
+            ),
+            "equalizer_final_sum": f"{float(canonical['final_sum']):.6f}",
+            "equalizer_fit_residual": f"{float(canonical['residual_rms']):.6f}",
+            "equalizer_valid_coverage": f"{float(canonical['valid_coverage']):.6f}",
+        })
+        for family in ("raw", "final", "normalized"):
+            values = canonical[f"{family}_weights"]
+            for label, suffix in EQUALIZER_CSV_SUFFIX.items():
+                value = values[label]
+                columns[f"equalizer_{family}_{suffix}"] = (
+                    "" if value is None else f"{float(value):.8f}"
+                )
+            # HTR has no canonical basis and remains a CSV null.
+            columns[f"equalizer_{family}_HTR"] = ""
+        return columns
+
+    @classmethod
+    def _human_primary_columns(
+        cls,
+        *,
+        reconstruction: str,
+        label_source: str,
+        labeler: str,
+        confidence: object,
+        blind_to_model: bool,
+        blind_to_equalizer: bool,
+        frame_path: Path,
+        capture_metadata: Mapping[str, object],
+        session_dir: Path,
+    ) -> dict[str, object]:
+        """Validate a human judgment and bind it to one exact decoded frame."""
+        allowed = {
+            "none/weak", "Twinned (2x1)", "c(6x2)", "rt13xrt13",
+            "HTR", "unknown", "artifact",
+        }
+        if reconstruction not in allowed:
+            raise ValueError(f"Unsupported human primary label {reconstruction!r}")
+        if label_source not in {"human_blind_primary", "human_assisted_primary"}:
+            raise ValueError("Human primary label_source is invalid")
+        if label_source == "human_blind_primary" and not (
+            blind_to_model and blind_to_equalizer
+        ):
+            raise ValueError("Blind primary source requires both blindness flags")
+        labeler_text = str(labeler or "").strip()
+        if not labeler_text:
+            raise ValueError("Human primary labeler is required")
+
+        confidence_text = str(confidence or "").strip()
+        if confidence_text:
+            confidence_value = float(confidence_text)
+            if not math.isfinite(confidence_value) or not 0.0 <= confidence_value <= 1.0:
+                raise ValueError("Human primary confidence must be in [0, 1]")
+            confidence_text = f"{confidence_value:.3f}"
+
+        exact_path = cls._resolve_existing_event_frame(session_dir, str(frame_path))
+        metadata = dict(capture_metadata)
+        required = (
+            "capture_backend", "captured_at_utc", "capture_sequence",
+            "view_segment_id", "visual_history_generation", "session_id",
+            "gun_aligned", "realignment_active",
+        )
+        missing = [name for name in required if metadata.get(name) in (None, "")]
+        if missing:
+            raise ValueError(
+                "Human primary capture binding is missing: " + ", ".join(missing)
+            )
+        sequence = int(metadata["capture_sequence"])
+        segment = int(metadata["view_segment_id"])
+        generation = int(metadata["visual_history_generation"])
+        if sequence <= 0 or segment < 0 or generation < 0:
+            raise ValueError("Human primary capture identity is invalid")
+        if metadata["gun_aligned"] is not True or metadata["realignment_active"] is not False:
+            raise ValueError("Human primary frame is not from a stable aligned view")
+        normalize_utc_timestamp(
+            str(metadata["captured_at_utc"]), field_name="human captured_at_utc",
+        )
+        try:
+            from PIL import Image
+
+            with Image.open(exact_path) as image:
+                rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+        except Exception as exc:
+            raise ValueError("Human primary frame cannot be decoded") from exc
+
+        return {
+            "human_primary_reconstruction": reconstruction,
+            "human_label_source": label_source,
+            "human_labeler": labeler_text,
+            "human_confidence": confidence_text,
+            "human_blind_to_model": str(bool(blind_to_model)),
+            "human_blind_to_equalizer": str(bool(blind_to_equalizer)),
+            "human_primary_frame_path": str(exact_path),
+            "human_primary_frame_sha256": frame_rgb_sha256(rgb),
+            "human_primary_frame_sha256_algorithm": "rgb-array-v1",
+            "human_primary_capture_backend": str(metadata["capture_backend"]),
+            "human_primary_captured_at_utc": str(metadata["captured_at_utc"]),
+            "human_primary_capture_sequence": sequence,
+            "human_primary_view_segment_id": segment,
+            "human_primary_visual_history_generation": generation,
+            "human_primary_session_id": str(metadata["session_id"]),
+        }
+
+    @staticmethod
+    def _utc_now_text() -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _human_labeling_state_path(self) -> Optional[Path]:
+        if self._session_dir is None:
+            return None
+        return self._session_dir / self.HUMAN_LABELING_STATE_FILE
+
+    def _new_human_labeling_state(self) -> dict[str, object]:
+        if self._session_dir is None:
+            raise RuntimeError("No growth session is available")
+        now = self._utc_now_text()
+        return {
+            "schema_version": self.HUMAN_LABELING_STATE_SCHEMA_VERSION,
+            "session_id": self._session_dir.name,
+            "created_at_utc": now,
+            "last_updated_at_utc": now,
+            "created_runtime_id": self._human_labeling_runtime_id,
+            "active_runtime_id": self._human_labeling_runtime_id,
+            "attach_count": 0,
+            "restart_count": 0,
+            "blind_mode_active": False,
+            "blind_mode_labeler": "",
+            "blind_mode_entered_at_utc": "",
+            "global_classifier_revealed": False,
+            "global_equalizer_revealed": False,
+            "revealed_frames": {},
+        }
+
+    def _validate_human_labeling_state(
+        self, raw: object,
+    ) -> dict[str, object]:
+        """Validate the persisted proof state; malformed state fails closed."""
+        if not isinstance(raw, dict):
+            raise ValueError("Human-labeling state must be a JSON object")
+        required = {
+            "schema_version", "session_id", "created_at_utc",
+            "last_updated_at_utc", "created_runtime_id",
+            "active_runtime_id", "attach_count", "restart_count",
+            "blind_mode_active", "blind_mode_labeler",
+            "blind_mode_entered_at_utc", "global_classifier_revealed",
+            "global_equalizer_revealed", "revealed_frames",
+        }
+        missing = sorted(required - set(raw))
+        if missing:
+            raise ValueError(
+                "Human-labeling state is missing: " + ", ".join(missing)
+            )
+        if raw.get("schema_version") != self.HUMAN_LABELING_STATE_SCHEMA_VERSION:
+            raise ValueError("Human-labeling state schema is unsupported")
+        if self._session_dir is None or raw.get("session_id") != self._session_dir.name:
+            raise ValueError("Human-labeling state belongs to another session")
+        for field in (
+            "blind_mode_active", "global_classifier_revealed",
+            "global_equalizer_revealed",
+        ):
+            if not isinstance(raw.get(field), bool):
+                raise ValueError(f"Human-labeling state {field} must be boolean")
+        for field in ("attach_count", "restart_count"):
+            value = raw.get(field)
+            if not isinstance(value, int) or value < 0:
+                raise ValueError(f"Human-labeling state {field} is invalid")
+        revealed = raw.get("revealed_frames")
+        if not isinstance(revealed, dict):
+            raise ValueError("Human-labeling revealed_frames must be an object")
+        for digest, exposures in revealed.items():
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or not isinstance(exposures, dict)
+                or any(kind not in {"classifier", "equalizer"} for kind in exposures)
+            ):
+                raise ValueError("Human-labeling exposure record is invalid")
+        return dict(raw)
+
+    def _read_human_labeling_state(self) -> Optional[dict[str, object]]:
+        path = self._human_labeling_state_path()
+        if path is None or not path.is_file():
+            self._human_labeling_state_trusted = False
+            return None
+        try:
+            state = self._validate_human_labeling_state(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self._human_labeling_state_trusted = False
+            log.error("Human-labeling proof state is untrusted: %s", exc)
+            return None
+        self._human_labeling_state_trusted = True
+        return state
+
+    def _write_human_labeling_state(self, state: Mapping[str, object]) -> bool:
+        path = self._human_labeling_state_path()
+        if path is None:
+            return False
+        candidate = dict(state)
+        candidate["last_updated_at_utc"] = self._utc_now_text()
+        try:
+            validated = self._validate_human_labeling_state(candidate)
+            payload = (
+                json.dumps(validated, sort_keys=True, indent=2) + "\n"
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            log.error("Refusing invalid human-labeling proof state: %s", exc)
+            self._human_labeling_state_trusted = False
+            return False
+        written = self._atomic_write_bytes(path, payload)
+        self._human_labeling_state_trusted = written
+        return written
+
+    def _initialize_human_labeling_state(self) -> bool:
+        """Create proof state only for a session born in this GUI runtime."""
+        return self._write_human_labeling_state(self._new_human_labeling_state())
+
+    def begin_human_labeling_review(self, labeler: str = "") -> dict[str, object]:
+        """Attach the labeling UI and force an explicit new blind-mode entry.
+
+        A persisted ``blind_mode_active`` value is never restored implicitly.
+        The runtime ID change records a restart; until the operator explicitly
+        enters blind mode again, subsequent judgments are assisted.
+        """
+        state = self._read_human_labeling_state()
+        if state is None:
+            return {
+                "audit_trusted": False,
+                "blind_mode_active": False,
+                "gold_eligible": False,
+                "reason": "No trusted labeling-state record exists for this session.",
+            }
+        previous_runtime = str(state.get("active_runtime_id", ""))
+        if previous_runtime and previous_runtime != self._human_labeling_runtime_id:
+            state["restart_count"] = int(state["restart_count"]) + 1
+        state["active_runtime_id"] = self._human_labeling_runtime_id
+        state["attach_count"] = int(state["attach_count"]) + 1
+        state["blind_mode_active"] = False
+        state["blind_mode_labeler"] = str(labeler or "").strip()
+        state["blind_mode_entered_at_utc"] = ""
+        if not self._write_human_labeling_state(state):
+            return {
+                "audit_trusted": False,
+                "blind_mode_active": False,
+                "gold_eligible": False,
+                "reason": "The labeling-state record could not be persisted.",
+            }
+        return {
+            "audit_trusted": True,
+            "blind_mode_active": False,
+            "gold_eligible": False,
+            "reason": "Enter blind labeling mode before assigning gold labels.",
+        }
+
+    def set_human_blind_labeling_mode(
+        self, enabled: bool, *, labeler: str,
+    ) -> dict[str, object]:
+        """Persist an explicit blind-mode transition and report eligibility."""
+        labeler_text = str(labeler or "").strip()
+        if enabled and not labeler_text:
+            raise ValueError("A labeler name is required for blind labeling mode")
+        state = self._read_human_labeling_state()
+        if state is None:
+            raise ValueError(
+                "Blind labeling cannot be audited for this session; "
+                "labels will be assisted only"
+            )
+        if state.get("active_runtime_id") != self._human_labeling_runtime_id:
+            raise ValueError(
+                "The labeling UI was restarted; attach it again before entering blind mode"
+            )
+        state["blind_mode_active"] = bool(enabled)
+        state["blind_mode_labeler"] = labeler_text if enabled else ""
+        state["blind_mode_entered_at_utc"] = (
+            self._utc_now_text() if enabled else ""
+        )
+        if not self._write_human_labeling_state(state):
+            raise OSError("Blind labeling state could not be persisted")
+        contaminated = bool(
+            state["global_classifier_revealed"]
+            or state["global_equalizer_revealed"]
+        )
+        return {
+            "audit_trusted": True,
+            "blind_mode_active": bool(enabled),
+            "gold_eligible": bool(enabled) and not contaminated,
+            "reason": (
+                "Classifier or Equalizer output was already displayed; "
+                "new labels remain assisted."
+                if enabled and contaminated
+                else "Blind labeling mode is active."
+                if enabled
+                else "Blind labeling mode is off."
+            ),
+        }
+
+    def record_human_label_output_exposure(
+        self, kind: str, *, frame_path: Optional[str | Path] = None,
+    ) -> bool:
+        """Persist that classifier/Equalizer output became visible.
+
+        The global flag is deliberately irreversible for the session.  This
+        fail-closed rule avoids claiming an unbiased label after the grower
+        has already seen a machine-generated answer.
+        """
+        if kind not in {"classifier", "equalizer"}:
+            raise ValueError("Exposure kind must be classifier or equalizer")
+        state = self._read_human_labeling_state()
+        if state is None:
+            # With no trusted proof state every future annotation is already
+            # forced to assisted. Showing an aid cannot create false gold.
+            return True
+        state[f"global_{kind}_revealed"] = True
+        if frame_path is not None:
+            try:
+                exact_path = self._resolve_existing_event_frame(
+                    self._session_dir, frame_path,
+                )
+                from PIL import Image
+
+                with Image.open(exact_path) as image:
+                    digest = frame_rgb_sha256(
+                        np.asarray(image.convert("RGB"), dtype=np.uint8)
+                    )
+                revealed = dict(state.get("revealed_frames", {}))
+                exposures = dict(revealed.get(digest, {}))
+                exposures[kind] = self._utc_now_text()
+                revealed[digest] = exposures
+                state["revealed_frames"] = revealed
+            except (OSError, TypeError, ValueError):
+                # The global exposure is still auditable even if an old frame
+                # disappeared before it could be hashed.
+                pass
+        state["blind_mode_active"] = False
+        state["blind_mode_labeler"] = ""
+        state["blind_mode_entered_at_utc"] = ""
+        return self._write_human_labeling_state(state)
+
+    def human_primary_provenance(
+        self, *, frame_path: str | Path, labeler: str,
+    ) -> dict[str, object]:
+        """Derive source/blind flags solely from persisted proof state."""
+        if self._session_dir is None:
+            raise ValueError("No session is attached")
+        labeler_text = str(labeler or "").strip()
+        if not labeler_text:
+            raise ValueError("Human primary labeler is required")
+        exact_path = self._resolve_existing_event_frame(
+            self._session_dir, frame_path,
+        )
+        from PIL import Image
+
+        with Image.open(exact_path) as image:
+            digest = frame_rgb_sha256(
+                np.asarray(image.convert("RGB"), dtype=np.uint8)
+            )
+        state = self._read_human_labeling_state()
+        if state is None:
+            return {
+                "human_label_source": "human_assisted_primary",
+                "human_blind_to_model": False,
+                "human_blind_to_equalizer": False,
+                "frame_sha256": digest,
+                "reason": "Blind provenance is unavailable or untrusted.",
+            }
+        exposures = dict(state.get("revealed_frames", {})).get(digest, {})
+        blind_to_model = not bool(
+            state["global_classifier_revealed"]
+            or (isinstance(exposures, dict) and exposures.get("classifier"))
+        )
+        blind_to_equalizer = not bool(
+            state["global_equalizer_revealed"]
+            or (isinstance(exposures, dict) and exposures.get("equalizer"))
+        )
+        explicit_mode = bool(
+            state["blind_mode_active"]
+            and state.get("active_runtime_id") == self._human_labeling_runtime_id
+            and state.get("blind_mode_labeler") == labeler_text
+        )
+        gold = explicit_mode and blind_to_model and blind_to_equalizer
+        return {
+            "human_label_source": (
+                "human_blind_primary" if gold else "human_assisted_primary"
+            ),
+            "human_blind_to_model": blind_to_model,
+            "human_blind_to_equalizer": blind_to_equalizer,
+            "frame_sha256": digest,
+            "reason": (
+                "Persisted blind-mode proof is valid."
+                if gold
+                else "No valid uncontaminated blind-mode proof exists."
+            ),
+        }
+
+    def _append_human_primary_label(
+        self,
+        *,
+        human_columns: Mapping[str, object],
+        capture_metadata: Mapping[str, object],
+        annotation_id: str = "",
+        qc_label: str = "",
+        timestamp: str = "",
+    ) -> dict[str, str]:
+        """Append one immutable human judgment and fsync it before summary."""
+        if self._session_dir is None:
+            raise ValueError("No session is attached")
+        path = self._session_dir / "human_primary_labels.csv"
+        rows: list[dict[str, str]] = []
+        if path.exists() and path.stat().st_size:
+            try:
+                with open(path, newline="", encoding="utf-8") as stream:
+                    reader = csv.DictReader(stream)
+                    if tuple(reader.fieldnames or ()) != tuple(
+                        self.HUMAN_PRIMARY_LABEL_FIELDS
+                    ):
+                        raise ValueError(
+                            "human_primary_labels.csv schema is not trusted"
+                        )
+                    rows = [dict(row) for row in reader]
+            except OSError as exc:
+                raise OSError("Human primary audit log could not be read") from exc
+        indices: list[int] = []
+        annotation_ids: set[str] = set()
+        for row in rows:
+            try:
+                idx = int(row.get("label_idx", ""))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Human primary audit log has an invalid label_idx") from exc
+            identifier = str(row.get("annotation_id", ""))
+            if idx <= 0 or not identifier or identifier in annotation_ids:
+                raise ValueError("Human primary audit log identity is invalid")
+            indices.append(idx)
+            annotation_ids.add(identifier)
+        if len(indices) != len(set(indices)):
+            raise ValueError("Human primary audit log has duplicate label_idx values")
+
+        identifier = str(annotation_id or uuid.uuid4().hex).strip()
+        if not identifier or identifier in annotation_ids:
+            raise ValueError("Human primary annotation_id must be unique")
+        label_idx = max(indices, default=0) + 1
+        exact_path = Path(str(human_columns["human_primary_frame_path"]))
+        try:
+            portable_path = exact_path.relative_to(self._session_dir).as_posix()
+        except ValueError:
+            portable_path = str(exact_path)
+        session_id = str(human_columns["human_primary_session_id"])
+        row = {
+            "schema_version": "1",
+            "annotation_id": identifier,
+            "label_idx": str(label_idx),
+            "label_timestamp_iso": timestamp or self._utc_now_text(),
+            "session_id": session_id,
+            "acquisition_run": session_id,
+            "frame_path": portable_path,
+            "frame_sha256": str(human_columns["human_primary_frame_sha256"]),
+            "frame_sha256_algorithm": str(
+                human_columns["human_primary_frame_sha256_algorithm"]
+            ),
+            "capture_sequence": str(
+                human_columns["human_primary_capture_sequence"]
+            ),
+            "view_segment_id": str(
+                human_columns["human_primary_view_segment_id"]
+            ),
+            "capture_backend": str(
+                human_columns["human_primary_capture_backend"]
+            ),
+            "captured_at_utc": str(
+                human_columns["human_primary_captured_at_utc"]
+            ),
+            "gun_aligned": str(bool(capture_metadata["gun_aligned"])),
+            "realignment_active": str(bool(
+                capture_metadata["realignment_active"]
+            )),
+            "human_primary_reconstruction": str(
+                human_columns["human_primary_reconstruction"]
+            ),
+            "human_label_source": str(human_columns["human_label_source"]),
+            "human_labeler": str(human_columns["human_labeler"]),
+            "human_confidence": str(human_columns["human_confidence"]),
+            "human_blind_to_model": str(
+                human_columns["human_blind_to_model"]
+            ),
+            "human_blind_to_equalizer": str(
+                human_columns["human_blind_to_equalizer"]
+            ),
+            "qc_label": str(qc_label or capture_metadata.get("qc_label", "")),
+        }
+        try:
+            needs_header = not path.exists() or path.stat().st_size == 0
+            with open(path, "a", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(
+                    stream, fieldnames=self.HUMAN_PRIMARY_LABEL_FIELDS,
+                )
+                if needs_header:
+                    writer.writeheader()
+                writer.writerow(row)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as exc:
+            raise OSError("Human primary audit append failed") from exc
+        return row
+
+    def read_human_primary_labels(self) -> list[dict[str, str]]:
+        """Read the append-only human-primary audit log without summarizing."""
+        if self._session_dir is None:
+            return []
+        path = self._session_dir / "human_primary_labels.csv"
+        if not path.is_file():
+            return []
+        try:
+            with open(path, newline="", encoding="utf-8") as stream:
+                reader = csv.DictReader(stream)
+                if tuple(reader.fieldnames or ()) != tuple(
+                    self.HUMAN_PRIMARY_LABEL_FIELDS
+                ):
+                    return []
+                return [dict(row) for row in reader]
+        except OSError:
+            return []
 
     @classmethod
     def _snapshot_capture_columns(cls, snapshot: RheedFrameSnapshot) -> dict:
@@ -616,6 +1265,10 @@ class GrowthLogger:
     def _calibration_transaction_path(cls, session_dir: Path) -> Path:
         return Path(session_dir) / cls.CALIBRATION_TRANSACTION_FILE
 
+    @classmethod
+    def _auto_capture_transaction_path(cls, session_dir: Path) -> Path:
+        return Path(session_dir) / cls.AUTO_CAPTURE_TRANSACTION_FILE
+
     @staticmethod
     def _resolve_session_relative_path(session_dir: Path, value: object) -> Path:
         """Resolve one WAL-owned path without permitting directory escape."""
@@ -840,14 +1493,270 @@ class GrowthLogger:
             )
             return False
 
+    @staticmethod
+    def _remove_auto_capture_directory(path: Path) -> bool:
+        """Remove one WAL-owned flat event directory without guessing."""
+        directory = Path(path)
+        if not directory.exists():
+            return True
+        try:
+            if directory.is_symlink() or not directory.is_dir():
+                raise ValueError("auto-capture transaction path is not a directory")
+            children = tuple(directory.iterdir())
+            if any(child.is_dir() and not child.is_symlink() for child in children):
+                raise ValueError("auto-capture transaction directory is not flat")
+            for child in children:
+                child.unlink()
+            directory.rmdir()
+            return True
+        except (OSError, ValueError) as exc:
+            log.error("Could not remove auto-capture transaction directory %s: %s", directory, exc)
+            return False
+
+    @classmethod
+    def _validate_auto_capture_event_directory(
+        cls,
+        event_dir: Path,
+        expected_manifest_rows: list[dict[str, str]],
+        expected_classifier_snapshot: Optional[bytes],
+    ) -> None:
+        """Require the committed directory to match the WAL manifest exactly."""
+        directory = Path(event_dir)
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("committed auto-capture event directory is missing")
+        manifest_path = directory / "capture_manifest.csv"
+        with open(manifest_path, newline="", encoding="utf-8") as stream:
+            reader = csv.DictReader(stream)
+            if tuple(reader.fieldnames or ()) != tuple(cls.AUTO_CAPTURE_MANIFEST_FIELDS):
+                raise ValueError("auto-capture manifest schema does not match the WAL")
+            actual_rows = [
+                {
+                    field: "" if row.get(field) is None else str(row.get(field))
+                    for field in cls.AUTO_CAPTURE_MANIFEST_FIELDS
+                }
+                for row in reader
+            ]
+        if actual_rows != expected_manifest_rows:
+            raise ValueError("auto-capture manifest rows do not match the WAL")
+        for row in expected_manifest_rows:
+            frame_name = row["frame_path"]
+            if Path(frame_name).name != frame_name or not frame_name.lower().endswith(".bmp"):
+                raise ValueError("auto-capture WAL contains an unsafe frame filename")
+            frame_path = directory / frame_name
+            if (
+                frame_path.is_symlink()
+                or not frame_path.is_file()
+                or frame_path.stat().st_size <= 0
+            ):
+                raise ValueError("auto-capture WAL frame is missing or empty")
+        snapshot_path = directory / "classifier_state.json"
+        if expected_classifier_snapshot is None:
+            if snapshot_path.exists() or snapshot_path.is_symlink():
+                raise ValueError("auto-capture directory has an unjournaled classifier snapshot")
+        elif (
+            snapshot_path.is_symlink()
+            or not snapshot_path.is_file()
+            or snapshot_path.read_bytes() != expected_classifier_snapshot
+        ):
+            raise ValueError("auto-capture classifier snapshot does not match the WAL")
+
+        expected_names = {
+            "capture_manifest.csv",
+            *(row["frame_path"] for row in expected_manifest_rows),
+        }
+        if expected_classifier_snapshot is not None:
+            expected_names.add("classifier_state.json")
+        actual_names = {child.name for child in directory.iterdir()}
+        if actual_names != expected_names:
+            raise ValueError("auto-capture event directory contains unjournaled files")
+
+    @classmethod
+    def _recover_auto_capture_transaction(cls, session_dir: Path) -> bool:
+        """Finish or roll back one event-buffer/CSV transaction.
+
+        The exact durable CSV row is the commit decision.  A matching row
+        keeps (or promotes) its verified event directory; an absent row owns
+        no data and therefore removes both staging and final directories.
+        Malformed or conflicting state is retained fail-closed.
+        """
+        session_dir = Path(session_dir)
+        marker = cls._auto_capture_transaction_path(session_dir)
+        if not marker.exists():
+            return True
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema_version")
+                != cls.AUTO_CAPTURE_TRANSACTION_SCHEMA_VERSION
+            ):
+                raise ValueError("unsupported auto-capture WAL schema")
+            row_payload = payload.get("row")
+            if not isinstance(row_payload, dict) or set(row_payload) != set(cls.AUTO_CAPTURE_FIELDS):
+                raise ValueError("auto-capture WAL row does not match the CSV schema")
+            row = {
+                field: "" if row_payload.get(field) is None else str(row_payload.get(field))
+                for field in cls.AUTO_CAPTURE_FIELDS
+            }
+            event_idx = int(payload.get("event_idx"))
+            if event_idx <= 0 or row["event_idx"] != str(event_idx):
+                raise ValueError("auto-capture WAL event identity is inconsistent")
+            buffer_count = int(row["buffer_count"])
+            if buffer_count < 0:
+                raise ValueError("auto-capture WAL buffer count is invalid")
+
+            manifest_payload = payload.get("manifest_rows")
+            if not isinstance(manifest_payload, list):
+                raise ValueError("auto-capture WAL manifest is missing")
+            manifest_rows: list[dict[str, str]] = []
+            for manifest_row in manifest_payload:
+                if (
+                    not isinstance(manifest_row, dict)
+                    or set(manifest_row) != set(cls.AUTO_CAPTURE_MANIFEST_FIELDS)
+                ):
+                    raise ValueError("auto-capture WAL manifest row is invalid")
+                manifest_rows.append({
+                    field: "" if manifest_row.get(field) is None else str(manifest_row.get(field))
+                    for field in cls.AUTO_CAPTURE_MANIFEST_FIELDS
+                })
+            if len(manifest_rows) != buffer_count:
+                raise ValueError("auto-capture WAL manifest count is inconsistent")
+            frame_names = [manifest_row["frame_path"] for manifest_row in manifest_rows]
+            if len(frame_names) != len(set(frame_names)):
+                raise ValueError("auto-capture WAL contains duplicate frame filenames")
+
+            snapshot_path_value = str(payload.get("classifier_snapshot_path", ""))
+            snapshot_json_value = payload.get("classifier_snapshot_json", "")
+            snapshot_hash = str(payload.get("classifier_snapshot_sha256", "")).lower()
+            expected_classifier_snapshot: Optional[bytes] = None
+            if snapshot_path_value:
+                if snapshot_path_value != "classifier_state.json" or not buffer_count:
+                    raise ValueError("auto-capture classifier snapshot path is invalid")
+                if not isinstance(snapshot_json_value, str) or not snapshot_json_value:
+                    raise ValueError("auto-capture classifier snapshot JSON is missing")
+                expected_classifier_snapshot = snapshot_json_value.encode("utf-8")
+                if (
+                    len(snapshot_hash) != 64
+                    or any(character not in "0123456789abcdef" for character in snapshot_hash)
+                    or hashlib.sha256(expected_classifier_snapshot).hexdigest()
+                    != snapshot_hash
+                ):
+                    raise ValueError("auto-capture classifier snapshot hash is invalid")
+                snapshot_payload = json.loads(snapshot_json_value)
+                if (
+                    not isinstance(snapshot_payload, dict)
+                    or int(snapshot_payload.get("event_idx", 0)) != event_idx
+                ):
+                    raise ValueError("auto-capture classifier snapshot identity is invalid")
+            elif snapshot_json_value or snapshot_hash:
+                raise ValueError("auto-capture classifier snapshot WAL fields conflict")
+
+            staging_value = str(payload.get("staging_dir", ""))
+            final_value = str(payload.get("final_dir", ""))
+            staging_dir: Optional[Path] = None
+            final_dir: Optional[Path] = None
+            if buffer_count:
+                staging_relative = Path(staging_value.replace("\\", "/"))
+                final_relative = Path(final_value.replace("\\", "/"))
+                expected_final = Path("frames") / f"auto_event_{event_idx:03d}"
+                if (
+                    final_relative != expected_final
+                    or row["buffer_dir"] != expected_final.as_posix()
+                    or staging_relative.parent != Path("frames")
+                    or not staging_relative.name.startswith(
+                        f".auto_event_{event_idx:03d}."
+                    )
+                    or not staging_relative.name.endswith(".pending")
+                ):
+                    raise ValueError("auto-capture WAL directory binding is invalid")
+                staging_dir = cls._resolve_session_relative_path(
+                    session_dir, staging_relative,
+                )
+                final_dir = cls._resolve_session_relative_path(
+                    session_dir, final_relative,
+                )
+                if row["event_state"] != EVENT_STATE_PENDING or row["state_changed_at"]:
+                    raise ValueError("buffered auto-capture WAL has invalid initial state")
+            elif (
+                staging_value
+                or final_value
+                or row["buffer_dir"]
+                or manifest_rows
+                or row["event_state"] != EVENT_STATE_AUTO_SKIPPED
+                or not row["state_changed_at"]
+            ):
+                raise ValueError("empty auto-capture WAL has inconsistent paths or state")
+            elif (session_dir / "frames" / f"auto_event_{event_idx:03d}").exists():
+                raise ValueError(
+                    "empty auto-capture WAL conflicts with an existing event directory"
+                )
+
+            csv_path = session_dir / "auto_capture_events.csv"
+            rows: list[dict[str, str]] = []
+            if csv_path.exists():
+                with open(csv_path, newline="", encoding="utf-8") as stream:
+                    reader = csv.DictReader(stream)
+                    if tuple(reader.fieldnames or ()) != tuple(cls.AUTO_CAPTURE_FIELDS):
+                        raise ValueError("auto-capture CSV schema does not match the WAL")
+                    rows = [
+                        {
+                            field: "" if existing.get(field) is None else str(existing.get(field))
+                            for field in cls.AUTO_CAPTURE_FIELDS
+                        }
+                        for existing in reader
+                    ]
+            same_index = [existing for existing in rows if existing["event_idx"] == str(event_idx)]
+            if len(same_index) > 1:
+                raise ValueError("auto-capture CSV contains a duplicate event index")
+            committed = bool(same_index)
+            if committed and same_index[0] != row:
+                raise ValueError("auto-capture WAL conflicts with the committed CSV row")
+
+            if committed and buffer_count:
+                assert staging_dir is not None and final_dir is not None
+                if final_dir.exists() and staging_dir.exists():
+                    raise ValueError("auto-capture WAL has both staging and final directories")
+                if not final_dir.exists():
+                    if not staging_dir.exists():
+                        raise ValueError("committed auto-capture row has no event directory")
+                    cls._validate_auto_capture_event_directory(
+                        staging_dir, manifest_rows, expected_classifier_snapshot,
+                    )
+                    os.replace(staging_dir, final_dir)
+                cls._validate_auto_capture_event_directory(
+                    final_dir, manifest_rows, expected_classifier_snapshot,
+                )
+            elif not committed:
+                cleanup_ok = True
+                for owned_dir in (staging_dir, final_dir):
+                    if owned_dir is not None:
+                        cleanup_ok = cls._remove_auto_capture_directory(owned_dir) and cleanup_ok
+                if not cleanup_ok:
+                    raise OSError("auto-capture rollback could not remove every directory")
+
+            for temporary_path in csv_path.parent.glob(f".{csv_path.name}.*.tmp"):
+                temporary_path.unlink(missing_ok=True)
+            marker.unlink()
+            return True
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            log.error(
+                "Auto-capture transaction recovery failed for %s: %s",
+                marker,
+                exc,
+            )
+            return False
+
     def _recover_pending_live_label_transactions(self) -> bool:
-        """Recover label and calibration WALs in the configured log root."""
+        """Recover all image/provenance WALs in the configured log root."""
         try:
             live_markers = tuple(
                 self._base_dir.glob(f"*/{self.LIVE_LABEL_TRANSACTION_FILE}")
             )
             calibration_markers = tuple(
                 self._base_dir.glob(f"*/{self.CALIBRATION_TRANSACTION_FILE}")
+            )
+            auto_capture_markers = tuple(
+                self._base_dir.glob(f"*/{self.AUTO_CAPTURE_TRANSACTION_FILE}")
             )
         except OSError as exc:
             log.error("Could not scan Equalizer transactions: %s", exc)
@@ -861,6 +1770,10 @@ class GrowthLogger:
             if not self._recover_calibration_transaction(marker.parent):
                 recovered = False
                 log.error("Calibration transaction remains unresolved: %s", marker)
+        for marker in auto_capture_markers:
+            if not self._recover_auto_capture_transaction(marker.parent):
+                recovered = False
+                log.error("Auto-capture transaction remains unresolved: %s", marker)
         return recovered
 
     def _close_live_label_stream(self) -> None:
@@ -887,6 +1800,39 @@ class GrowthLogger:
             self._live_label_writer = None
             log.error("Could not reopen Live-label CSV %s: %s", path, exc)
             return False
+
+    def _close_auto_capture_stream(self) -> None:
+        stream = self._auto_capture_file
+        if stream is not None and not stream.closed:
+            stream.close()
+        self._auto_capture_file = None
+        self._auto_capture_writer = None
+
+    def _open_auto_capture_stream_for_append(self) -> bool:
+        if self._session_dir is None:
+            return False
+        path = self._session_dir / "auto_capture_events.csv"
+        try:
+            self._auto_capture_file = open(
+                path, "a", newline="", encoding="utf-8",
+            )
+            self._auto_capture_writer = csv.DictWriter(
+                self._auto_capture_file, fieldnames=self.AUTO_CAPTURE_FIELDS,
+            )
+            return True
+        except OSError as exc:
+            self._auto_capture_file = None
+            self._auto_capture_writer = None
+            log.error("Could not reopen auto-capture CSV %s: %s", path, exc)
+            return False
+
+    def _auto_capture_stream_ready(self) -> bool:
+        stream = self._auto_capture_file
+        return bool(
+            self._auto_capture_writer is not None
+            and stream is not None
+            and not stream.closed
+        )
 
     @staticmethod
     def _remove_live_label_transaction_files(*paths: Path) -> bool:
@@ -941,6 +1887,11 @@ class GrowthLogger:
         self._live_label_counter = 0
         self._equalizer_calibration_event_counter = 0
         self._basis_bundle_ids_recorded: set[str] = set()
+        # A fresh runtime identifier is intentionally not persisted across
+        # process restarts.  Blind-label provenance is valid only after this
+        # runtime explicitly attaches to the session and enters blind mode.
+        self._human_labeling_runtime_id = uuid.uuid4().hex
+        self._human_labeling_state_trusted = False
         self._sensor_row_counter = 0
         self._session_start: Optional[datetime] = None
         self._entries: list[dict] = []  # Accumulated entries for export
@@ -980,6 +1931,11 @@ class GrowthLogger:
         (self._session_dir / "frames").mkdir(exist_ok=True)
         self._calibration_journal_trusted = True
         self._basis_bundle_ids_recorded.clear()
+        if not self._initialize_human_labeling_state():
+            log.error(
+                "Human blind-labeling proof state could not be initialized; "
+                "this session will produce assisted labels only"
+            )
 
         sensor_path = self._session_dir / "sensor_log.csv"
         self._sensor_file = open(sensor_path, "w", newline="")
@@ -1925,6 +2881,8 @@ class GrowthLogger:
         psu_source: str = "none",
         frame: Optional[np.ndarray] = None,
         capture_metadata: Optional[dict] = None,
+        equalizer_payload: Optional[Mapping[str, object]] = None,
+        labeler: str = "",
     ) -> int:
         """Persist a Live Equalizer label and its exact frozen camera frame.
 
@@ -1965,6 +2923,23 @@ class GrowthLogger:
         capture_columns = self._snapshot_capture_columns(snapshot)
         if not isinstance(weights, Mapping):
             raise TypeError("weights must be a mapping")
+
+        equalizer_columns = self._equalizer_record_columns(
+            equalizer_payload,
+            labeler=labeler,
+            rgb=snapshot.rgb,
+            calibration_valid=True,
+        )
+        if equalizer_payload is not None:
+            supplied_final = equalizer_payload.get("final_weights")
+            if not isinstance(supplied_final, Mapping):
+                raise ValueError("Equalizer payload final_weights are missing")
+            for label in calibration.active_classes:
+                if abs(
+                    float(weights.get(label, 0.0) or 0.0)
+                    - float(supplied_final.get(label, 0.0) or 0.0)
+                ) > 1e-9:
+                    raise ValueError("Equalizer payload and saved weights differ")
 
         active_classes = tuple(calibration.active_classes)
         active_text = self._active_classes_text(active_classes)
@@ -2009,6 +2984,7 @@ class GrowthLogger:
             "timestamp": datetime.now().isoformat(),
             "elapsed_s": f"{float(elapsed_s):.2f}",
             "label_idx": idx,
+            **equalizer_columns,
             "recon_1x1": _validated_weight("1x1"),
             "recon_tw": _validated_weight("Tw(2x1)"),
             "recon_c6x2": _validated_weight("c(6x2)"),
@@ -2026,6 +3002,10 @@ class GrowthLogger:
             "psu_source": str(psu_source),
             "frame_path": "",
             **capture_columns,
+            "captured_monotonic_ns": snapshot.received_monotonic_ns,
+            "session_id": snapshot.session_id,
+            "gun_aligned": str(snapshot.gun_aligned),
+            "realignment_active": str(snapshot.realignment_active),
             "calibration_id": calibration.calibration_id,
             "basis_bundle_id": calibration.basis_bundle_id,
             "equalizer_active_classes": active_text,
@@ -2139,6 +3119,371 @@ class GrowthLogger:
         })
         self._heartbeat_file.flush()
 
+    @staticmethod
+    def _stringify_csv_row(
+        row: Mapping[str, object], fields: Iterable[str],
+    ) -> dict[str, str]:
+        return {
+            field: "" if row.get(field) is None else str(row.get(field))
+            for field in fields
+        }
+
+    def _build_auto_capture_row(
+        self,
+        event_idx: int,
+        score: float,
+        elapsed_s: float,
+        pyro_temp: Optional[float] = None,
+        buffer_count: int = 0,
+        buffer_dir: str = "",
+        event_state: str = EVENT_STATE_PENDING,
+        capture_metadata: Optional[dict] = None,
+        timestamp: Optional[str] = None,
+    ) -> dict[str, str]:
+        """Validate and stringify one row exactly as CSV reads it back."""
+        event_idx = int(event_idx)
+        score = float(score)
+        elapsed_s = float(elapsed_s)
+        buffer_count = int(buffer_count)
+        if event_idx <= 0:
+            raise ValueError("auto-capture event_idx must be positive")
+        if not math.isfinite(score) or not math.isfinite(elapsed_s):
+            raise ValueError("auto-capture score and elapsed time must be finite")
+        if pyro_temp is not None and not math.isfinite(float(pyro_temp)):
+            raise ValueError("auto-capture pyrometer value must be finite")
+        if buffer_count < 0:
+            raise ValueError("auto-capture buffer_count cannot be negative")
+        if event_state not in {
+            EVENT_STATE_PENDING,
+            EVENT_STATE_KEPT_EXPLICIT,
+            EVENT_STATE_KEPT_DEFAULT,
+            EVENT_STATE_DISCARDED,
+            EVENT_STATE_AUTO_SKIPPED,
+        }:
+            raise ValueError("invalid auto-capture event state")
+        stamp = timestamp or datetime.now().isoformat()
+        raw = {
+            "timestamp": stamp,
+            "elapsed_s": f"{elapsed_s:.2f}",
+            "event_idx": event_idx,
+            "change_score": f"{score:.4f}",
+            "pyrometer_temp_C": (
+                f"{float(pyro_temp):.1f}" if pyro_temp is not None else ""
+            ),
+            "buffer_count": buffer_count,
+            "buffer_dir": str(buffer_dir),
+            "event_state": event_state,
+            "state_changed_at": (
+                stamp if event_state != EVENT_STATE_PENDING else ""
+            ),
+            **self._capture_columns(capture_metadata),
+        }
+        return self._stringify_csv_row(raw, self.AUTO_CAPTURE_FIELDS)
+
+    def _read_auto_capture_rows(self) -> tuple[Path, list[dict[str, str]]]:
+        """Read durable CSV rows, flushing an append stream when available."""
+        if self._session_dir is None:
+            raise OSError("auto-capture session is not available")
+        csv_path = self._session_dir / "auto_capture_events.csv"
+        if self._auto_capture_file is not None:
+            self._auto_capture_file.flush()
+            os.fsync(self._auto_capture_file.fileno())
+        with open(csv_path, newline="", encoding="utf-8") as stream:
+            reader = csv.DictReader(stream)
+            if tuple(reader.fieldnames or ()) != tuple(self.AUTO_CAPTURE_FIELDS):
+                raise ValueError("auto-capture CSV schema is incompatible")
+            rows = [
+                self._stringify_csv_row(row, self.AUTO_CAPTURE_FIELDS)
+                for row in reader
+            ]
+        return csv_path, rows
+
+    def _rollback_auto_capture_transaction(
+        self,
+        staging_dir: Optional[Path],
+        final_dir: Optional[Path],
+        marker: Path,
+    ) -> bool:
+        cleaned = True
+        for owned_dir in (staging_dir, final_dir):
+            if owned_dir is not None:
+                cleaned = self._remove_auto_capture_directory(owned_dir) and cleaned
+        if not cleaned:
+            log.error("Retaining auto-capture WAL after incomplete rollback: %s", marker)
+            return False
+        try:
+            marker.unlink(missing_ok=True)
+            return True
+        except OSError as exc:
+            log.error("Could not clear rolled-back auto-capture WAL %s: %s", marker, exc)
+            return False
+
+    def record_auto_capture_event(
+        self,
+        *,
+        event_idx: int,
+        score: float,
+        elapsed_s: float,
+        frames: list[np.ndarray],
+        frame_capture_metadata: Optional[list[dict]] = None,
+        pyro_temp: Optional[float] = None,
+        event_capture_metadata: Optional[dict] = None,
+        classifier_snapshot: Optional[Mapping[str, object]] = None,
+    ) -> AutoCaptureCommitResult:
+        """Crash-transactionally persist one event row and its frame buffer."""
+        if self._session_dir is None or not self._auto_capture_stream_ready():
+            return AutoCaptureCommitResult(
+                writer_ready=self._auto_capture_stream_ready(),
+            )
+        try:
+            self._auto_capture_file.flush()
+            os.fsync(self._auto_capture_file.fileno())
+        except (OSError, ValueError) as exc:
+            log.error("Could not flush auto-capture CSV before recovery: %s", exc)
+            return AutoCaptureCommitResult(
+                writer_ready=self._auto_capture_stream_ready(),
+            )
+        if not self._recover_auto_capture_transaction(self._session_dir):
+            log.error("Refusing auto-capture write while an older WAL is unresolved")
+            return AutoCaptureCommitResult(
+                writer_ready=self._auto_capture_stream_ready(),
+            )
+
+        event_idx = int(event_idx)
+        if event_idx <= 0:
+            raise ValueError("auto-capture event_idx must be positive")
+        try:
+            from drivers.frame_quality import check_frame_quality
+        except ImportError:
+            check_frame_quality = None
+
+        ts_tag = datetime.now().strftime("%H%M%S_%f")
+        selected: list[tuple[np.ndarray, dict[str, str]]] = []
+        for pos, frame in enumerate(frames):
+            if check_frame_quality is not None:
+                qa = check_frame_quality(frame)
+                if not qa.passed:
+                    continue
+            metadata = (
+                frame_capture_metadata[pos]
+                if frame_capture_metadata is not None
+                and pos < len(frame_capture_metadata)
+                else {}
+            )
+            raw_manifest = {
+                "frame_path": f"buf_{pos:02d}_{ts_tag}.bmp",
+                **self._capture_columns(metadata),
+                "captured_monotonic_ns": metadata.get("captured_monotonic_ns", ""),
+                "camera_width": metadata.get("camera_width", frame.shape[1]),
+                "camera_height": metadata.get("camera_height", frame.shape[0]),
+                "session_id": metadata.get("session_id", ""),
+                "view_segment_id": metadata.get("view_segment_id", ""),
+                "visual_history_generation": metadata.get(
+                    "visual_history_generation", "",
+                ),
+                "gun_aligned": metadata.get("gun_aligned", ""),
+                "realignment_active": metadata.get("realignment_active", ""),
+                "calibration_id": metadata.get("calibration_id", ""),
+                "basis_bundle_id": metadata.get("basis_bundle_id", ""),
+            }
+            selected.append((
+                frame,
+                self._stringify_csv_row(
+                    raw_manifest, self.AUTO_CAPTURE_MANIFEST_FIELDS,
+                ),
+            ))
+
+        buffer_count = len(selected)
+        classifier_snapshot_bytes: Optional[bytes] = None
+        classifier_snapshot_text = ""
+        classifier_snapshot_hash = ""
+        if buffer_count and classifier_snapshot is not None:
+            if not isinstance(classifier_snapshot, Mapping):
+                raise ValueError("classifier snapshot must be a mapping")
+            snapshot_payload = dict(classifier_snapshot)
+            if int(snapshot_payload.get("event_idx", 0)) != event_idx:
+                raise ValueError("classifier snapshot event identity does not match")
+            snapshot_score = float(snapshot_payload.get("event_score", math.nan))
+            if not math.isfinite(snapshot_score) or snapshot_score != float(score):
+                raise ValueError("classifier snapshot score identity does not match")
+            try:
+                classifier_snapshot_text = json.dumps(
+                    snapshot_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("classifier snapshot is not finite JSON") from exc
+            classifier_snapshot_bytes = classifier_snapshot_text.encode("utf-8")
+            classifier_snapshot_hash = hashlib.sha256(
+                classifier_snapshot_bytes,
+            ).hexdigest()
+        final_relative = (
+            Path("frames") / f"auto_event_{event_idx:03d}"
+            if buffer_count else None
+        )
+        staging_relative = (
+            Path("frames")
+            / f".auto_event_{event_idx:03d}.{uuid.uuid4().hex}.pending"
+            if buffer_count else None
+        )
+        buffer_dir = final_relative.as_posix() if final_relative is not None else ""
+        row = self._build_auto_capture_row(
+            event_idx=event_idx,
+            score=score,
+            elapsed_s=elapsed_s,
+            pyro_temp=pyro_temp,
+            buffer_count=buffer_count,
+            buffer_dir=buffer_dir,
+            event_state=(
+                EVENT_STATE_PENDING if buffer_count else EVENT_STATE_AUTO_SKIPPED
+            ),
+            capture_metadata=event_capture_metadata,
+        )
+        manifest_rows = [manifest for _frame, manifest in selected]
+        try:
+            csv_path, existing_rows = self._read_auto_capture_rows()
+        except (OSError, TypeError, ValueError) as exc:
+            log.error("Could not prepare auto-capture transaction: %s", exc)
+            return AutoCaptureCommitResult(
+                writer_ready=self._auto_capture_stream_ready(),
+            )
+        if any(row_["event_idx"] == str(event_idx) for row_ in existing_rows):
+            log.error("Auto-capture event index %d already exists", event_idx)
+            return AutoCaptureCommitResult(
+                writer_ready=self._auto_capture_stream_ready(),
+            )
+
+        marker = self._auto_capture_transaction_path(self._session_dir)
+        staging_dir = (
+            self._session_dir / staging_relative
+            if staging_relative is not None else None
+        )
+        final_dir = (
+            self._session_dir / final_relative
+            if final_relative is not None else None
+        )
+        expected_final_dir = (
+            self._session_dir / "frames" / f"auto_event_{event_idx:03d}"
+        )
+        if marker.exists() or any(
+            path is not None and path.exists() for path in (staging_dir, final_dir)
+        ) or expected_final_dir.exists():
+            log.error("Auto-capture transaction paths already exist for event %d", event_idx)
+            return AutoCaptureCommitResult(
+                writer_ready=self._auto_capture_stream_ready(),
+            )
+        wal_payload = {
+            "schema_version": self.AUTO_CAPTURE_TRANSACTION_SCHEMA_VERSION,
+            "event_idx": event_idx,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "staging_dir": (
+                staging_relative.as_posix() if staging_relative is not None else ""
+            ),
+            "final_dir": final_relative.as_posix() if final_relative is not None else "",
+            "row": row,
+            "manifest_rows": manifest_rows,
+            "classifier_snapshot_path": (
+                "classifier_state.json"
+                if classifier_snapshot_bytes is not None else ""
+            ),
+            "classifier_snapshot_json": classifier_snapshot_text,
+            "classifier_snapshot_sha256": classifier_snapshot_hash,
+        }
+        try:
+            wal_bytes = json.dumps(
+                wal_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            log.error("Could not serialize auto-capture transaction: %s", exc)
+            return AutoCaptureCommitResult(
+                writer_ready=self._auto_capture_stream_ready(),
+            )
+        if not self._atomic_write_bytes(marker, wal_bytes):
+            return AutoCaptureCommitResult(
+                writer_ready=self._auto_capture_stream_ready(),
+            )
+
+        if buffer_count:
+            assert staging_dir is not None and final_dir is not None
+            try:
+                staging_dir.mkdir()
+            except OSError as exc:
+                log.error("Could not create auto-capture staging directory: %s", exc)
+                self._rollback_auto_capture_transaction(staging_dir, final_dir, marker)
+                return AutoCaptureCommitResult(
+                    writer_ready=self._auto_capture_stream_ready(),
+                )
+            for frame, manifest in selected:
+                if not self._save_rgb_bmp(frame, staging_dir / manifest["frame_path"]):
+                    self._rollback_auto_capture_transaction(staging_dir, final_dir, marker)
+                    return AutoCaptureCommitResult(
+                        writer_ready=self._auto_capture_stream_ready(),
+                    )
+            if (
+                classifier_snapshot_bytes is not None
+                and not self._atomic_write_bytes(
+                    staging_dir / "classifier_state.json",
+                    classifier_snapshot_bytes,
+                )
+            ):
+                self._rollback_auto_capture_transaction(staging_dir, final_dir, marker)
+                return AutoCaptureCommitResult(
+                    writer_ready=self._auto_capture_stream_ready(),
+                )
+            if not self._atomic_write_csv(
+                staging_dir / "capture_manifest.csv",
+                self.AUTO_CAPTURE_MANIFEST_FIELDS,
+                manifest_rows,
+            ):
+                self._rollback_auto_capture_transaction(staging_dir, final_dir, marker)
+                return AutoCaptureCommitResult(
+                    writer_ready=self._auto_capture_stream_ready(),
+                )
+            try:
+                os.replace(staging_dir, final_dir)
+            except OSError as exc:
+                log.error("Could not finalize auto-capture event directory: %s", exc)
+                self._rollback_auto_capture_transaction(staging_dir, final_dir, marker)
+                return AutoCaptureCommitResult(
+                    writer_ready=self._auto_capture_stream_ready(),
+                )
+
+        self._close_auto_capture_stream()
+        write_ok = False
+        try:
+            write_ok = self._atomic_write_csv(
+                csv_path,
+                self.AUTO_CAPTURE_FIELDS,
+                [*existing_rows, row],
+            )
+        finally:
+            reopened = self._open_auto_capture_stream_for_append()
+        if not write_ok:
+            self._rollback_auto_capture_transaction(staging_dir, final_dir, marker)
+            return AutoCaptureCommitResult(writer_ready=bool(reopened))
+        try:
+            marker.unlink()
+        except OSError as exc:
+            log.error(
+                "Committed auto-capture event %d but could not clear WAL %s: %s",
+                event_idx,
+                marker,
+                exc,
+            )
+        if not reopened:
+            log.error("Auto-capture CSV committed but its append stream is unavailable")
+        return AutoCaptureCommitResult(
+            buffer_count=buffer_count,
+            buffer_dir=buffer_dir,
+            committed=True,
+            writer_ready=bool(reopened and self._auto_capture_stream_ready()),
+        )
+
     def log_auto_capture_event(
         self,
         event_idx: int,
@@ -2149,8 +3494,8 @@ class GrowthLogger:
         buffer_dir: str = "",
         event_state: str = EVENT_STATE_PENDING,
         capture_metadata: Optional[dict] = None,
-    ):
-        """Append a row to auto_capture_events.csv for shadow-mode logging.
+    ) -> bool:
+        """Atomically append a no-image row to auto_capture_events.csv.
 
         Called by GrowthApp when AutoCaptureEngine emits frame_captured.
         Writes timestamp + change score + temp at trigger time, so the
@@ -2164,30 +3509,39 @@ class GrowthLogger:
         when the grower interacts with the AutoCaptureBanner (see
         ``update_auto_capture_state``).
         """
-        if not self._auto_capture_writer:
-            return
-        timestamp = datetime.now().isoformat()
-        # Non-pending initial states (auto_skipped, etc.) are terminal at
-        # log time — set state_changed_at so the CSV stays internally
-        # consistent with the rule that any non-pending row has a stamp.
-        state_changed_at = (
-            timestamp if event_state != EVENT_STATE_PENDING else ""
+        if not self._auto_capture_writer or self._session_dir is None:
+            return False
+        if int(buffer_count) != 0 or str(buffer_dir):
+            raise ValueError(
+                "Buffered auto-capture events require record_auto_capture_event"
+            )
+        if not self._recover_auto_capture_transaction(self._session_dir):
+            return False
+        row = self._build_auto_capture_row(
+            event_idx=event_idx,
+            score=score,
+            elapsed_s=elapsed_s,
+            pyro_temp=pyro_temp,
+            buffer_count=0,
+            buffer_dir="",
+            event_state=event_state,
+            capture_metadata=capture_metadata,
         )
-        self._auto_capture_writer.writerow({
-            "timestamp": timestamp,
-            "elapsed_s": f"{elapsed_s:.2f}",
-            "event_idx": event_idx,
-            "change_score": f"{score:.4f}",
-            "pyrometer_temp_C": (
-                f"{pyro_temp:.1f}" if pyro_temp is not None else ""
-            ),
-            "buffer_count": buffer_count,
-            "buffer_dir": buffer_dir,
-            "event_state": event_state,
-            "state_changed_at": state_changed_at,
-            **self._capture_columns(capture_metadata),
-        })
-        self._auto_capture_file.flush()
+        try:
+            csv_path, rows = self._read_auto_capture_rows()
+        except (OSError, TypeError, ValueError) as exc:
+            log.error("Could not prepare auto-capture row: %s", exc)
+            return False
+        if any(existing["event_idx"] == row["event_idx"] for existing in rows):
+            return False
+        self._close_auto_capture_stream()
+        try:
+            write_ok = self._atomic_write_csv(
+                csv_path, self.AUTO_CAPTURE_FIELDS, [*rows, row],
+            )
+        finally:
+            self._open_auto_capture_stream_for_append()
+        return write_ok
 
     def update_auto_capture_state(
         self,
@@ -2208,17 +3562,21 @@ class GrowthLogger:
         """
         if self._session_dir is None:
             return False
-        csv_path = self._session_dir / "auto_capture_events.csv"
-        if not csv_path.exists():
+        try:
+            if self._auto_capture_file is not None:
+                self._auto_capture_file.flush()
+                os.fsync(self._auto_capture_file.fileno())
+        except (OSError, ValueError):
+            return False
+        if not self._recover_auto_capture_transaction(self._session_dir):
+            return False
+        try:
+            csv_path, rows = self._read_auto_capture_rows()
+        except (OSError, TypeError, ValueError):
             return False
 
         # Close the writer's file handle so we can rewrite in-place.
-        if self._auto_capture_file and not self._auto_capture_file.closed:
-            self._auto_capture_file.close()
-
-        with open(csv_path, "r", newline="") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
+        self._close_auto_capture_stream()
 
         timestamp = datetime.now().isoformat()
         found = False
@@ -2240,10 +3598,7 @@ class GrowthLogger:
         # Reopen for append so subsequent log_auto_capture_event calls work.
         # No header write — the file already has the header from start_session
         # (or the rewrite above when found=True).
-        self._auto_capture_file = open(csv_path, "a", newline="")
-        self._auto_capture_writer = csv.DictWriter(
-            self._auto_capture_file, fieldnames=self.AUTO_CAPTURE_FIELDS,
-        )
+        self._open_auto_capture_stream_for_append()
         return found and write_ok
 
     def read_event_labels(self) -> dict[int, dict]:
@@ -2281,6 +3636,15 @@ class GrowthLogger:
         self,
         event_idx: int,
         primary_reconstruction: Optional[str] = None,
+        human_primary_reconstruction: Optional[str] = None,
+        human_label_source: Optional[str] = None,
+        human_labeler: Optional[str] = None,
+        human_confidence: object = None,
+        human_blind_to_model: Optional[bool] = None,
+        human_blind_to_equalizer: Optional[bool] = None,
+        human_frame_path: Optional[str] = None,
+        human_capture_metadata: Optional[Mapping[str, object]] = None,
+        human_annotation_id: str = "",
         change_from: Optional[str] = None,
         change_to: Optional[str] = None,
         notes: Optional[str] = None,
@@ -2303,6 +3667,8 @@ class GrowthLogger:
         frame_age_ms: Optional[float] = None,
         source_hwnd: Optional[int] = None,
         capture_geometry_id: Optional[str] = None,
+        equalizer_payload: Optional[Mapping[str, object]] = None,
+        equalizer_labeler: str = "",
     ) -> bool:
         """Atomically upsert a labeling row in events_labels.csv.
 
@@ -2347,6 +3713,8 @@ class GrowthLogger:
         has_equalizer_weights = any(
             value is not None for value in recon_values.values()
         )
+        if equalizer_payload is not None and not has_equalizer_weights:
+            raise ValueError("Equalizer payload requires final weights")
         has_typed_context = calibration is not None or snapshot is not None
         has_explicit_context = any(value is not None for value in (
             calibration_id, basis_bundle_id, equalizer_active_classes,
@@ -2383,6 +3751,10 @@ class GrowthLogger:
                 "view_segment_id": snapshot.view_segment_id,
                 "visual_history_generation": snapshot.visual_history_generation,
                 "frame_path": str(existing_frame_path),
+                "captured_monotonic_ns": snapshot.received_monotonic_ns,
+                "gun_aligned": str(snapshot.gun_aligned),
+                "realignment_active": str(snapshot.realignment_active),
+                "session_id": snapshot.session_id,
                 **capture,
             }
             active_classes = set(calibration.active_classes)
@@ -2442,6 +3814,10 @@ class GrowthLogger:
                 "view_segment_id": view_segment_id,
                 "visual_history_generation": visual_history_generation,
                 "frame_path": str(existing_frame_path),
+                "captured_monotonic_ns": journaled.received_monotonic_ns,
+                "gun_aligned": str(journaled.gun_aligned),
+                "realignment_active": str(journaled.realignment_active),
+                "session_id": journaled.session_id,
                 **self._capture_columns({
                     "capture_backend": capture_backend,
                     "captured_at_utc": captured_at_utc,
@@ -2453,6 +3829,54 @@ class GrowthLogger:
             }
         else:
             active_classes = set()
+
+        equalizer_columns: dict[str, object] = {}
+        if has_equalizer_weights:
+            equalizer_columns = self._equalizer_record_columns(
+                equalizer_payload,
+                labeler=equalizer_labeler,
+                rgb=snapshot.rgb if snapshot is not None else None,
+                calibration_valid=True,
+            )
+            if equalizer_payload is not None:
+                supplied_final = equalizer_payload.get("final_weights")
+                if not isinstance(supplied_final, Mapping):
+                    raise ValueError("Equalizer payload final_weights are missing")
+                payload_columns = {
+                    "recon_1x1": "1x1",
+                    "recon_tw": "Tw(2x1)",
+                    "recon_c6x2": "c(6x2)",
+                    "recon_rt13": "RT13",
+                }
+                for column, label in payload_columns.items():
+                    value = recon_values[column]
+                    if value is None or abs(
+                        float(value) - float(supplied_final.get(label, 0.0) or 0.0)
+                    ) > 1e-9:
+                        raise ValueError("Equalizer payload and saved weights differ")
+
+        human_columns: dict[str, object] = {}
+        if human_primary_reconstruction is not None:
+            if not human_primary_reconstruction:
+                human_columns = {
+                    field: ""
+                    for field in self.EVENT_LABEL_FIELDS
+                    if field.startswith("human_")
+                }
+            else:
+                if human_frame_path is None or human_capture_metadata is None:
+                    raise ValueError("Human primary label requires exact frame context")
+                human_columns = self._human_primary_columns(
+                    reconstruction=human_primary_reconstruction,
+                    label_source=str(human_label_source or ""),
+                    labeler=str(human_labeler or ""),
+                    confidence=human_confidence,
+                    blind_to_model=bool(human_blind_to_model),
+                    blind_to_equalizer=bool(human_blind_to_equalizer),
+                    frame_path=Path(human_frame_path),
+                    capture_metadata=human_capture_metadata,
+                    session_dir=self._session_dir,
+                )
 
         formatted_recons: dict[str, str] = {}
         for column, value in recon_values.items():
@@ -2498,8 +3922,33 @@ class GrowthLogger:
             existing["event_idx"] = target
             rows.append(existing)
 
+        label_timestamp = self._utc_now_text()
+        human_audit_row: Optional[dict[str, str]] = None
+        if human_primary_reconstruction:
+            # The append-only file is the source of truth.  It is committed
+            # before the mutable per-event summary so a crash cannot leave a
+            # summary-only "gold" label with no independent annotation.
+            human_audit_row = self._append_human_primary_label(
+                human_columns=human_columns,
+                capture_metadata=human_capture_metadata or {},
+                annotation_id=human_annotation_id,
+                timestamp=label_timestamp,
+            )
+
         if primary_reconstruction is not None:
             existing["primary_reconstruction"] = primary_reconstruction
+        if human_primary_reconstruction is not None:
+            # Legacy summary mirrors only an explicit human decision.  An
+            # Equalizer save never reaches this branch.
+            existing["primary_reconstruction"] = human_primary_reconstruction
+            existing.update(human_columns)
+            if human_audit_row is not None:
+                existing["human_primary_annotation_id"] = human_audit_row[
+                    "annotation_id"
+                ]
+                existing["human_primary_label_idx"] = human_audit_row[
+                    "label_idx"
+                ]
         if change_from is not None:
             existing["change_from"] = change_from
         if change_to is not None:
@@ -2507,17 +3956,25 @@ class GrowthLogger:
         if notes is not None:
             existing["notes"] = notes
         existing.update(formatted_recons)
+        existing.update(equalizer_columns)
         if context:
             existing.update(context)
             if "HTR" not in active_classes:
                 existing["recon_HTR"] = ""
-        existing["label_timestamp_iso"] = datetime.now().isoformat()
+        existing["label_timestamp_iso"] = label_timestamp
 
         if not self._atomic_write_csv(
             csv_path,
             self.EVENT_LABEL_FIELDS,
             rows,
         ):
+            if human_audit_row is not None:
+                log.error(
+                    "Human annotation %s is durable but events_labels.csv "
+                    "summary could not be refreshed",
+                    human_audit_row["annotation_id"],
+                )
+                return True
             return False
         return True
 
@@ -2527,116 +3984,12 @@ class GrowthLogger:
         frames: list[np.ndarray],
         capture_metadata: Optional[list[dict]] = None,
     ) -> tuple[int, str]:
-        """Save the auto-capture context buffer for a flagged event.
-
-        Each frame is written to a per-event subdirectory under frames/ so
-        that sessions with many events stay browsable. The quality gate is
-        applied per-frame; rejected frames are silently skipped (they don't
-        carry information worth keeping).
-
-        Returns ``(saved_count, relative_dir)``. ``relative_dir`` is empty
-        if no session is active.
-        """
-        if self._session_dir is None or not frames:
-            return 0, ""
-
-        try:
-            from drivers.frame_quality import check_frame_quality
-        except ImportError:
-            check_frame_quality = None
-
-        frames_root = self._session_dir / "frames"
-        frames_root.mkdir(parents=True, exist_ok=True)
-        event_dir = frames_root / f"auto_event_{event_idx:03d}"
-        if event_dir.exists():
-            log.error("Auto-capture event directory already exists: %s", event_dir)
-            return 0, ""
-        staging_dir = Path(tempfile.mkdtemp(
-            prefix=f".auto_event_{event_idx:03d}.",
-            suffix=".pending",
-            dir=str(frames_root),
-        ))
-
-        def _discard_staging() -> None:
-            try:
-                for child in staging_dir.iterdir():
-                    if child.is_file():
-                        child.unlink(missing_ok=True)
-                staging_dir.rmdir()
-            except OSError as exc:
-                log.error(
-                    "Could not clean pending auto-capture transaction %s: %s",
-                    staging_dir,
-                    exc,
-                )
-
-        ts_tag = datetime.now().strftime("%H%M%S_%f")
-        saved_paths: list[Path] = []
-        manifest_rows: list[dict] = []
-        for pos, frame in enumerate(frames):
-            if check_frame_quality is not None:
-                qa = check_frame_quality(frame)
-                if not qa.passed:
-                    continue
-            # .bmp per Jul 9 2026 switch — training-data-format-match.
-            fname = f"buf_{pos:02d}_{ts_tag}.bmp"
-            path = staging_dir / fname
-            if not self._save_rgb_bmp(frame, path):
-                continue
-            saved_paths.append(path)
-            metadata = (
-                capture_metadata[pos]
-                if capture_metadata is not None
-                and pos < len(capture_metadata)
-                else {}
-            )
-            manifest_rows.append({
-                "frame_path": fname,
-                **self._capture_columns(metadata),
-                "captured_monotonic_ns": metadata.get(
-                    "captured_monotonic_ns", "",
-                ),
-                "camera_width": metadata.get("camera_width", frame.shape[1]),
-                "camera_height": metadata.get("camera_height", frame.shape[0]),
-                "session_id": metadata.get("session_id", ""),
-                "view_segment_id": metadata.get("view_segment_id", ""),
-                "visual_history_generation": metadata.get(
-                    "visual_history_generation", "",
-                ),
-                "gun_aligned": metadata.get("gun_aligned", ""),
-                "realignment_active": metadata.get(
-                    "realignment_active", "",
-                ),
-                "calibration_id": metadata.get("calibration_id", ""),
-                "basis_bundle_id": metadata.get("basis_bundle_id", ""),
-            })
-
-        if manifest_rows:
-            manifest_path = staging_dir / "capture_manifest.csv"
-            if not self._atomic_write_csv(
-                manifest_path,
-                self.AUTO_CAPTURE_MANIFEST_FIELDS,
-                manifest_rows,
-            ):
-                _discard_staging()
-                return 0, ""
-
-            try:
-                os.replace(staging_dir, event_dir)
-            except OSError as exc:
-                log.error(
-                    "Could not commit auto-capture transaction %s: %s",
-                    staging_dir,
-                    exc,
-                )
-                _discard_staging()
-                return 0, ""
-        else:
-            _discard_staging()
-            return 0, ""
-
-        rel_dir = str(event_dir.relative_to(self._session_dir))
-        return len(saved_paths), rel_dir
+        """Fail closed for callers of the removed two-step buffer API."""
+        log.error(
+            "save_auto_capture_buffer is disabled; use the transactional "
+            "record_auto_capture_event API"
+        )
+        return 0, ""
 
     def save_frame(
         self, frame: np.ndarray, timestamp: str = "",

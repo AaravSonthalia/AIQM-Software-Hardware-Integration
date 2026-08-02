@@ -28,9 +28,7 @@ from gui.equalizer_alignment import (
     calibration_is_stale,
 )
 from gui.growth_logger import (
-    EVENT_STATE_AUTO_SKIPPED,
     EVENT_STATE_DISCARDED,
-    EVENT_STATE_PENDING,
     RHEED_VIEW_EVENT_ALIGNMENT_CONFIRMED,
     RHEED_VIEW_EVENT_HISTORY_RESET,
     RHEED_VIEW_EVENT_HISTORY_READY,
@@ -335,7 +333,72 @@ class GrowthApp(QMainWindow):
             )
         )
 
+        # Local alignment commissioning does not need an armed instrument
+        # session.  Feed one immutable repository-backed dummy frame while
+        # idle so Calibrate is immediately available for a desktop demo.
+        self._local_demo_sequence = 0
+        self.monitor.config_camera_mode.currentTextChanged.connect(
+            self._load_local_alignment_demo,
+        )
+        self._load_local_alignment_demo(
+            self.monitor.config_camera_mode.currentText(),
+        )
+
     # --- ARM / DISARM ------------------------------------------------------
+
+    @pyqtSlot(str)
+    def _load_local_alignment_demo(self, mode: str) -> None:
+        """Load an idle dummy frame without starting hardware workers."""
+        if self.camera_worker is not None and self.camera_worker.isRunning():
+            return
+        if not (mode == "dummy" or mode.startswith("dummy_")):
+            self.monitor.update_camera_state(CameraState(
+                mode=mode,
+                capture_backend=mode,
+                connected=False,
+            ))
+            return
+
+        from datetime import datetime, timezone
+        from drivers.rheed_camera import DummyCamera
+
+        camera = DummyCamera(preset=mode)
+        try:
+            camera.connect()
+            frame = camera.read_frame()
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            self._on_camera_state(CameraState(
+                mode=mode,
+                capture_backend=mode,
+                connected=False,
+                error=f"Local alignment demo unavailable: {exc}",
+            ))
+            return
+        finally:
+            camera.disconnect()
+
+        self._local_demo_sequence += 1
+        captured_monotonic_ns = time.monotonic_ns()
+        self._on_camera_state(CameraState(
+            frame=frame,
+            frame_number=self._local_demo_sequence,
+            width=int(frame.shape[1]),
+            height=int(frame.shape[0]),
+            intensity=float(np.mean(frame)),
+            connected=True,
+            mode=mode,
+            capture_backend=mode,
+            captured_at_utc=(
+                datetime.now(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            ),
+            capture_sequence=self._local_demo_sequence,
+            frame_age_ms=0.0,
+            source_hwnd=0,
+            captured_monotonic_ns=captured_monotonic_ns,
+            capture_geometry_id=f"{mode}:full-frame",
+        ))
 
     @pyqtSlot()
     def _on_arm(self):
@@ -608,7 +671,10 @@ class GrowthApp(QMainWindow):
         # Point the events tab at this session's logger so backfill
         # (handles GUI-restart-mid-session), the live append-on-signal,
         # and labeling reads/writes all flow through the same source.
-        self.monitor.events_tab.attach_session(self.growth_log)
+        self.monitor.events_tab.attach_session(
+            self.growth_log,
+            labeler=self.monitor.grower_input.text().strip(),
+        )
         # Point the scrubber tab at the session dir so its ↻ Reload
         # button can build the frame index against the correct session.
         # Reads three CSVs (heartbeat / manual / auto-capture); missing
@@ -875,6 +941,14 @@ class GrowthApp(QMainWindow):
         if calibration is None:
             return True
         reason = reason.strip() or "calibration invalidated"
+        local_demo = str(calibration.capture_backend or "").startswith("dummy")
+        if local_demo:
+            self._equalizer_calibration = None
+            self.monitor.live_equalizer_tab.invalidate_calibration(
+                reason,
+                emit=False,
+            )
+            return True
         journaled = False
         try:
             journaled = bool(
@@ -911,23 +985,6 @@ class GrowthApp(QMainWindow):
             )
             return
         qc = self._rheed_qc_state
-        if (
-            not self.growth_log.active
-            or not qc.session_active
-            or qc.gun_aligned is not True
-            or qc.realignment_active
-        ):
-            self.monitor.live_equalizer_tab.invalidate_calibration(
-                "A running, gun-aligned session is required",
-                emit=False,
-            )
-            self.statusBar().showMessage(
-                "Confirm a stable RHEED view before accepting calibration.",
-                4000,
-            )
-            return
-
-        metadata = self.monitor.get_current_capture_metadata()
         evidence_snapshot = (
             self.monitor.live_equalizer_tab.get_calibration_snapshot()
         )
@@ -944,6 +1001,26 @@ class GrowthApp(QMainWindow):
                 5000,
             )
             return
+        local_demo = str(
+            evidence_snapshot.capture_backend or ""
+        ).startswith("dummy")
+        if not local_demo and (
+            not self.growth_log.active
+            or not qc.session_active
+            or qc.gun_aligned is not True
+            or qc.realignment_active
+        ):
+            self.monitor.live_equalizer_tab.invalidate_calibration(
+                "A running, gun-aligned session is required",
+                emit=False,
+            )
+            self.statusBar().showMessage(
+                "Confirm a stable RHEED view before accepting calibration.",
+                4000,
+            )
+            return
+
+        metadata = self.monitor.get_current_capture_metadata()
         basis_bundle = self.monitor.live_equalizer_tab.get_basis_bundle()
         basis_bundle_id = (
             basis_bundle.bundle_id
@@ -969,12 +1046,25 @@ class GrowthApp(QMainWindow):
             capture_geometry_id=str(
                 metadata.get("capture_geometry_id") or ""
             ),
-            view_segment_id=qc.view_segment_id,
-            visual_history_generation=qc.visual_history_generation,
-            session_id=self._equalizer_session_id(),
+            view_segment_id=(
+                pending.view_segment_id if local_demo else qc.view_segment_id
+            ),
+            visual_history_generation=(
+                pending.visual_history_generation
+                if local_demo else qc.visual_history_generation
+            ),
+            session_id=(
+                pending.session_id
+                if local_demo else self._equalizer_session_id()
+            ),
             basis_bundle_id=basis_bundle_id,
-            gun_aligned=qc.gun_aligned is True,
-            realignment_active=qc.realignment_active,
+            gun_aligned=(
+                pending.gun_aligned
+                if local_demo else qc.gun_aligned is True
+            ),
+            realignment_active=(
+                pending.realignment_active if local_demo else qc.realignment_active
+            ),
             session_active=True,
         )
         if stale:
@@ -1015,15 +1105,18 @@ class GrowthApp(QMainWindow):
                     emit=False,
                 )
                 return
-        try:
-            recorded = self.growth_log.record_calibration(
-                accepted,
-                evidence_snapshot=evidence_snapshot,
-                basis_bundle=basis_bundle,
-            )
-        except (TypeError, ValueError, OSError) as exc:
-            log.warning("Equalizer calibration journal rejected record: %s", exc)
-            recorded = False
+        if local_demo:
+            recorded = True
+        else:
+            try:
+                recorded = self.growth_log.record_calibration(
+                    accepted,
+                    evidence_snapshot=evidence_snapshot,
+                    basis_bundle=basis_bundle,
+                )
+            except (TypeError, ValueError, OSError) as exc:
+                log.warning("Equalizer calibration journal rejected record: %s", exc)
+                recorded = False
         if not recorded:
             self.monitor.live_equalizer_tab.invalidate_calibration(
                 "calibration journal write failed",
@@ -1035,13 +1128,16 @@ class GrowthApp(QMainWindow):
             )
             return
         if not self.monitor.live_equalizer_tab.set_accepted_calibration(accepted):
-            try:
-                invalidated = self.growth_log.record_calibration_invalidation(
-                    accepted,
-                    "GUI activation failed after journal write",
-                )
-            except (TypeError, ValueError, OSError):
-                invalidated = False
+            if local_demo:
+                invalidated = True
+            else:
+                try:
+                    invalidated = self.growth_log.record_calibration_invalidation(
+                        accepted,
+                        "GUI activation failed after journal write",
+                    )
+                except (TypeError, ValueError, OSError):
+                    invalidated = False
             if not invalidated:
                 log.critical(
                     "Accepted calibration %s could not be invalidated after "
@@ -1053,11 +1149,17 @@ class GrowthApp(QMainWindow):
             )
             return
         self._equalizer_calibration = accepted
-        self.statusBar().showMessage(
-            f"Equalizer calibrated ({accepted.parity}, "
-            f"max residual {accepted.max_residual_px:.2f} px)",
-            4000,
-        )
+        if local_demo:
+            self.statusBar().showMessage(
+                f"Local alignment demo active ({accepted.parity}, not saved)",
+                5000,
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Equalizer calibrated ({accepted.parity}, "
+                f"max residual {accepted.max_residual_px:.2f} px)",
+                4000,
+            )
 
     @pyqtSlot(str)
     def _on_equalizer_calibration_invalidation(self, reason: str) -> None:
@@ -1631,8 +1733,14 @@ class GrowthApp(QMainWindow):
     # --- LIVE EQUALIZER save (Jul 10 2026 workstream #4) -------------------
 
     @pyqtSlot(dict)
-    def _on_live_label_save(self, weights: dict):
+    def _on_live_label_save(self, payload: dict):
         """Write one label bound to the tab's immutable camera snapshot."""
+        weights = payload.get("final_weights") if isinstance(payload, dict) else None
+        if not isinstance(weights, dict):
+            self.statusBar().showMessage(
+                "Live label rejected: invalid Equalizer payload.", 4000,
+            )
+            return
         if not self.growth_log.active:
             self.statusBar().showMessage(
                 "Start a session before saving live labels.", 3000,
@@ -1722,6 +1830,8 @@ class GrowthApp(QMainWindow):
                 voltage_V=voltage_v,
                 current_A=current_a,
                 psu_source=psu_source,
+                equalizer_payload=payload,
+                labeler=self.monitor.grower_input.text().strip(),
             )
         except (TypeError, ValueError, OSError) as exc:
             log.warning("Live Equalizer label rejected: %s", exc)
@@ -2131,49 +2241,61 @@ class GrowthApp(QMainWindow):
             )
             return
 
-        self._auto_capture_event_count += 1
+        event_idx = self._auto_capture_event_count + 1
         pyro_temp = (
             self.monitor._latest_pyro.temperature
             if self.monitor._latest_pyro and self.monitor._latest_pyro.connected
             else None
         )
         context_captures = self.auto_capture_engine.get_recent_captures()
-        buffer_count, buffer_dir = self.growth_log.save_auto_capture_buffer(
-            event_idx=self._auto_capture_event_count,
-            frames=[frame for frame, _metadata in context_captures],
-            capture_metadata=[
-                metadata for _frame, metadata in context_captures
-            ],
+        trigger_metadata = (
+            context_captures[-1][1]
+            if context_captures
+            else self._current_auto_capture_metadata()
         )
+        elapsed_s = self.monitor.get_elapsed_seconds()
+        try:
+            classifier_snapshot = self._build_classifier_snapshot_payload(
+                event_idx=event_idx,
+                event_score=score,
+                elapsed_s=elapsed_s,
+                capture_metadata=trigger_metadata,
+            )
+            result = self.growth_log.record_auto_capture_event(
+                event_idx=event_idx,
+                score=score,
+                elapsed_s=elapsed_s,
+                pyro_temp=pyro_temp,
+                frames=[item[0] for item in context_captures],
+                frame_capture_metadata=[item[1] for item in context_captures],
+                event_capture_metadata=trigger_metadata,
+                classifier_snapshot=classifier_snapshot,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            log.error("Auto-capture transaction rejected event %d: %s", event_idx, exc)
+            result = None
+        if result is None or not result.committed:
+            self.statusBar().showMessage(
+                "Auto-capture event was not saved; transaction recovery is required.",
+                7000,
+            )
+            return
+        self._auto_capture_event_count = event_idx
+        buffer_count = result.buffer_count
+        buffer_dir = result.buffer_dir
+        if not result.writer_ready:
+            self.auto_capture_engine.enabled = False
+            self.monitor.set_auto_capture_status(
+                "Auto-capture: ERROR (event saved, CSV writer unavailable)"
+            )
         # Empty-buffer events have nothing to review — quality gate rejected
         # all 20 frames. Mark as auto_skipped at log time so the CSV row
         # gets a terminal state instead of sitting at pending forever.
-        initial_state = (
-            EVENT_STATE_AUTO_SKIPPED if buffer_count == 0
-            else EVENT_STATE_PENDING
-        )
-        self.growth_log.log_auto_capture_event(
-            event_idx=self._auto_capture_event_count,
-            score=score,
-            elapsed_s=self.monitor.get_elapsed_seconds(),
-            pyro_temp=pyro_temp,
-            buffer_count=buffer_count,
-            buffer_dir=buffer_dir,
-            event_state=initial_state,
-            capture_metadata=self.monitor.get_current_capture_metadata(),
-        )
         # Snapshot the latest classifier state into the event directory.
         # Gives Justin's team a per-event training pair — visual context
         # buffer + the model's opinion at trigger time — for every flagged
         # event, essentially free. Only writes when there's a buffer dir
         # (buffer_count > 0) AND a classifier state to snapshot.
-        if buffer_count > 0 and buffer_dir and self._latest_classifier is not None:
-            self._save_classifier_snapshot(
-                buffer_dir=buffer_dir,
-                event_idx=self._auto_capture_event_count,
-                event_score=score,
-            )
-
         # Surface the banner so the grower can discard if it looks spurious.
         # Default action (timeout) is to keep — the buffer is already on disk.
         if buffer_count > 0:
@@ -2182,11 +2304,22 @@ class GrowthApp(QMainWindow):
                 score=score,
                 buffer_dir=buffer_dir,
             )
+        if not result.writer_ready:
+            self.statusBar().showMessage(
+                "Auto-capture event saved, but further capture is disabled: "
+                "the event CSV could not be reopened.",
+                9000,
+            )
 
-    def _save_classifier_snapshot(
-        self, buffer_dir: str, event_idx: int, event_score: float,
-    ) -> None:
-        """Write ``classifier_state.json`` next to the event's frame buffer.
+    def _build_classifier_snapshot_payload(
+        self,
+        *,
+        event_idx: int,
+        event_score: float,
+        elapsed_s: float,
+        capture_metadata: dict,
+    ) -> Optional[dict]:
+        """Freeze classifier metadata before the auto-event WAL is written.
 
         Note: the snapshot reflects the *most recent* classifier emission,
         which may be up to ``ClassifierWorker.POLL_INTERVAL_S`` (~0.5 s)
@@ -2195,12 +2328,11 @@ class GrowthApp(QMainWindow):
         becomes limiting, the fix is to classify the flagged frame
         synchronously here instead of using the cached state.
         """
-        import json
         from datetime import datetime as _dt
 
         cs = self._latest_classifier
-        if cs is None:  # defensive — caller already checked, keep for lint
-            return
+        if cs is None:
+            return None
 
         smoothed = cs.smoothed_percent or {}
         argmax_class = (
@@ -2208,11 +2340,18 @@ class GrowthApp(QMainWindow):
             if smoothed and cs.has_confident_data
             else None
         )
-        snapshot = {
+        return {
             "timestamp_iso": _dt.now().isoformat(),
             "event_idx": event_idx,
             "event_score": float(event_score),
-            "elapsed_s": self.monitor.get_elapsed_seconds(),
+            "elapsed_s": float(elapsed_s),
+            "capture_backend": str(capture_metadata.get("capture_backend") or ""),
+            "captured_at_utc": str(capture_metadata.get("captured_at_utc") or ""),
+            "capture_sequence": int(capture_metadata.get("capture_sequence") or 0),
+            "source_hwnd": int(capture_metadata.get("source_hwnd") or 0),
+            "capture_geometry_id": str(
+                capture_metadata.get("capture_geometry_id") or ""
+            ),
             "predicted_class": argmax_class,
             "smoothed_percent": {k: int(v) for k, v in smoothed.items()},
             "normalized_percent": {
@@ -2239,13 +2378,6 @@ class GrowthApp(QMainWindow):
             "history_ready": bool(cs.history_ready),
             "prediction_actionable": bool(cs.prediction_actionable),
         }
-        out_path = Path(buffer_dir) / "classifier_state.json"
-        try:
-            out_path.write_text(json.dumps(snapshot, indent=2))
-        except Exception as e:
-            log.warning(
-                "Failed to write classifier snapshot to %s: %s", out_path, e,
-            )
 
     @pyqtSlot(int, str, str)
     def _on_auto_capture_decision(
@@ -2263,8 +2395,13 @@ class GrowthApp(QMainWindow):
         worth making should be recorded; a 10-second decision shouldn't
         be irreversible).
         """
-        self.growth_log.update_auto_capture_state(event_idx, state)
-        if state == EVENT_STATE_DISCARDED:
+        updated = self.growth_log.update_auto_capture_state(event_idx, state)
+        if not updated:
+            self.statusBar().showMessage(
+                f"Event #{event_idx} decision was not saved; inspect the event CSV.",
+                7000,
+            )
+        elif state == EVENT_STATE_DISCARDED:
             self.statusBar().showMessage(
                 f"Event #{event_idx} marked discarded (buffer preserved at {buffer_dir})",
                 3000,

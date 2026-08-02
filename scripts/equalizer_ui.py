@@ -176,6 +176,32 @@ def reconstruct(
     return np.clip(out, 0, 255)
 
 
+def auto_fit_details(
+    means: dict[str, np.ndarray], target: np.ndarray,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Return non-negative raw least-squares coefficients and normalization."""
+    labels_in_means = [label for label in ACTIVE_CLASS_LABELS if label in means]
+    if not labels_in_means:
+        raise ValueError("No active canonical basis images are available")
+    basis = np.stack(
+        [means[label].flatten() for label in labels_in_means], axis=1,
+    )
+    t = target.flatten()
+    coefficients, *_ = np.linalg.lstsq(basis, t, rcond=None)
+    coefficients = np.clip(coefficients, 0, None)
+    total = coefficients.sum()
+    if total <= 0:
+        normalized = np.full(
+            len(labels_in_means), 1.0 / len(labels_in_means),
+        )
+    else:
+        normalized = coefficients / total
+    return (
+        dict(zip(labels_in_means, coefficients)),
+        dict(zip(labels_in_means, normalized)),
+    )
+
+
 def auto_fit(
     means: dict[str, np.ndarray], target: np.ndarray,
 ) -> dict[str, float]:
@@ -185,21 +211,8 @@ def auto_fit(
     and normalizes so the weights sum to 1. Falls back to uniform if the
     fit collapses to all-zeros (e.g., black target image).
     """
-    labels_in_means = [label for label in ACTIVE_CLASS_LABELS if label in means]
-    if not labels_in_means:
-        raise ValueError("No active canonical basis images are available")
-    basis = np.stack(
-        [means[label].flatten() for label in labels_in_means], axis=1,
-    )
-    t = target.flatten()
-    w, *_ = np.linalg.lstsq(basis, t, rcond=None)
-    w = np.clip(w, 0, None)
-    s = w.sum()
-    if s <= 0:
-        w = np.full(len(labels_in_means), 1.0 / len(labels_in_means))
-    else:
-        w = w / s
-    return dict(zip(labels_in_means, w))
+    _raw, normalized = auto_fit_details(means, target)
+    return normalized
 
 
 def apply_green_palette(arr_u8: np.ndarray) -> np.ndarray:

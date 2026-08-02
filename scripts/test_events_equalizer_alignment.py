@@ -34,6 +34,7 @@ from gui.events_tab import (  # noqa: E402
     _EQUALIZER_MANIFEST_FIELDS,
 )
 from gui.growth_logger import GrowthLogger  # noqa: E402
+from gui.equalizer_label_contract import build_equalizer_payload  # noqa: E402
 
 
 class _Calibration:
@@ -161,7 +162,7 @@ class _FakeLogger:
         self.update_calls.append((event_idx, dict(kwargs)))
         row = {field: "" for field in GrowthLogger.EVENT_LABEL_FIELDS}
         row["event_idx"] = str(event_idx)
-        row["primary_reconstruction"] = kwargs["primary_reconstruction"]
+        row["equalizer_argmax"] = kwargs["equalizer_payload"]["argmax"]
         for key in ("recon_1x1", "recon_tw", "recon_c6x2", "recon_rt13"):
             row[key] = f"{kwargs[key]:.4f}"
         row["recon_HTR"] = ""
@@ -518,13 +519,18 @@ class EventsEqualizerAlignmentTests(unittest.TestCase):
         panel.calibration = calibration
         self.tab._equalizer_window._equalizer_active_calibration = calibration
 
-        panel.live_label_save_requested.emit({
-            "1x1": 0.1,
-            "Tw(2x1)": 0.2,
-            "c(6x2)": 0.6,
-            "RT13": 0.1,
-            "HTR": None,
-        })
+        weights = {
+            "1x1": 0.1, "Tw(2x1)": 0.2,
+            "c(6x2)": 0.6, "RT13": 0.1, "HTR": None,
+        }
+        panel.live_label_save_requested.emit(build_equalizer_payload(
+            raw_weights=None,
+            final_weights=weights,
+            fit_mode="manual",
+            normalization_applied=False,
+            residual_rms=3.0,
+            valid_coverage=0.9,
+        ))
 
         self.assertEqual(len(self.logger.update_calls), 1)
         event_idx, kwargs = self.logger.update_calls[0]
@@ -534,7 +540,9 @@ class EventsEqualizerAlignmentTests(unittest.TestCase):
         self.assertEqual(kwargs["frame_path"], str(self.frame_path))
         self.assertIsNone(kwargs["recon_HTR"])
         self.assertEqual(kwargs["recon_c6x2"], 0.6)
-        self.assertEqual(kwargs["primary_reconstruction"], "c(6x2)")
+        self.assertNotIn("primary_reconstruction", kwargs)
+        self.assertEqual(kwargs["equalizer_payload"]["argmax"], "c(6x2)")
+        self.assertEqual(self.tab._labels_cache[1]["primary_reconstruction"], "")
         self.assertEqual(self.tab._labels_cache[1]["recon_HTR"], "")
 
     def test_real_panel_record_reuse_and_save_round_trip(self) -> None:
@@ -608,13 +616,17 @@ class EventsEqualizerAlignmentTests(unittest.TestCase):
         self.assertIsInstance(panel, LiveEqualizerTab)
         self.assertIs(panel.get_calibration(), resolved[0])
 
-        panel.live_label_save_requested.emit({
-            "1x1": 0.7,
-            "Tw(2x1)": 0.1,
-            "c(6x2)": 0.1,
-            "RT13": 0.1,
-            "HTR": None,
-        })
+        panel.live_label_save_requested.emit(build_equalizer_payload(
+            raw_weights=None,
+            final_weights={
+                "1x1": 0.7, "Tw(2x1)": 0.1,
+                "c(6x2)": 0.1, "RT13": 0.1, "HTR": None,
+            },
+            fit_mode="manual",
+            normalization_applied=False,
+            residual_rms=2.0,
+            valid_coverage=1.0,
+        ))
 
         self.assertEqual(len(self.logger.update_calls), 1)
         _, kwargs = self.logger.update_calls[0]

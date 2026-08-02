@@ -34,6 +34,7 @@ except ModuleNotFoundError:
     sys.modules["pyqtgraph"] = types.ModuleType("pyqtgraph")
 
 from gui.growth_app import GrowthApp  # noqa: E402
+from gui.growth_logger import AutoCaptureCommitResult  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QMainWindow  # noqa: E402
 
 
@@ -133,6 +134,9 @@ class _Monitor:
         self.config_camera_mode = _Combo("screengrab")
         self.reconnect_states: list[tuple[bool, bool]] = []
         self.camera_states: list[object] = []
+        self._latest_pyro = None
+        self.auto_capture_statuses: list[str] = []
+        self.auto_capture_events: list[tuple[int, float, str]] = []
 
     def reset_displays(self) -> None:
         self.reset_called = True
@@ -147,6 +151,18 @@ class _Monitor:
 
     def update_camera_state(self, state) -> None:
         self.camera_states.append(state)
+
+    @staticmethod
+    def get_elapsed_seconds() -> float:
+        return 12.0
+
+    def set_auto_capture_status(self, status: str) -> None:
+        self.auto_capture_statuses.append(status)
+
+    def show_auto_capture_event(
+        self, *, event_idx: int, score: float, buffer_dir: str,
+    ) -> None:
+        self.auto_capture_events.append((event_idx, score, buffer_dir))
 
     @staticmethod
     def get_session_metadata() -> dict:
@@ -183,8 +199,15 @@ class _GrowthLog:
         self.saved_metadata = None
         self.ended = False
         self.plot_generated = False
-        self.auto_capture_buffer_writes = 0
-        self.auto_capture_event_writes = 0
+        self.auto_capture_transaction_writes = 0
+        self.auto_capture_result = AutoCaptureCommitResult(
+            buffer_count=1,
+            buffer_dir="frames/auto_event_001",
+            committed=True,
+            writer_ready=True,
+        )
+        self.auto_capture_decision_result = True
+        self.last_auto_capture_kwargs = None
 
     def save_session_metadata(self, metadata: dict) -> None:
         self.saved_metadata = metadata
@@ -196,12 +219,13 @@ class _GrowthLog:
     def generate_temperature_plot(self, _metadata: dict) -> None:
         self.plot_generated = True
 
-    def save_auto_capture_buffer(self, **_kwargs) -> tuple[int, str]:
-        self.auto_capture_buffer_writes += 1
-        return 1, "frames/auto_event_001"
+    def record_auto_capture_event(self, **kwargs) -> AutoCaptureCommitResult:
+        self.auto_capture_transaction_writes += 1
+        self.last_auto_capture_kwargs = kwargs
+        return self.auto_capture_result
 
-    def log_auto_capture_event(self, **_kwargs) -> None:
-        self.auto_capture_event_writes += 1
+    def update_auto_capture_state(self, _event_idx: int, _state: str) -> bool:
+        return self.auto_capture_decision_result
 
 
 class _CloseEvent:
@@ -241,6 +265,7 @@ class _AppHarness:
         self.stop_survivors: tuple[object, ...] = ()
         self.invalidations: list[str] = []
         self.auto_capture_state_at_worker_stop = None
+        self._latest_classifier = None
 
     def _stop_workers(self, *workers) -> tuple[object, ...]:
         self.stopped_workers = workers
@@ -264,6 +289,10 @@ class _AppHarness:
     @staticmethod
     def _current_auto_capture_metadata() -> dict:
         return {"capture_sequence": 1}
+
+    @staticmethod
+    def _build_classifier_snapshot_payload(**_kwargs):
+        return None
 
 
 class StopWorkersTests(unittest.TestCase):
@@ -464,8 +493,7 @@ class StopWorkersTests(unittest.TestCase):
         self.assertEqual(app.monitor.camera_states, [])
         self.assertEqual(app.rheed_intensity_window.camera_states, [])
         self.assertEqual(app._auto_capture_event_count, 0)
-        self.assertEqual(app.growth_log.auto_capture_buffer_writes, 0)
-        self.assertEqual(app.growth_log.auto_capture_event_writes, 0)
+        self.assertEqual(app.growth_log.auto_capture_transaction_writes, 0)
 
     def test_camera_and_capture_persistence_require_active_session(self):
         app = _AppHarness()
@@ -481,8 +509,42 @@ class StopWorkersTests(unittest.TestCase):
         GrowthApp._on_auto_capture_event(app, frame, 10.0)
 
         self.assertEqual(app.auto_capture_engine.evaluations, [])
-        self.assertEqual(app.growth_log.auto_capture_buffer_writes, 0)
-        self.assertEqual(app.growth_log.auto_capture_event_writes, 0)
+        self.assertEqual(app.growth_log.auto_capture_transaction_writes, 0)
+
+    def test_committed_event_with_failed_reopen_disables_auto_capture(self):
+        app = _AppHarness()
+        app.growth_log.active = True
+        app.growth_log.auto_capture_result = AutoCaptureCommitResult(
+            buffer_count=1,
+            buffer_dir="frames/auto_event_001",
+            committed=True,
+            writer_ready=False,
+        )
+
+        GrowthApp._on_auto_capture_event(
+            app,
+            np.zeros((4, 4, 3), dtype=np.uint8),
+            4.0,
+        )
+
+        self.assertEqual(app._auto_capture_event_count, 1)
+        self.assertFalse(app.auto_capture_engine.enabled)
+        self.assertIn("CSV writer unavailable", app.monitor.auto_capture_statuses[-1])
+        self.assertIn("further capture is disabled", app._status_bar.messages[-1])
+
+    def test_failed_auto_capture_decision_is_not_reported_as_saved(self):
+        app = _AppHarness()
+        app.growth_log.auto_capture_decision_result = False
+
+        GrowthApp._on_auto_capture_decision(
+            app,
+            1,
+            "frames/auto_event_001",
+            "discarded",
+        )
+
+        self.assertIn("decision was not saved", app._status_bar.messages[-1])
+        self.assertNotIn("marked discarded", app._status_bar.messages[-1])
 
     def test_close_hides_auxiliary_top_levels_before_main_exit(self):
         qt_app = QApplication.instance() or QApplication([])
