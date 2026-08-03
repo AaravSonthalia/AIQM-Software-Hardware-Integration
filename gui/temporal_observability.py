@@ -46,6 +46,11 @@ class TimingSnapshot:
     capture_completed_monotonic_ns: Optional[int] = None
     processing_duration_ms: Optional[float] = None
     sample_span_ms: Optional[float] = None
+    attempt_capture_completed_at_utc: Optional[str] = None
+    attempt_capture_completed_monotonic_ns: Optional[int] = None
+    attempt_completed_at_utc: Optional[str] = None
+    attempt_completed_monotonic_ns: Optional[int] = None
+    attempt_duration_ms: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -132,6 +137,21 @@ def snapshot_state(
             state, "processing_duration_ms", None,
         )),
         sample_span_ms=_finite_float(getattr(state, "sample_span_ms", None)),
+        attempt_capture_completed_at_utc=getattr(
+            state, "attempt_capture_completed_at_utc", None,
+        ),
+        attempt_capture_completed_monotonic_ns=_positive_int(getattr(
+            state, "attempt_capture_completed_monotonic_ns", None,
+        )),
+        attempt_completed_at_utc=getattr(
+            state, "attempt_completed_at_utc", None,
+        ),
+        attempt_completed_monotonic_ns=_positive_int(getattr(
+            state, "attempt_completed_monotonic_ns", None,
+        )),
+        attempt_duration_ms=_finite_float(getattr(
+            state, "attempt_duration_ms", None,
+        )),
     )
 
 

@@ -1504,7 +1504,7 @@ class EventsTab(QWidget):
         # Ch-MBE (Omicron chalcogenide MBE) — added 2026-07-21
         r"C:\Users\Omicron\AI_for_quantum",
         # AJ's Mac dev clone
-        "/Users/aj/test-claude/projects/ai-for-quantum",
+        "/Users/aj/ai-for-quantum",
     ]
 
     @staticmethod

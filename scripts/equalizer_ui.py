@@ -10,6 +10,7 @@ legacy window cannot save labels.
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -34,7 +35,6 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-
 CLASS_LABELS = [*ACTIVE_SIMULATOR_LABELS, "HTR"]
 ACTIVE_CLASS_LABELS = list(ACTIVE_SIMULATOR_LABELS)
 INACTIVE_CLASS_LABELS = [
@@ -45,7 +45,10 @@ IMAGE_EXTS = {".png", ".bmp", ".jpg", ".jpeg", ".tif", ".tiff"}
 # Legacy cache-builder inputs retained for scripts/build_equalizer_cache.py.
 # The runtime loader below intentionally does not consume this empirical cache.
 CLASSIFIER2_DATA_ROOT = Path(
-    "/Users/aj/test-claude/projects/ai-for-quantum/src/data"
+    os.environ.get(
+        "AIQM_CLASSIFIER_DATA",
+        "/Users/aj/Documents/Research/Data/RHEED image classifier training data",
+    )
 )
 CLASS_DIRS: dict[str, str] = {
     "1x1": "STO_ideal_1x1",

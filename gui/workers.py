@@ -2,6 +2,7 @@
 Background worker threads for instrument communication.
 """
 
+import logging
 import time
 from copy import deepcopy
 from dataclasses import replace
@@ -10,6 +11,8 @@ from typing import Optional
 
 import numpy as np
 from PyQt6.QtCore import QMutex, QThread, pyqtSignal
+
+log = logging.getLogger(__name__)
 
 
 def _utc_iso_now() -> str:
@@ -21,7 +24,7 @@ def _mark_sample_received(
     state,
     read_started_ns: int,
     source_at_utc: Optional[str] = None,
-) -> None:
+) -> int:
     """Attach provenance after one poll returns without raising.
 
     A failed read does not call this helper, so its state retains the previous
@@ -37,6 +40,7 @@ def _mark_sample_received(
     )
     state.received_monotonic_ns = received_ns
     state.valid = True
+    return received_ns
 
 
 def _emission_snapshot(state):
@@ -51,15 +55,53 @@ def _emission_snapshot(state):
 
 def _mark_read_failed(
     state, error: object, read_started_ns: Optional[int] = None,
-) -> None:
+) -> int:
     """Invalidate the current poll without advancing its success sequence."""
+    failed_ns = time.perf_counter_ns()
     state.valid = False
     state.error = str(error or "read returned no usable values")
     if read_started_ns is not None:
         state.acquire_started_monotonic_ns = int(read_started_ns)
         state.read_duration_ms = max(
             0.0,
-            (time.perf_counter_ns() - read_started_ns) / 1_000_000.0,
+            (failed_ns - read_started_ns) / 1_000_000.0,
+        )
+    return failed_ns
+
+
+def _mark_attempt_completed(
+    state,
+    *,
+    read_started_ns: int,
+    completed_ns: int,
+    capture_at_utc: Optional[str],
+    capture_monotonic_ns: Optional[int],
+    succeeded: bool,
+) -> None:
+    """Attach one poll attempt without cross-wiring sample provenance.
+
+    The regular capture/receive fields describe the latest successful sample.
+    The ``attempt_*`` fields advance for both successes and failures so OCR
+    screenshot and processing time remain observable when parsing fails.
+    """
+    state.attempt_capture_completed_at_utc = capture_at_utc
+    state.attempt_capture_completed_monotonic_ns = capture_monotonic_ns
+    state.attempt_completed_monotonic_ns = completed_ns
+    state.attempt_completed_at_utc = (
+        state.received_at_utc if succeeded else _utc_iso_now()
+    )
+    state.attempt_duration_ms = max(
+        0.0, (completed_ns - read_started_ns) / 1_000_000.0,
+    )
+    if not succeeded:
+        return
+    state.capture_completed_at_utc = capture_at_utc
+    state.capture_completed_monotonic_ns = capture_monotonic_ns
+    state.processing_duration_ms = None
+    if capture_monotonic_ns is not None:
+        state.processing_duration_ms = max(
+            0.0,
+            (completed_ns - capture_monotonic_ns) / 1_000_000.0,
         )
 
 
@@ -514,10 +556,16 @@ class PyrometerWorker(QThread):
         samples_per_poll: int = 5,
         port: str = "COM4",
         baudrate: int = 115200,
+        rts: Optional[bool] = None,
     ):
         super().__init__()
         self.mode = mode
         self.poll_interval = poll_interval
+        # RTS line state for the Modbus driver, from
+        # MBESystemConfig.pyrometer_rts. None means "no decision recorded
+        # for this chamber" and leaves the serial library alone; the
+        # driver logs a warning naming the field when it sees None.
+        self.rts = rts
         # Number of rapid sub-readings to average per poll cycle. 5 ≈ 0.5 s
         # at the Exactus default rate (~10 reads/s); for screengrab mode it
         # samples whatever jitter the GUI exposes between refreshes.
@@ -578,8 +626,22 @@ class PyrometerWorker(QThread):
                     read_error = e
                     break
             complete_batch = len(readings) == self.samples_per_poll
+            arr = None
             if complete_batch:
-                arr = np.asarray(readings, dtype=float)
+                try:
+                    arr = np.asarray(readings, dtype=float)
+                    if (
+                        arr.size != self.samples_per_poll
+                        or not np.isfinite(arr).all()
+                    ):
+                        raise ValueError(
+                            "pyrometer batch contains a non-finite reading"
+                        )
+                except (TypeError, ValueError) as exc:
+                    read_error = exc
+                    complete_batch = False
+            if complete_batch:
+                assert arr is not None
                 state.temperature = float(arr.mean())
                 state.temperature_std = float(arr.std(ddof=0)) if arr.size > 1 else 0.0
                 state.temperature_n = int(arr.size)
@@ -592,6 +654,17 @@ class PyrometerWorker(QThread):
                 )
             else:
                 _mark_read_failed(state, read_error, read_started_ns)
+                # Batch entirely failed. Reset the reading fields to their
+                # None sentinels so we don't leak the previous cycle's
+                # temperature into the next emission timestamp. `connected`
+                # stays True because the sensor object is still open — only
+                # the reading itself is stale. `state.error` was set in the
+                # except clause above.
+                state.temperature = None
+                state.temperature_std = None
+                state.temperature_n = 0
+                state.subread_monotonic_ns = ()
+                state.sample_span_ms = None
 
             # Emissivity is a slow-moving config value — single read is fine.
             if hasattr(self._sensor, "read_emissivity"):
@@ -619,7 +692,18 @@ class PyrometerWorker(QThread):
         """Factory method — import and instantiate pyrometer driver."""
         if self.mode == "modbus":
             from drivers.pyrometer import ModbusPyrometer
-            return ModbusPyrometer()
+            # Forward the worker's own inputs, exactly as the exactus
+            # branch below does. This factory used to call
+            # ModbusPyrometer() bare, discarding all three: on Jul 30 2026
+            # the O-MBE GUI logged "RTS not configured for this chamber"
+            # and its Modbus reads failed, seconds after the standalone
+            # scripts had read the probe on the same port. The chamber
+            # config was correct; the worker threw it away.
+            return ModbusPyrometer(
+                port=self.port,
+                baudrate=self.baudrate,
+                rts=self.rts,
+            )
         elif self.mode == "screengrab":
             from drivers.pyrometer import ScreenGrabPyrometer
             return ScreenGrabPyrometer()
@@ -645,10 +729,21 @@ class MistralWorker(QThread):
 
     state_updated = pyqtSignal(MistralState)
 
-    def __init__(self, mode: str = "screengrab", poll_interval: float = 1.0):
+    def __init__(
+        self,
+        mode: str = "screengrab",
+        poll_interval: float = 1.0,
+        chamber_config=None,
+    ):
         super().__init__()
         self.mode = mode
         self.poll_interval = poll_interval
+        # chamber_config: MBESystemConfig (from drivers.config). Required
+        # when mode="ads" — supplies per-chamber netid / ports / cell_count
+        # for MistralAdsClient. Explicit passing (not get_active_config()
+        # lookup) so worker instances stay coupled only to the config they
+        # were given, not to env vars.
+        self._chamber_config = chamber_config
         # True from __init__ to close the stop()-before-run race
         # (see PowerSupplyWorker for the full comment).
         self.running = True
@@ -666,7 +761,7 @@ class MistralWorker(QThread):
                     state.error = ""
                 except Exception as e:
                     state.connected = False
-                    state.error = str(e)
+                    _mark_read_failed(state, e)
                     self.state_updated.emit(_emission_snapshot(state))
                     time.sleep(self.poll_interval)
                     continue
@@ -679,34 +774,50 @@ class MistralWorker(QThread):
                 state.i_set = vals.get("i_set")
                 state.i_actual = vals.get("i_actual")
                 # ads_cells: full extended read() dict when mode="ads"
-                # (Ch-MBE Beckhoff TwinCAT ADS). Includes cell{1..7}_T,
-                # ion gauge pressure, turbo RPM, etc. None in other modes.
+                # (Beckhoff TwinCAT ADS, both chambers). Includes per-cell
+                # T / T_set / active_setpoint / V / I / prog_V / prog_A / power
+                # / state / shutter_* plus ion gauge, turbo, service_mode.
+                # None in other modes.
                 state.ads_cells = vals if self.mode == "ads" else None
-                state.capture_completed_at_utc = getattr(
-                    self._driver, "last_capture_at_utc", None,
-                )
-                state.capture_completed_monotonic_ns = getattr(
-                    self._driver, "last_capture_monotonic_ns", None,
-                )
                 state.connected = True
-                if any(vals.get(key) is not None for key in (
-                    "v_set", "v_actual", "i_set", "i_actual",
-                )):
-                    state.error = ""
-                    _mark_sample_received(state, read_started_ns)
-                    if state.capture_completed_monotonic_ns:
-                        state.processing_duration_ms = max(
-                            0.0,
-                            (state.received_monotonic_ns
-                             - state.capture_completed_monotonic_ns)
-                            / 1_000_000.0,
-                        )
+                succeeded = False
+                if self.mode == "ads":
+                    # ADS supplies a union of all cells and chamber telemetry.
+                    # A Cell1 alias outage must not discard valid Cells2-6 or
+                    # pressure data; per-field None still records partialness.
+                    has_usable_value = any(
+                        value is not None for value in vals.values()
+                    )
                 else:
-                    _mark_read_failed(
+                    has_usable_value = any(vals.get(key) is not None for key in (
+                        "v_set", "v_actual", "i_set", "i_actual",
+                    ))
+                if has_usable_value:
+                    state.error = ""
+                    completed_ns = _mark_sample_received(
+                        state, read_started_ns,
+                    )
+                    succeeded = True
+                else:
+                    completed_ns = _mark_read_failed(
                         state, "read returned no MISTRAL values", read_started_ns,
                     )
             except Exception as e:
-                _mark_read_failed(state, e, read_started_ns)
+                succeeded = False
+                completed_ns = _mark_read_failed(state, e, read_started_ns)
+
+            _mark_attempt_completed(
+                state,
+                read_started_ns=read_started_ns,
+                completed_ns=completed_ns,
+                capture_at_utc=getattr(
+                    self._driver, "last_capture_at_utc", None,
+                ),
+                capture_monotonic_ns=getattr(
+                    self._driver, "last_capture_monotonic_ns", None,
+                ),
+                succeeded=succeeded,
+            )
 
             self.state_updated.emit(_emission_snapshot(state))
             time.sleep(self.poll_interval)
@@ -740,16 +851,26 @@ class MistralWorker(QThread):
             from drivers.mistral_jsonrpc import MistralJsonRpcClient
             return MistralJsonRpcClient()
         elif self.mode == "ads":
-            # Beckhoff TwinCAT ADS direct-read — Ch-MBE only.
-            # Discovered Jul 22 2026: MistralGui on Ch-MBE is an ADS client
-            # to a Beckhoff PLC (not the Kestrel JSON-RPC backend that
-            # Bulbasaur uses). pyads reads Cell1-7 T/V/I via two ports
-            # (851 = main PLC, 852 = PID program). v_actual = Cell1_V
-            # (manipulator); i_actual = Cell1_I. v_set / i_set = None
-            # (ADS exposes temperature setpoints, not V/I setpoints).
-            # READ ONLY — write_by_name is never called.
+            # Beckhoff TwinCAT ADS direct-read — per-chamber config.
+            # Ch-MBE validated Jul 22 2026 (Task #191, netId 10.0.42.112.1.1,
+            # 7 cells). Bulbasaur/O-MBE validated Jul 27 2026 via direct pyads
+            # to netId 10.0.42.111.1.1 with 6 cells, bypassing Bulbasaur's
+            # Kestrel JSON-RPC gateway which exposes zero introspection.
+            # v_actual/v_set = Cell1_V / Cell1_prog_V (manipulator); similar
+            # for current. READ ONLY — write_by_name is never called.
             from drivers.mistral_ads import MistralAdsClient
-            return MistralAdsClient()
+            if self._chamber_config is None:
+                raise RuntimeError(
+                    "MistralWorker mode='ads' requires chamber_config "
+                    "(pass it via __init__ from GrowthApp)"
+                )
+            cfg = self._chamber_config
+            return MistralAdsClient(
+                netid=cfg.ads_netid,
+                port_main=cfg.ads_port_main,
+                port_pid=cfg.ads_port_pid,
+                cell_count=cfg.ads_cell_count,
+            )
         else:
             from drivers.mistral import DummyMistralGui
             return DummyMistralGui()
@@ -771,6 +892,9 @@ class EvapControlWorker(QThread):
         # (see PowerSupplyWorker for the full comment).
         self.running = True
         self._driver = None
+        # Last connect-failure message logged, so the per-poll retry loop
+        # reports each distinct cause once instead of every second.
+        self._last_logged_error: Optional[str] = None
 
     def run(self):
         state = EvapControlState(mode=self.mode)
@@ -784,7 +908,20 @@ class EvapControlWorker(QThread):
                     state.error = ""
                 except Exception as e:
                     state.connected = False
-                    state.error = str(e)
+                    _mark_read_failed(state, e)
+                    # Log the first occurrence of each distinct message.
+                    # This block previously recorded the reason in
+                    # state.error and nothing more; no consumer surfaces
+                    # that string, so a driver that never connected was
+                    # indistinguishable at the console from one quietly
+                    # reading nothing. Deduped because the retry loop
+                    # re-enters every poll_interval and would flood.
+                    if state.error != self._last_logged_error:
+                        self._last_logged_error = state.error
+                        log.warning(
+                            "EvapControlWorker (%s mode) not connected: %s",
+                            self.mode, state.error,
+                        )
                     self.state_updated.emit(_emission_snapshot(state))
                     time.sleep(self.poll_interval)
                     continue
@@ -808,35 +945,38 @@ class EvapControlWorker(QThread):
                 state.plasma_dc_bias_V = vals.get("plasma_dc_bias_V")
                 state.plasma_forward_W = vals.get("plasma_forward_W")
                 state.plasma_reflected_W = vals.get("plasma_reflected_W")
-                state.capture_completed_at_utc = getattr(
-                    self._driver, "last_capture_at_utc", None,
-                )
-                state.capture_completed_monotonic_ns = getattr(
-                    self._driver, "last_capture_monotonic_ns", None,
-                )
                 state.connected = True
+                succeeded = False
                 if any(value is not None for value in vals.values()):
                     state.error = ""
-                    _mark_sample_received(
+                    completed_ns = _mark_sample_received(
                         state,
                         read_started_ns,
                         source_at_utc=getattr(
                             self._driver, "last_source_at_utc", None,
                         ),
                     )
-                    if state.capture_completed_monotonic_ns:
-                        state.processing_duration_ms = max(
-                            0.0,
-                            (state.received_monotonic_ns
-                             - state.capture_completed_monotonic_ns)
-                            / 1_000_000.0,
-                        )
+                    succeeded = True
                 else:
-                    _mark_read_failed(
+                    completed_ns = _mark_read_failed(
                         state, "read returned no EvapControl values", read_started_ns,
                     )
             except Exception as e:
-                _mark_read_failed(state, e, read_started_ns)
+                succeeded = False
+                completed_ns = _mark_read_failed(state, e, read_started_ns)
+
+            _mark_attempt_completed(
+                state,
+                read_started_ns=read_started_ns,
+                completed_ns=completed_ns,
+                capture_at_utc=getattr(
+                    self._driver, "last_capture_at_utc", None,
+                ),
+                capture_monotonic_ns=getattr(
+                    self._driver, "last_capture_monotonic_ns", None,
+                ),
+                succeeded=succeeded,
+            )
 
             self.state_updated.emit(_emission_snapshot(state))
             time.sleep(self.poll_interval)

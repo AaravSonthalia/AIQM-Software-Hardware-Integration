@@ -127,11 +127,28 @@ class GrowthLogger:
         "cell_HTEC2_pv_C",
         "cell_Y_pv_C", "cell_Sr_pv_C", "cell_Eu_pv_C", "cell_Er_pv_C",
         "plasma_dc_bias_V", "plasma_forward_W", "plasma_reflected_W",
-        # ADS-mode cell temperatures (Ch-MBE, mode="ads"). Empty in O-MBE
-        # sessions (MistralState.ads_cells is None). Cell1–7 map to the
-        # Beckhoff PLC's PIDProgram.Cell{i}_pidTDK.ActualTemperature.
-        "cell1_T_C", "cell2_T_C", "cell3_T_C", "cell4_T_C",
-        "cell5_T_C", "cell6_T_C", "cell7_T_C",
+        # ADS union schema (7-cell superset — both chambers).
+        # Ch-MBE (mode="ads"): all 7 cells populate per cadence.
+        # Bulbasaur O-MBE (mode="ads"): cells 1-6 populate, cell7 blank
+        #   (per drivers/config.py ads_cell_count).
+        # Non-ADS modes: all cell columns blank (MistralState.ads_cells is None).
+        # Per-chamber ads_cell_count in drivers/config.py determines
+        # how many cells populate per session; unused cells stay blank.
+        # Column naming preserves the historical `cell{i}_T_C` — do NOT rename.
+        "cell1_T_C", "cell1_T_set_C", "cell1_active_setpoint_C",
+        "cell1_V", "cell1_I", "cell1_prog_V", "cell1_prog_A", "cell1_power_W",
+        "cell2_T_C", "cell2_T_set_C", "cell2_active_setpoint_C",
+        "cell2_V", "cell2_I", "cell2_prog_V", "cell2_prog_A", "cell2_power_W",
+        "cell3_T_C", "cell3_T_set_C", "cell3_active_setpoint_C",
+        "cell3_V", "cell3_I", "cell3_prog_V", "cell3_prog_A", "cell3_power_W",
+        "cell4_T_C", "cell4_T_set_C", "cell4_active_setpoint_C",
+        "cell4_V", "cell4_I", "cell4_prog_V", "cell4_prog_A", "cell4_power_W",
+        "cell5_T_C", "cell5_T_set_C", "cell5_active_setpoint_C",
+        "cell5_V", "cell5_I", "cell5_prog_V", "cell5_prog_A", "cell5_power_W",
+        "cell6_T_C", "cell6_T_set_C", "cell6_active_setpoint_C",
+        "cell6_V", "cell6_I", "cell6_prog_V", "cell6_prog_A", "cell6_power_W",
+        "cell7_T_C", "cell7_T_set_C", "cell7_active_setpoint_C",
+        "cell7_V", "cell7_I", "cell7_prog_V", "cell7_prog_A", "cell7_power_W",
         # Read-only timing provenance. Appended to preserve every legacy
         # column name and position for existing consumers.
         "pyrometer_source_at_utc", "pyrometer_received_at_utc",
@@ -2146,12 +2163,26 @@ class GrowthLogger:
             "plasma_dc_bias_V":   _f(plasma_dc_bias_V, 1),
             "plasma_forward_W":   _f(plasma_forward_W, 1),
             "plasma_reflected_W": _f(plasma_reflected_W, 1),
-            # ADS cell temps — populated from ads_cells dict when mode="ads"
+            # ADS union schema — 8 columns × 7 cells. Populated from
+            # ads_cells dict when MistralWorker mode="ads"; blank in other
+            # modes. Cells above the chamber's ads_cell_count (e.g. cell7
+            # on Bulbasaur) get None from ads_cells.get() → blank cells.
             **{
-                f"cell{i}_T_C": _f(
-                    ads_cells.get(f"cell{i}_T") if ads_cells else None, 1
+                col: _f(
+                    ads_cells.get(f"cell{i}_{src}") if ads_cells else None,
+                    precision,
                 )
                 for i in range(1, 8)
+                for col, src, precision in (
+                    (f"cell{i}_T_C",                "T",                1),
+                    (f"cell{i}_T_set_C",            "T_set",            1),
+                    (f"cell{i}_active_setpoint_C",  "active_setpoint",  1),
+                    (f"cell{i}_V",                  "V",                3),
+                    (f"cell{i}_I",                  "I",                3),
+                    (f"cell{i}_prog_V",             "prog_V",           2),
+                    (f"cell{i}_prog_A",             "prog_A",           3),
+                    (f"cell{i}_power_W",            "power",            3),
+                )
             },
             "pyrometer_source_at_utc": pyrometer_source_at_utc or "",
             "pyrometer_received_at_utc": pyrometer_received_at_utc or "",

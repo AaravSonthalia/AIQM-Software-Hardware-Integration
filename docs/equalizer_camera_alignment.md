@@ -84,18 +84,18 @@ Run with the workstation GUI environment:
 
 ```powershell
 $python = 'D:\Environment_Cache\conda_envs\ai4mbe-gui\python.exe'
-& $python -m unittest -q scripts.test_equalizer_alignment
-& $python -m unittest -q scripts.test_live_equalizer_tab
-& $python -m unittest -q scripts.test_equalizer_app_integration
-& $python -m unittest -q scripts.test_events_equalizer_alignment
-& $python -m unittest -q scripts.test_growth_logger
-& $python -m unittest -q scripts.test_classifier_worker
-& $python -m unittest -q scripts.test_rheed_qc_flow
-& $python -m unittest -q scripts.test_rheed_qc_export_integration
-& $python -m unittest -q scripts.test_worker_shutdown
-& $python -m unittest -q scripts.test_movie_export
-& $python scripts/test_screengrab_camera.py
-& $python scripts/test_window_capture.py
+& $python -m pytest -q tests/test_equalizer_alignment.py
+& $python -m pytest -q tests/test_live_equalizer_tab.py
+& $python -m pytest -q tests/test_equalizer_app_integration.py
+& $python -m pytest -q tests/test_events_equalizer_alignment.py
+& $python -m pytest -q tests/test_growth_logger.py
+& $python -m pytest -q tests/test_classifier_worker.py
+& $python -m pytest -q tests/test_rheed_qc_flow.py
+& $python -m pytest -q tests/test_rheed_qc_export_integration.py
+& $python -m pytest -q tests/test_worker_shutdown.py
+& $python -m pytest -q tests/test_movie_export.py
+& $python -m pytest -q tests/test_screengrab_camera.py
+& $python -m pytest -q tests/test_window_capture.py
 & $python scripts/simulate_alignment.py
 git diff --check
 ```

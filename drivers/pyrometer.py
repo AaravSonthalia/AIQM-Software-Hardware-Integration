@@ -86,7 +86,21 @@ class ModbusPyrometer(TemperatureSensor):
         parity: str = "N",
         stopbits: int = 1,
         bytesize: int = 8,
+        rts: Optional[bool] = None,
     ):
+        """``rts`` controls the RTS line — see ``connect``.
+
+        ``None`` (the default) makes no claim and leaves pyserial's own
+        behaviour untouched. ``False`` de-asserts RTS, which on
+        Bulbasaur's IFD-5 + Prolific PL2303GS path is what makes the probe
+        reachable at all: with RTS asserted the link loops back and every
+        request returns byte-for-byte without reaching the instrument.
+
+        The default is None rather than False so that constructing this
+        driver against an uncharacterised chamber cannot silently change
+        that chamber's serial behaviour. Callers should pass
+        ``MBESystemConfig.pyrometer_rts``.
+        """
         self._port = port
         self._baudrate = baudrate
         self._device_id = device_id
@@ -94,6 +108,7 @@ class ModbusPyrometer(TemperatureSensor):
         self._parity = parity
         self._stopbits = stopbits
         self._bytesize = bytesize
+        self._rts = rts
         self._client = None
         self._connected = False
         self._word_swap = False
@@ -119,6 +134,50 @@ class ModbusPyrometer(TemperatureSensor):
                 f"Could not open serial port {self._port}. "
                 "Close TemperaSure or any serial monitor."
             )
+
+        # Set RTS explicitly, immediately after the port is open and before
+        # any traffic. pyserial leaves RTS asserted by default; on
+        # Bulbasaur's IFD-5 + PL2303GS path that asserted line puts the
+        # link into loopback — every request comes back byte-for-byte and
+        # the probe is never reached. Measured Jul 30 2026 on COM4:
+        #
+        #   RTS=True  -> 01 03 13 00 00 01 80 8E   (our own request back)
+        #   RTS=False -> 01 03 02 09 03 FE 15      (version 9.3, CRC valid)
+        #
+        # DTR made no difference in either direction and is left alone.
+        # This is per-chamber configuration, not a universal truth: the
+        # value comes from MBESystemConfig.pyrometer_rts because Ch-MBE's
+        # cabling has not been characterised.
+        #
+        # rts=None means "no decision recorded for this chamber" and must
+        # leave the line exactly as pyserial set it. Touching it here
+        # would turn an unconfigured chamber into an untested behaviour
+        # change, which is the one thing this setting exists to avoid.
+        if self._rts is None:
+            log.warning(
+                "ModbusPyrometer: RTS not configured for this chamber "
+                "(pyrometer_rts=None); using the serial library default. "
+                "If reads return the request verbatim, the line is "
+                "looping back — set pyrometer_rts=False in "
+                "drivers/config.py for this chamber and re-verify.",
+            )
+        else:
+            sock = getattr(self._client, "socket", None)
+            if sock is None:
+                log.warning(
+                    "ModbusPyrometer: no underlying serial object on the "
+                    "pymodbus client; RTS could not be set to %s. If reads "
+                    "return the request verbatim, this is why.", self._rts,
+                )
+            else:
+                try:
+                    sock.rts = self._rts
+                    log.info("ModbusPyrometer: RTS set to %s", self._rts)
+                except Exception as exc:  # noqa: BLE001 — driver-dependent
+                    log.warning(
+                        "ModbusPyrometer: could not set RTS to %s (%s). A "
+                        "loopback response is likely.", self._rts, exc,
+                    )
 
         # Auto-detect word order
         self._detect_word_order()
@@ -322,11 +381,29 @@ class ModbusPyrometer(TemperatureSensor):
             and len(rr.registers) >= need
         )
 
+    # Diagnostic message for "empty register response" — surfaced when
+    # the probe is in Exactus streaming mode rather than Modbus RTU.
+    # Ported Jul 27 2026 from scripts/pyrometer_modbus_smoke.py after
+    # the Bulbasaur lab session; the smoke script's helpful message
+    # made the failure mode diagnosable, the driver's bare error did not.
+    _EMPTY_RESPONSE_HINT = (
+        " Probe is likely in Exactus Protocol mode rather than Modbus RTU. "
+        "Recovery: physical power-cycle the probe (~10s off, 10s boot), "
+        "or use ExactusSerialPyrometer instead."
+    )
+
     def _read_f32(self, addr: int, word_swap: bool = False) -> float:
         rr = self._read_holding(addr, 2)
         if not self._resp_ok(rr, 2):
+            regs = getattr(rr, "registers", None)
+            if not regs:
+                raise RuntimeError(
+                    f"Modbus read at 0x{addr:04X}: empty register response."
+                    + self._EMPTY_RESPONSE_HINT
+                )
             raise RuntimeError(
-                f"Modbus read error at 0x{addr:04X} (needs 2 regs)"
+                f"Modbus read at 0x{addr:04X}: response has {len(regs)} regs, "
+                "needs 2"
             )
         hi, lo = rr.registers[:2]
         if word_swap:
@@ -336,13 +413,31 @@ class ModbusPyrometer(TemperatureSensor):
     def _read_u16(self, addr: int) -> int:
         rr = self._read_holding(addr, 1)
         if not self._resp_ok(rr, 1):
-            raise RuntimeError(f"Modbus read error at 0x{addr:04X}")
+            regs = getattr(rr, "registers", None)
+            if not regs:
+                raise RuntimeError(
+                    f"Modbus read at 0x{addr:04X}: empty register response."
+                    + self._EMPTY_RESPONSE_HINT
+                )
+            raise RuntimeError(
+                f"Modbus read at 0x{addr:04X}: response has {len(regs)} regs, "
+                "needs 1"
+            )
         return rr.registers[0]
 
     def _read_ascii(self, addr: int, n_regs: int) -> str:
         rr = self._read_holding(addr, n_regs)
         if not self._resp_ok(rr, n_regs):
-            raise RuntimeError(f"Modbus read error at 0x{addr:04X}")
+            regs = getattr(rr, "registers", None)
+            if not regs:
+                raise RuntimeError(
+                    f"Modbus read at 0x{addr:04X}: empty register response."
+                    + self._EMPTY_RESPONSE_HINT
+                )
+            raise RuntimeError(
+                f"Modbus read at 0x{addr:04X}: response has {len(regs)} regs, "
+                f"needs {n_regs}"
+            )
         return _regs_to_ascii(rr.registers)
 
 

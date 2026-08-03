@@ -48,7 +48,10 @@ class PyrometerWindow(QMainWindow):
         self.setCentralWidget(central)
 
     def on_pyrometer_state(self, state: PyrometerState) -> None:
-        if not state.connected or not state.valid:
+        # `has_valid_reading` skips both disconnected states AND the
+        # connected-but-no-reading-yet window (post-connect / failed batch),
+        # so the trend curve never has a `None` inserted.
+        if not state.has_valid_reading:
             return
         now = time.monotonic()
         if self._t0 is None:

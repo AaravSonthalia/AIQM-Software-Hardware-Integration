@@ -70,6 +70,33 @@ class MBESystemConfig:
     pyrometer_port: str = "COM4"
     pyrometer_baudrate: int = 115200
     pyrometer_device_id: int = 1
+    # RTS line state applied immediately after the port opens.
+    #
+    #   None  — make no claim; leave whatever pyserial does by default.
+    #   True  — assert RTS.
+    #   False — de-assert RTS.
+    #
+    # This is a property of the CABLING AND ADAPTER, not of the probe, so
+    # it belongs per chamber rather than as a driver default. On Bulbasaur
+    # (O-MBE: IFD-5 in RS232 position + Prolific PL2303GS) an asserted RTS
+    # — pyserial's default — puts the link into loopback, returning every
+    # request byte-for-byte while the probe never sees it. Measured on
+    # COM4, Jul 30 2026:
+    #
+    #   RTS=True  -> 01 03 13 00 00 01 80 8E  (the request, echoed)
+    #   RTS=False -> 01 03 02 09 03 FE 15     (version 9.3, CRC valid)
+    #
+    # DTR had no effect on either outcome and is deliberately not
+    # configured here.
+    #
+    # The default is None rather than False ON PURPOSE. Setting False for
+    # a chamber whose cabling nobody has tested is a behaviour change on
+    # that system, not a configuration entry — and it would silently
+    # export an O-MBE finding to hardware it was never measured against.
+    # None preserves whatever that chamber did before, and connect()
+    # logs a hint naming this field when it sees None, so an unconfigured
+    # chamber diagnoses itself the first time someone looks at the log.
+    pyrometer_rts: Optional[bool] = None
 
     # Data storage paths
     single_images_folder: str = ""
@@ -79,6 +106,20 @@ class MBESystemConfig:
     camera_index: int = 0
     camera_fps: float = 1.0
 
+    # MISTRAL ADS backend config — per-chamber Beckhoff PLC endpoint.
+    # Empty ads_netid disables the "ads" MistralWorker mode for the chamber.
+    # ads_port_main / ads_port_pid follow the TwinCAT convention: 851 for
+    # PLC Task 1 (Main.*), 852 for PLC Task 2 (PIDProgram.*).
+    # ads_display_confirmed gates whether the existing _cell_displays
+    # widgets get populated from ADS Cell{i}_T. Set False when the
+    # cell_display uses material labels whose Cell{N} → material mapping
+    # is not yet confirmed — ADS data still flows to CSV in that case.
+    ads_netid: str = ""
+    ads_port_main: int = 851
+    ads_port_pid: int = 852
+    ads_cell_count: int = 7
+    ads_display_confirmed: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Pre-configured systems
@@ -87,7 +128,9 @@ class MBESystemConfig:
 OXIDE_MBE = MBESystemConfig(
     name="Oxide MBE",
     chamber_id="ombe",
-    mistral_mode_default="screengrab",
+    # ads mode validated Jul 27 2026 (direct pyads to PLC 10.0.42.111.1.1).
+    # screengrab still available as fallback via the sidebar dropdown.
+    mistral_mode_default="ads",
     evap_mode_default="elog",
     # evap_log_dir left empty — ElogReader auto-detects the Bulbasaur path
     cell_display=[
@@ -99,6 +142,11 @@ OXIDE_MBE = MBESystemConfig(
     ],
     temperasure_title="BASF TemperaSure 5.7.0.4 Advanced Mode",
     temperasure_exe=r"C:\Users\Lab10\Desktop\TemperaSure.exe",
+    # VERIFIED on hardware Jul 30 2026 — probe EXI4765 answered
+    # REG_VER 0x1300 with version 9.3, matching TemperaSure's reported
+    # FW 9.3.0.6, and REG_CH1_TEMP with 201.41 C against TemperaSure's
+    # 201.5. First direct read of this probe.
+    pyrometer_rts=False,
     single_images_folder=(
         r"C:\Users\Lab10\Desktop\Automated RHEED Image Acquisition"
         r"\Acquiring Images Via Python Script Tests\Single Images"
@@ -107,6 +155,14 @@ OXIDE_MBE = MBESystemConfig(
         r"C:\Users\Lab10\Desktop\Automated RHEED Image Acquisition"
         r"\Acquiring Images Via Python Script Tests\Stream Images"
     ),
+    # ADS: 6 cells on Bulbasaur (Cell7 raises symbol-not-found).
+    # ads_display_confirmed=False because cell_display uses material
+    # labels (Sr, Eu, Er, etc.) and the ADS Cell{N} → material mapping
+    # is still unconfirmed — ADS data flows to CSV only until Jiangang
+    # confirms the physical wiring.
+    ads_netid="10.0.42.111.1.1",
+    ads_cell_count=6,
+    ads_display_confirmed=False,
 )
 
 CHALCOGENIDE_MBE = MBESystemConfig(
@@ -132,8 +188,24 @@ CHALCOGENIDE_MBE = MBESystemConfig(
     ],
     temperasure_title="BASF TemperaSure 5.7.0.4",
     temperasure_exe=r"C:\Users\Omicron\Desktop\TemperaSure.exe",
+    # Deliberately left None: Ch-MBE's serial path has never been
+    # characterised, and this chamber has never had a validated direct
+    # pyrometer read. None keeps its prior behaviour (pyserial's default)
+    # rather than exporting an O-MBE measurement to untested hardware.
+    #
+    # If Ch-MBE reads come back as a verbatim copy of the request, that is
+    # the same loopback signature O-MBE had — set False here and verify
+    # against the probe before trusting it.
+    pyrometer_rts=None,
     single_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     stream_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
+    # ADS: 7 cells on Ch-MBE (Task #191 validated Jul 22 2026).
+    # ads_display_confirmed=True because cell_display uses numeric
+    # labels aligned with ADS Cell{N} (Cell1=Substrate, Cell2-7 by
+    # number). Existing widget-populate behavior preserved.
+    ads_netid="10.0.42.112.1.1",
+    ads_cell_count=7,
+    ads_display_confirmed=True,
 )
 
 # Available system configurations. "oxide" and "chalcogenide" are legacy

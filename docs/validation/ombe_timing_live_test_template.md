@@ -30,8 +30,8 @@ $python = 'D:\Environment_Cache\conda_envs\ai4mbe-gui\python.exe'
 ```
 
 This creates a deterministic four-source session, analyzes it, and runs the
-durability validator. `scripts\test_modbus_pyrometer.py` and
-`scripts\test_exactus_pyrometer.py` use fakes and are safe offline.
+durability validator. `tests\test_modbus_pyrometer.py` and
+`tests\test_exactus_pyrometer.py` use fakes and are safe offline.
 `scripts\test_pyrometer.py` opens a real serial port and is live-only.
 
 ## A. Per-interface baselines

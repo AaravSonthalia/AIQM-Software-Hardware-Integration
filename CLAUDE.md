@@ -20,6 +20,9 @@
 | `scripts/psu_diagnostic.py` | PSU connectivity check |
 | `scripts/owon_self_test.py` | OWON self-test |
 
+## Testing
+Unit tests live in `tests/` (run `pytest` from the repo root — `pytest.ini` limits collection to `tests/`, 696 tests, all mock-based and Mac-safe). `scripts/` keeps the **hardware probe scripts** whose names also start with `test_` (`test_ads_read.py`, `test_elog.py`, `test_ksa_comm.py`, `test_ksa_single.py`, `test_mistral_jsonrpc_discovery.py`, `test_pyrometer.py`, plus `heater_step_test.py`, `owon_self_test.py`) — these talk to real instruments and exit at import on machines without them; never collect them with pytest.
+
 ## Two GUI Applications
 
 This repo ships two distinct PyQt6 apps that share `gui/state.py`,
@@ -193,7 +196,7 @@ python gui.py
 
 ## MBE Hardware Control
 - **Scienta Omicron MISTRAL** controls all MBE hardware (pumps, valves, heaters, manipulators) via touch-screen panels. GUI-based, no serial API. Not needed for v2.
-- **Eurotherm Temperature Controller** (likely model 3508) — controls substrate heater. Speaks **Modbus TCP on port 502**. IP likely on instrument subnet (`10.0.42.x` or `10.120.40.170`). Python driver already exists at `/Users/aj/test-claude/projects/research-lab/src/control/temp_pid.py`. Key registers: PV temp (reg 1, /10), setpoint (reg 2), current SP (reg 5), output power rate (reg 36). Safety limits 20-930°C. **This is how we get V/I and heater temp into the Growth Monitor — over Ethernet, no port conflicts.**
+- **Eurotherm Temperature Controller** (likely model 3508) — controls substrate heater. Speaks **Modbus TCP on port 502**. IP likely on instrument subnet (`10.0.42.x` or `10.120.40.170`). Python driver lives in-repo at `drivers/temp_pid.py` (extracted from the retired research-lab repo). Key registers: PV temp (reg 1, /10), setpoint (reg 2), current SP (reg 5), output power rate (reg 36). Safety limits 20-930°C. **This is how we get V/I and heater temp into the Growth Monitor — over Ethernet, no port conflicts.**
 - **OWON PSU** is our controllable heater bypass for AI-Scientist mode (v4). Deprioritized per PI.
 - CPU inference benchmarked at **13ms/frame** — no GPU/cluster needed.
 - **Note:** Eurotherm is now owned by Watlow (acquisition completed Oct 2022). kSA 400's support for both "Eurotherm" and "Watlow" covers the same product line.

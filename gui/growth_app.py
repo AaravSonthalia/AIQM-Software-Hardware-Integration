@@ -160,7 +160,7 @@ _KNOWN_AI_REPO_ROOTS = [
     # Ch-MBE (Omicron chalcogenide MBE) — added 2026-07-21
     r"C:\Users\Omicron\AI_for_quantum",
     # AJ's Mac dev clone
-    "/Users/aj/test-claude/projects/ai-for-quantum",
+    "/Users/aj/ai-for-quantum",
 ]
 
 
@@ -582,13 +582,16 @@ class GrowthApp(QMainWindow):
                 poll_interval=0.5,
                 port=exactus_port,
                 baudrate=exactus_baud,
+                rts=self._chamber_config.pyrometer_rts,
             )
             self.pyrometer_worker.state_updated.connect(self._on_pyrometer_state)
             self.pyrometer_worker.start()
 
         if not self.mistral_worker or not self.mistral_worker.isRunning():
             self.mistral_worker = MistralWorker(
-                mode=mistral_mode, poll_interval=1.0,
+                mode=mistral_mode,
+                poll_interval=1.0,
+                chamber_config=self._chamber_config,
             )
             self.mistral_worker.state_updated.connect(self._on_mistral_state)
             self.mistral_worker.start()
@@ -1937,7 +1940,7 @@ class GrowthApp(QMainWindow):
 
         pyro_temp: Optional[float] = None
         pyro = self.monitor._latest_pyro
-        if pyro is not None and pyro.connected and pyro.valid:
+        if pyro is not None and pyro.has_valid_reading:
             pyro_temp = pyro.temperature
 
         write_started_ns = time.perf_counter_ns()
@@ -2092,7 +2095,11 @@ class GrowthApp(QMainWindow):
         if not self.growth_log.active:
             return
         pyro = self.monitor._latest_pyro
-        pyro_ok = pyro is not None and pyro.connected and pyro.valid
+        # `has_valid_reading` is stricter than `connected` — it also
+        # rejects the pre-first-read window and any failed batch after,
+        # so an empty pyrometer cell in sensor_log.csv genuinely means
+        # "no reading" instead of a spurious 0.0.
+        pyro_ok = pyro is not None and pyro.has_valid_reading
         pyro_temp = pyro.temperature if pyro_ok else None
         pyro_temp_std = pyro.temperature_std if pyro_ok else None
         pyro_temp_n = pyro.temperature_n if pyro_ok else None
@@ -2478,13 +2485,14 @@ class GrowthApp(QMainWindow):
                 },
             )
             return  # Quality gate rejected, or save failed
+        # Heartbeat frame capture MUST NOT depend on pyrometer health —
+        # if camera quality passed, we save the frame. Pyrometer just
+        # gets logged as blank when there's no valid reading (post-connect
+        # window or failed batch); previously this used `connected` alone
+        # and leaked 0.0 into the heartbeat log.
         pyro_temp = (
             self.monitor._latest_pyro.temperature
-            if (
-                self.monitor._latest_pyro
-                and self.monitor._latest_pyro.connected
-                and self.monitor._latest_pyro.valid
-            )
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.has_valid_reading
             else None
         )
         self.growth_log.log_heartbeat(
@@ -2545,13 +2553,11 @@ class GrowthApp(QMainWindow):
             return
 
         event_idx = self._auto_capture_event_count + 1
+        # Auto-capture is driven by RHEED, not pyrometer health. Preserve the
+        # event and leave its temperature blank when no fresh reading exists.
         pyro_temp = (
             self.monitor._latest_pyro.temperature
-            if (
-                self.monitor._latest_pyro
-                and self.monitor._latest_pyro.connected
-                and self.monitor._latest_pyro.valid
-            )
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.has_valid_reading
             else None
         )
         context_captures = self.auto_capture_engine.get_recent_captures()
@@ -2797,13 +2803,13 @@ class GrowthApp(QMainWindow):
         # an unchanged setpoint, so only fire when the change exceeds the
         # configured tolerance. Ignore None readings (transient OCR failures).
         elapsed = self.monitor.get_elapsed_seconds()
+        # Set-change events happen at arbitrary moments — including during
+        # the post-connect / failed-batch pyrometer window. `has_valid_reading`
+        # ensures we don't leak 0.0/stale readings into set_change_events.csv
+        # when the operator changes V-set or I-set at that moment.
         pyro_temp = (
             self.monitor._latest_pyro.temperature
-            if (
-                self.monitor._latest_pyro
-                and self.monitor._latest_pyro.connected
-                and self.monitor._latest_pyro.valid
-            )
+            if self.monitor._latest_pyro and self.monitor._latest_pyro.has_valid_reading
             else None
         )
 

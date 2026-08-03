@@ -133,6 +133,7 @@ class MovieExporter:
 
         total = len(paths)
         cancelled = False
+        written = 0
         try:
             for i, path in enumerate(paths, 1):
                 if cancel_cb is not None and cancel_cb():
@@ -146,6 +147,7 @@ class MovieExporter:
                     if frame.shape[:2] != (h, w):
                         frame = cv2.resize(frame, (w, h))
                     writer.write(frame)
+                    written += 1
                 # else: skip silently — the row's frame_path was valid
                 # but cv2 couldn't decode. Rare; not worth aborting.
                 if progress_cb is not None:
@@ -161,9 +163,11 @@ class MovieExporter:
             return ""
 
         # Sanity check the output: cv2 won't raise if it wrote 0 bytes.
-        # If the file exists but is trivially small, treat as failure.
+        # A fixed byte floor is codec-dependent (short clips of small
+        # frames legitimately encode under 1 KB), so fail only when no
+        # frame was actually written or the file is missing/empty.
         out = Path(output_path)
-        if not out.exists() or out.stat().st_size < 1024:
+        if written == 0 or not out.exists() or out.stat().st_size == 0:
             return ""
 
         return str(out)

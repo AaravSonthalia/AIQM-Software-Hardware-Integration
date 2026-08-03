@@ -2,6 +2,7 @@
 State dataclasses for the hardware control GUI.
 """
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -82,10 +83,18 @@ class PyrometerState:
     standard deviation (0.0 when n=1). Polybot-inspired: a per-poll
     mean/std gives downstream consumers a cheap statistical-consistency
     check without requiring a second pass over the sensor log.
+
+    ``None`` semantics: "no valid reading has been taken since connect
+    (or since the last error batch)." The worker emits ``connected=True``
+    with ``temperature=None`` right after ``connect()`` succeeds and
+    before the first poll, and again whenever a poll batch fails
+    entirely. Consumers MUST NOT persist ``0.0`` in place of ``None`` —
+    that leaks a spurious real-looking reading into sensor_log.csv and
+    downstream analyses. Use the ``has_valid_reading`` predicate below.
     """
-    temperature: float = 0.0
-    temperature_std: float = 0.0
-    temperature_n: int = 1
+    temperature: Optional[float] = None
+    temperature_std: Optional[float] = None
+    temperature_n: int = 0
     emissivity: Optional[float] = None  # 0.0-1.0, from TemperaSure or Modbus
     unit: str = "C"
     connected: bool = False
@@ -116,6 +125,25 @@ class PyrometerState:
         default_factory=tuple, repr=False, compare=False,
     )
 
+    @property
+    def has_valid_reading(self) -> bool:
+        """True iff a real finite numeric reading is available right now.
+
+        Consumers should gate CSV writes / label renders / thresholds on
+        this — NOT on ``connected`` alone, which is True for the interval
+        between ``connect()`` and the first successful read. ``math.isfinite``
+        rejects ``nan`` and ``inf`` — a driver with a dual-endian ambiguity
+        can produce non-finite floats, and treating them as valid would
+        leak ``nan`` into every downstream analysis that assumes float
+        arithmetic.
+        """
+        return (
+            self.connected
+            and self.valid
+            and self.temperature is not None
+            and math.isfinite(self.temperature)
+        )
+
 
 @dataclass
 class MistralState:
@@ -127,11 +155,15 @@ class MistralState:
     connected: bool = False
     error: str = ""
     mode: str = ""  # "screengrab", "jsonrpc", "ads", or "dummy"
-    # Populated by MistralWorker when mode="ads" (Beckhoff TwinCAT ADS,
-    # Ch-MBE only). Full read() output from MistralAdsClient — superset
-    # of the 4 standard keys. Keys include cell{1..7}_T/V/I/power/state/
-    # shutter_open/shutter_closed, ebvm_*, ion_gauge_*_P, pirani_*_P,
-    # turbo*_rpm, service_mode. None in all other modes.
+    # Populated by MistralWorker when mode="ads" (Beckhoff TwinCAT ADS).
+    # ADS is the primary MISTRAL path for both chambers as of Jul 27 2026:
+    # Ch-MBE via netId 10.0.42.112.1.1 (7 cells), Bulbasaur/O-MBE via
+    # netId 10.0.42.111.1.1 (6 cells). Full read() output from
+    # MistralAdsClient — superset of the 4 standard keys. Per-cell keys:
+    # cell{i}_{T, T_set, active_setpoint, V, I, prog_V, prog_A, power,
+    # state, shutter_open, shutter_closed}. System keys: ebvm_*,
+    # ion_gauge_*_P, pirani_*_P, turbo*_rpm, service_mode.
+    # None in all other modes (screengrab / jsonrpc / dummy).
     ads_cells: Optional[dict] = None
     # ``source_at_utc`` is reserved for a future hardware/source timestamp;
     # current MISTRAL modes expose only the Python receive timestamp.
@@ -157,6 +189,18 @@ class MistralState:
         default=None, repr=False, compare=False,
     )
     processing_duration_ms: Optional[float] = None
+    # Latest poll-attempt timing is separate from the latest successful
+    # sample above. On OCR parse failure the success sequence/timestamps stay
+    # unchanged while these fields still describe the failed screenshot/OCR.
+    attempt_capture_completed_at_utc: Optional[str] = None
+    attempt_capture_completed_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    attempt_completed_at_utc: Optional[str] = None
+    attempt_completed_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    attempt_duration_ms: Optional[float] = None
 
 
 @dataclass
@@ -216,6 +260,17 @@ class EvapControlState:
         default=None, repr=False, compare=False,
     )
     processing_duration_ms: Optional[float] = None
+    # Per-attempt OCR/Elog provenance; kept separate from the last successful
+    # sample so a failed poll cannot cross-wire two sample generations.
+    attempt_capture_completed_at_utc: Optional[str] = None
+    attempt_capture_completed_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    attempt_completed_at_utc: Optional[str] = None
+    attempt_completed_monotonic_ns: Optional[int] = field(
+        default=None, repr=False, compare=False,
+    )
+    attempt_duration_ms: Optional[float] = None
 
 
 @dataclass

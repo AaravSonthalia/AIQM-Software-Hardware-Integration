@@ -276,12 +276,25 @@ class ElogReader:
         if path is None:
             raise RuntimeError(
                 f"No live .elo file found in {self._log_dir}. Is EvapControl "
-                f"running? Today's expected file: "
-                f"log_<YYYY-MM-DD>_000000.elo"
+                f"running? Expected a file named log_<today>_<HHMMSS>.elo"
             )
         self._last_log_path = path
         self._connected = True
-        log.info("ElogReader connected: %s", path)
+        # WARNING, not INFO, for the mid-day-start case. The GUI never calls
+        # logging.basicConfig, so it runs on logging's lastResort handler —
+        # stderr at WARNING and above. INFO goes nowhere. An operator who
+        # has just been handed pressure readings deserves to see which
+        # session file they came from whenever it is not the ordinary
+        # midnight rotation, because that is exactly when "is this file
+        # live?" is a reasonable thing to wonder.
+        if path.name.endswith("_000000.elo"):
+            log.info("ElogReader connected: %s", path)
+        else:
+            log.warning(
+                "ElogReader connected to mid-day session file: %s "
+                "(EvapControl was started during the day rather than "
+                "rotating at midnight)", path.name,
+            )
 
     def read(self) -> dict[str, Optional[float]]:
         # All output keys start None; populated only if the variable
@@ -319,9 +332,14 @@ class ElogReader:
             self._schema_log_path = path
             missing = set(wanted) - set(self._schema_present)
             if missing:
-                log.info(
+                # WARNING, not INFO: every name in `missing` is a column
+                # that will be silently blank in sensor_log.csv for the
+                # whole session. At INFO this never reached the operator's
+                # console, so an empty Direct-read tab looked like a dead
+                # subsystem rather than a name mismatch we could fix.
+                log.warning(
                     "ElogReader: %d/%d wanted vars absent from elog schema "
-                    "(skipping): %s",
+                    "(these columns will be blank): %s",
                     len(missing), len(wanted), sorted(missing),
                 )
         self._last_log_path = path
