@@ -331,6 +331,11 @@ def summarize_trace(records: list[dict], parse_errors: int) -> dict:
     classifier_inference_ms: list[float] = []
     frame_write_ms: list[float] = []
     frame_age_ms: list[float] = []
+    save_operation_values: dict[str, dict[str, list[float]]] = {
+        "heartbeat": {"write_ms": [], "source_age_ms": []},
+        "manual_event": {"write_ms": [], "source_age_ms": []},
+        "equalizer": {"write_ms": [], "source_age_ms": []},
+    }
     csv_flush_ms: list[float] = []
     event_loop_ms: list[float] = []
     rss_bytes: list[float] = []
@@ -352,11 +357,22 @@ def summarize_trace(records: list[dict], parse_errors: int) -> dict:
                 classifier_capture_ms.append(value)
             if (value := _parse_float(details.get("inference_ms"))) is not None:
                 classifier_inference_ms.append(value)
-        elif event == "frame_saved":
+        elif event in {
+            "frame_saved", "manual_event_saved", "equalizer_label_saved",
+        }:
+            operation = {
+                "frame_saved": "heartbeat",
+                "manual_event_saved": "manual_event",
+                "equalizer_label_saved": "equalizer",
+            }[event]
             if (value := _parse_float(details.get("write_duration_ms"))) is not None:
-                frame_write_ms.append(value)
+                save_operation_values[operation]["write_ms"].append(value)
+                if operation == "heartbeat":
+                    frame_write_ms.append(value)
             if (value := _parse_float(details.get("source_age_at_save_ms"))) is not None:
-                frame_age_ms.append(value)
+                save_operation_values[operation]["source_age_ms"].append(value)
+                if operation == "heartbeat":
+                    frame_age_ms.append(value)
         elif event == "sensor_snapshot":
             if (value := _parse_float(details.get("csv_flush_duration_ms"))) is not None:
                 csv_flush_ms.append(value)
@@ -400,6 +416,14 @@ def summarize_trace(records: list[dict], parse_errors: int) -> dict:
         "classifier_inference_ms": _stats(classifier_inference_ms),
         "frame_write_ms": _stats(frame_write_ms),
         "frame_age_at_save_ms": _stats(frame_age_ms),
+        "save_operations": {
+            operation: {
+                "count": len(values["write_ms"]),
+                "write_ms": _stats(values["write_ms"]),
+                "source_age_at_save_ms": _stats(values["source_age_ms"]),
+            }
+            for operation, values in save_operation_values.items()
+        },
         "csv_flush_ms": _stats(csv_flush_ms),
         "event_loop_turn_ms": _stats(event_loop_ms),
         "rss_bytes": _stats(rss_bytes),
@@ -635,6 +659,20 @@ def render_markdown(summary: dict) -> str:
         f"the audit threshold `{_fmt(result['stale_audit_threshold_ms'])} ms`."
         for name, result in summary["instruments"].items()
     ]
+    save_lines = [
+        f"- {name}: count `{values['count']}`, write p50/p95/p99 "
+        f"`{_fmt(values['write_ms']['p50'])} / "
+        f"{_fmt(values['write_ms']['p95'])} / "
+        f"{_fmt(values['write_ms']['p99'])} ms`, source age p50/p95/p99 "
+        f"`{_fmt(values['source_age_at_save_ms']['p50'])} / "
+        f"{_fmt(values['source_age_at_save_ms']['p95'])} / "
+        f"{_fmt(values['source_age_at_save_ms']['p99'])} ms`"
+        for name, values in (
+            summary["temporal_trace"].get("save_operations") or {}
+        ).items()
+    ]
+    if not save_lines:
+        save_lines.append("- No per-operation save timing was recorded.")
     lines.extend([
         "",
         "### Stale-data audit",
@@ -666,6 +704,10 @@ def render_markdown(summary: dict) -> str:
         f"{_fmt(summary['temporal_trace']['event_loop_turn_ms']['p99'])}`",
         f"- Operator fault/recovery markers: "
         f"`{summary['operator_actions']['action_count']}`",
+        "",
+        "### RHEED save operations",
+        "",
+        *save_lines,
         "",
         "## Interpretation notes",
         "",

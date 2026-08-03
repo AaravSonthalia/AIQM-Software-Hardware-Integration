@@ -110,7 +110,12 @@ as a `unittest` import.
 - Verify automatic and manual landmark paths, both parity previews, all four
   overlay-basis choices, and the mandatory evidence confirmation gate.
 - Commission handedness with a naturally occurring asymmetric
-  Tw/c(6x2)/RT13 or streak/tail frame; record the evidence SHA-256.
+  Tw/c(6x2)/RT13 or streak/tail frame; record the evidence SHA-256. Historical
+  Vimba/BGW files do not establish the current kSA/WGC orientation. Capture a
+  new WGC frame and direct Vimba uint16 frame sequentially on a stable surface,
+  record their time separation and kSA display transform, and do not describe
+  the pair as simultaneous. The direct-camera probe must pass strict
+  trigger-to-callback-to-save accounting before its frame is accepted.
 - Exercise WGC under occlusion, movement, foreground/background changes,
   resize/DPI changes, minimize, close, and explicit reconnect.
 - Confirm failure clears the frame, invalidates calibration, and prevents new

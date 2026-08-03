@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -138,6 +139,13 @@ class TimingMathTests(unittest.TestCase):
 
 
 class OcrCaptureTimingTests(unittest.TestCase):
+    def test_audited_bulbasaur_window_titles_match_driver_substrings(self):
+        self.assertIn(MistralGui()._substring, "MistralGui")
+        self.assertIn(
+            EvapControl()._substring,
+            "Evaporation control (Logged in: master)",
+        )
+
     def test_mistral_capture_time_is_before_ocr_completion(self):
         driver = MistralGui()
         driver._connected = True
@@ -166,8 +174,64 @@ class OcrCaptureTimingTests(unittest.TestCase):
         self.assertIsNone(values["chamber_pressure_mbar"])
         self.assertEqual(driver.last_capture_monotonic_ns, 456)
 
+    def test_failed_window_capture_clears_previous_ocr_capture_time(self):
+        for module, driver, shape in (
+            ("drivers.mistral", MistralGui(), (1039, 1793, 3)),
+            ("drivers.evap_control", EvapControl(), (567, 1497, 3)),
+        ):
+            driver._connected = True
+            driver._hwnd = 1
+            with (
+                patch(
+                    f"{module}.capture_window",
+                    return_value=np.zeros(shape, dtype=np.uint8),
+                ),
+                patch(f"{module}.ocr_crop", return_value=""),
+                patch(f"{module}.time.perf_counter_ns", return_value=100),
+            ):
+                driver.read()
+            self.assertEqual(driver.last_capture_monotonic_ns, 100)
+            with patch(f"{module}.capture_window", side_effect=OSError("closed")):
+                driver.read()
+            self.assertIsNone(driver.last_capture_monotonic_ns)
+            self.assertIsNone(driver.last_capture_at_utc)
+
 
 class TraceAndDurabilityTests(unittest.TestCase):
+    @staticmethod
+    def _write_frame_session(root: Path, *, trace_sequence: int = 7) -> Path:
+        session = root
+        frames = session / "frames"
+        frames.mkdir()
+        frame = frames / "manual_event_001_120000.bmp"
+        frame.write_bytes(b"durable-rheed-evidence")
+        (session / "sensor_log.csv").write_text(
+            "timestamp,rheed_valid\n", encoding="utf-8",
+        )
+        (session / "heartbeat_log.csv").write_text(
+            "frame_path,capture_sequence,capture_backend,source_hwnd,"
+            "captured_at_utc\n",
+            encoding="utf-8",
+        )
+        (session / "manual_events.csv").write_text(
+            "frame_path,capture_sequence,capture_backend,source_hwnd,"
+            "captured_at_utc\n"
+            f"frames/{frame.name},7,wgc,123,2026-08-03T12:00:00+00:00\n",
+            encoding="utf-8",
+        )
+        trace = {
+            "event": "frame_saved",
+            "source": "manual_event",
+            "details": {
+                "frame_path": str(frame),
+                "capture_sequence": trace_sequence,
+            },
+        }
+        (session / "temporal_trace.jsonl").write_text(
+            json.dumps(trace) + "\n", encoding="utf-8",
+        )
+        return frame
+
     def test_logger_writes_parseable_trace_and_sync_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
             logger = GrowthLogger(base_dir=tmp)
@@ -222,11 +286,33 @@ class TraceAndDurabilityTests(unittest.TestCase):
                 ("mistral", 4_000, 4_000, True, ""),
             )
         ]
+        records.extend([
+            {
+                "event": "manual_event_saved", "source": "manual_event",
+                "details": {
+                    "write_duration_ms": 12.5,
+                    "source_age_at_save_ms": 40.0,
+                },
+            },
+            {
+                "event": "equalizer_label_saved", "source": "equalizer",
+                "details": {
+                    "write_duration_ms": 20.0,
+                    "source_age_at_save_ms": 55.0,
+                },
+            },
+        ])
         trace = summarize_trace(records, 0)
         self.assertEqual(
             trace["nearest_neighbor_to_rheed"]["mistral"]
             ["absolute_delta_ms"]["p50"],
             0.0001,
+        )
+        self.assertEqual(trace["save_operations"]["manual_event"]["count"], 1)
+        self.assertEqual(
+            trace["save_operations"]["equalizer"]
+            ["source_age_at_save_ms"]["p50"],
+            55.0,
         )
         actions = [
             {"label": "close", "source": "mistral", "phase": "before",
@@ -255,6 +341,90 @@ class TraceAndDurabilityTests(unittest.TestCase):
             result = validate(session)
         self.assertFalse(result["passed"])
         self.assertTrue(any("temporal_trace" in error for error in result["errors"]))
+
+    def test_validator_accepts_nonheartbeat_frame_with_unique_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_frame_session(Path(tmp))
+            result = validate(Path(tmp))
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["stored_images"], 1)
+        self.assertEqual(result["traced_frames"], 1)
+
+    def test_validator_rejects_orphan_nonheartbeat_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp)
+            self._write_frame_session(session)
+            (session / "frames" / "entry_002_120001.bmp").write_bytes(b"orphan")
+            result = validate(session)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("orphan RHEED image" in error for error in result["errors"]))
+
+    def test_validator_rejects_trace_sequence_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp)
+            self._write_frame_session(session, trace_sequence=8)
+            result = validate(session)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("does not match CSV" in error for error in result["errors"]))
+
+    def test_validator_rejects_missing_referenced_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp)
+            frame = self._write_frame_session(session)
+            frame.unlink()
+            result = validate(session)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("missing frame_path" in error for error in result["errors"]))
+
+    def test_validator_accepts_hashed_equalizer_orientation_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp)
+            self._write_frame_session(session)
+            evidence = session / "frames" / "equalizer_orientation.png"
+            evidence.write_bytes(b"immutable-calibration-frame")
+            digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+            event = {
+                "event": "accepted",
+                "orientation_evidence_path": "frames/equalizer_orientation.png",
+                "calibration": {
+                    "capture_sequence": 9,
+                    "capture_backend": "wgc",
+                    "captured_at_utc": "2026-08-03T12:00:01+00:00",
+                    "source_hwnd": 123,
+                    "orientation_evidence_sha256": digest,
+                },
+            }
+            (session / "equalizer_calibrations.jsonl").write_text(
+                json.dumps(event) + "\n", encoding="utf-8",
+            )
+            result = validate(session)
+        self.assertTrue(result["passed"], result["errors"])
+        self.assertEqual(result["stored_images"], 2)
+
+    def test_validator_rejects_equalizer_evidence_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp)
+            self._write_frame_session(session)
+            evidence = session / "frames" / "equalizer_orientation.png"
+            evidence.write_bytes(b"immutable-calibration-frame")
+            event = {
+                "event": "accepted",
+                "orientation_evidence_path": "frames/equalizer_orientation.png",
+                "calibration": {
+                    "capture_sequence": 9,
+                    "capture_backend": "wgc",
+                    "captured_at_utc": "2026-08-03T12:00:01+00:00",
+                    "source_hwnd": 123,
+                    "orientation_evidence_sha256": "0" * 64,
+                },
+            }
+            (session / "equalizer_calibrations.jsonl").write_text(
+                json.dumps(event) + "\n", encoding="utf-8",
+            )
+            result = validate(session)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("SHA-256 mismatch" in error for error in result["errors"]))
 
 
 if __name__ == "__main__":
