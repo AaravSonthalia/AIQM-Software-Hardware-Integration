@@ -146,6 +146,12 @@ class EvapControlState:
     cell_Sr_pv_C: Optional[float] = None      # Strontium
     cell_Eu_pv_C: Optional[float] = None      # Europium
     cell_Er_pv_C: Optional[float] = None      # Erbium
+    # Elog-mode only: Ch-MBE sources, verified on Omicron 2026-08-05.
+    # Kept distinct from ADS Cell1..Cell7 until their physical mapping is
+    # independently confirmed.
+    cell_Fe_pv_C: Optional[float] = None
+    cell_Te_pv_C: Optional[float] = None
+    cell_Se_pv_C: Optional[float] = None
     # Elog-mode only: plasma source state (when in use)
     plasma_dc_bias_V: Optional[float] = None
     plasma_forward_W: Optional[float] = None

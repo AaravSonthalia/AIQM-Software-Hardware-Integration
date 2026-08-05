@@ -116,6 +116,15 @@ class WorkerModeRoutingTests(unittest.TestCase):
         driver = worker._create_driver()
         self.assertIsInstance(driver, ElogReader)
 
+    def test_elog_mode_passes_chamber_reader_configuration(self):
+        var_map = {"Ch.P": "chamber_pressure_mbar"}
+        worker = EvapControlWorker(
+            mode="elog", elog_log_dir=r"C:\elog", elog_var_map=var_map,
+        )
+        driver = worker._create_driver()
+        self.assertEqual(driver._log_dir, r"C:\elog")
+        self.assertEqual(driver._var_map, var_map)
+
     def test_dummy_mode_returns_dummy_evap_control(self):
         worker = EvapControlWorker(mode="dummy")
         driver = worker._create_driver()

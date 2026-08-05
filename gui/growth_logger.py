@@ -45,6 +45,7 @@ class GrowthLogger:
         "substrate_temp_pv_C", "substrate_temp_setpoint_C",
         "cell_HTEC2_pv_C",
         "cell_Y_pv_C", "cell_Sr_pv_C", "cell_Eu_pv_C", "cell_Er_pv_C",
+        "cell_Fe_pv_C", "cell_Te_pv_C", "cell_Se_pv_C",
         "plasma_dc_bias_V", "plasma_forward_W", "plasma_reflected_W",
         # ADS union schema (7-cell superset — both chambers).
         # Ch-MBE (mode="ads"): all 7 cells populate per cadence.
@@ -328,6 +329,7 @@ class GrowthLogger:
         cell_HTEC2_pv_C=None,
         cell_Y_pv_C=None, cell_Sr_pv_C=None,
         cell_Eu_pv_C=None, cell_Er_pv_C=None,
+        cell_Fe_pv_C=None, cell_Te_pv_C=None, cell_Se_pv_C=None,
         plasma_dc_bias_V=None, plasma_forward_W=None,
         plasma_reflected_W=None,
         # ADS-mode extensions (Jul 23 2026 — MistralWorker mode="ads").
@@ -374,6 +376,9 @@ class GrowthLogger:
             "cell_Sr_pv_C":    _f(cell_Sr_pv_C, 1),
             "cell_Eu_pv_C":    _f(cell_Eu_pv_C, 1),
             "cell_Er_pv_C":    _f(cell_Er_pv_C, 1),
+            "cell_Fe_pv_C":    _f(cell_Fe_pv_C, 1),
+            "cell_Te_pv_C":    _f(cell_Te_pv_C, 1),
+            "cell_Se_pv_C":    _f(cell_Se_pv_C, 1),
             "plasma_dc_bias_V":   _f(plasma_dc_bias_V, 1),
             "plasma_forward_W":   _f(plasma_forward_W, 1),
             "plasma_reflected_W": _f(plasma_reflected_W, 1),

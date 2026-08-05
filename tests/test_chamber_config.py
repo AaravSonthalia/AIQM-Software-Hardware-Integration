@@ -115,7 +115,19 @@ class TestChMbeConfig(unittest.TestCase):
         self.assertEqual(CHALCOGENIDE_MBE.mistral_mode_default, "ads")
 
     def test_evap_mode_default(self):
-        self.assertEqual(CHALCOGENIDE_MBE.evap_mode_default, "screengrab")
+        self.assertEqual(CHALCOGENIDE_MBE.evap_mode_default, "elog")
+
+    def test_elog_map_uses_verified_chmbe_names(self):
+        self.assertEqual(
+            CHALCOGENIDE_MBE.evap_elog_var_map,
+            {
+                "MBE.Pressure": "chamber_pressure_mbar",
+                "Manipulator.PV": "substrate_temp_pv_C",
+                "HTEZ_Fe.PV": "cell_Fe_pv_C",
+                "NTEZ1_Te.PV": "cell_Te_pv_C",
+                "NTEZ2_Se.PV": "cell_Se_pv_C",
+            },
+        )
 
     def test_seven_cells(self):
         self.assertEqual(len(CHALCOGENIDE_MBE.cell_display), 7)
@@ -143,6 +155,12 @@ class TestChMbeConfig(unittest.TestCase):
         # cell_display uses numeric labels (Cell1..Cell7) aligned with
         # ADS Cell{N}, so widget-populate-from-ADS is safe.
         self.assertTrue(CHALCOGENIDE_MBE.ads_display_confirmed)
+
+    def test_chmbe_pyrometer_config_verified(self):
+        self.assertEqual(CHALCOGENIDE_MBE.pyrometer_port, "COM3")
+        self.assertEqual(CHALCOGENIDE_MBE.pyrometer_baudrate, 115200)
+        self.assertEqual(CHALCOGENIDE_MBE.pyrometer_device_id, 1)
+        self.assertFalse(CHALCOGENIDE_MBE.pyrometer_rts)
 
 
 class TestSystems(unittest.TestCase):

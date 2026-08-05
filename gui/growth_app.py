@@ -353,6 +353,8 @@ class GrowthApp(QMainWindow):
         if not self.evap_worker or not self.evap_worker.isRunning():
             self.evap_worker = EvapControlWorker(
                 mode=evap_mode, poll_interval=1.0,
+                elog_log_dir=self._chamber_config.evap_log_dir,
+                elog_var_map=self._chamber_config.evap_elog_var_map,
             )
             self.evap_worker.state_updated.connect(self._on_evap_state)
             self.evap_worker.start()
@@ -795,6 +797,9 @@ class GrowthApp(QMainWindow):
             cell_Sr_pv_C=e.cell_Sr_pv_C if evap_ok else None,
             cell_Eu_pv_C=e.cell_Eu_pv_C if evap_ok else None,
             cell_Er_pv_C=e.cell_Er_pv_C if evap_ok else None,
+            cell_Fe_pv_C=e.cell_Fe_pv_C if evap_ok else None,
+            cell_Te_pv_C=e.cell_Te_pv_C if evap_ok else None,
+            cell_Se_pv_C=e.cell_Se_pv_C if evap_ok else None,
             plasma_dc_bias_V=e.plasma_dc_bias_V if evap_ok else None,
             plasma_forward_W=e.plasma_forward_W if evap_ok else None,
             plasma_reflected_W=e.plasma_reflected_W if evap_ok else None,

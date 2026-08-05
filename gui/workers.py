@@ -657,10 +657,18 @@ class EvapControlWorker(QThread):
 
     state_updated = pyqtSignal(EvapControlState)
 
-    def __init__(self, mode: str = "screengrab", poll_interval: float = 1.0):
+    def __init__(
+        self,
+        mode: str = "screengrab",
+        poll_interval: float = 1.0,
+        elog_log_dir: Optional[str] = None,
+        elog_var_map: Optional[dict[str, str]] = None,
+    ):
         super().__init__()
         self.mode = mode
         self.poll_interval = poll_interval
+        self.elog_log_dir = elog_log_dir
+        self.elog_var_map = elog_var_map
         # True from __init__ to close the stop()-before-run race
         # (see PowerSupplyWorker for the full comment).
         self.running = True
@@ -714,6 +722,9 @@ class EvapControlWorker(QThread):
                 state.cell_Sr_pv_C = vals.get("cell_Sr_pv_C")
                 state.cell_Eu_pv_C = vals.get("cell_Eu_pv_C")
                 state.cell_Er_pv_C = vals.get("cell_Er_pv_C")
+                state.cell_Fe_pv_C = vals.get("cell_Fe_pv_C")
+                state.cell_Te_pv_C = vals.get("cell_Te_pv_C")
+                state.cell_Se_pv_C = vals.get("cell_Se_pv_C")
                 state.plasma_dc_bias_V = vals.get("plasma_dc_bias_V")
                 state.plasma_forward_W = vals.get("plasma_forward_W")
                 state.plasma_reflected_W = vals.get("plasma_reflected_W")
@@ -737,7 +748,10 @@ class EvapControlWorker(QThread):
             return EvapControl()
         elif self.mode == "elog":
             from drivers.evap_control import ElogReader
-            return ElogReader()
+            return ElogReader(
+                log_dir=self.elog_log_dir or None,
+                var_map=self.elog_var_map or None,
+            )
         else:
             from drivers.evap_control import DummyEvapControl
             return DummyEvapControl()

@@ -804,6 +804,20 @@ class GrowthMonitor(QWidget):
             self._cell_displays.append(d)
         layout.addWidget(cells_group)
 
+        # Ch-MBE direct-log sources are separate from the generic ADS cell
+        # widgets above.  Keeping them separate prevents an unverified ADS
+        # CellN -> material assignment from being presented as fact.
+        self._elog_source_displays: list = []
+        if self._cfg.elog_source_display:
+            elog_sources_group = QGroupBox("EvapControl log sources")
+            elog_sources_layout = QHBoxLayout(elog_sources_group)
+            for source_def in self._cfg.elog_source_display:
+                d = ValueDisplay(source_def["label"], "°C", 1)
+                d.setStyleSheet(_field_style)
+                elog_sources_layout.addWidget(d)
+                self._elog_source_displays.append(d)
+            layout.addWidget(elog_sources_group)
+
         # --- Plasma section: hidden by default; revealed when any
         #     plasma field is populated. ElogReader treats NaN as
         #     "unavailable" (returns None), so all-None ⇒ plasma off.
@@ -980,14 +994,16 @@ class GrowthMonitor(QWidget):
         self.config_pyrometer_mode.addItems(["dummy", "exactus", "modbus", "screengrab"])
         config_form.addRow("Pyrometer mode:", self.config_pyrometer_mode)
 
-        self.config_exactus_port = QLineEdit("COM4")
+        self.config_exactus_port = QLineEdit(self._cfg.pyrometer_port)
         config_form.addRow("Exactus port:", self.config_exactus_port)
 
         self.config_exactus_baud = QComboBox()
         self.config_exactus_baud.addItems(
             ["9600", "19200", "38400", "57600", "115200"]
         )
-        self.config_exactus_baud.setCurrentText("115200")
+        self.config_exactus_baud.setCurrentText(
+            str(self._cfg.pyrometer_baudrate),
+        )
         config_form.addRow("Exactus baud:", self.config_exactus_baud)
 
         self.config_mistral_mode = QComboBox()
@@ -1357,6 +1373,17 @@ class GrowthMonitor(QWidget):
                 display.value.setText("---")
             else:
                 display.set_value(val)
+        for display, source_def in zip(
+            self._elog_source_displays, self._cfg.elog_source_display,
+        ):
+            value = (
+                getattr(state, source_def["state_field"], None)
+                if connected else None
+            )
+            if value is None:
+                display.value.setText("---")
+            else:
+                display.set_value(value)
         for display, value in (
             (self.substrate_pv_display,
              state.substrate_temp_pv_C if connected else None),

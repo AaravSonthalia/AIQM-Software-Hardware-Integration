@@ -39,9 +39,18 @@ class MBESystemConfig:
     mistral_mode_default: str = "screengrab"
     evap_mode_default: str = "elog"
 
-    # EvapControl log directory passed to ElogReader.
-    # Empty string = ElogReader uses its built-in multi-path auto-detect.
+    # EvapControl direct-read configuration.  ``evap_elog_var_map`` is an
+    # EvapControl variable name -> EvapControlState field-name map.  ``None``
+    # means use ElogReader's O-MBE default map; Ch-MBE supplies its own map.
+    # Empty ``evap_log_dir`` = ElogReader uses its built-in multi-path
+    # auto-detect.
     evap_log_dir: str = ""
+    evap_elog_var_map: Optional[dict[str, str]] = None
+
+    # Extra, chamber-specific direct-log source displays.  These are kept
+    # separate from ``cell_display`` because the latter also labels the ADS
+    # Cell1..Cell7 widgets; do not imply an unverified ADS-to-material map.
+    elog_source_display: list = field(default_factory=list)
 
     # Effusion cell display entries for the Direct-read tab.
     # Each dict:
@@ -169,11 +178,21 @@ CHALCOGENIDE_MBE = MBESystemConfig(
     name="Chalcogenide MBE",
     chamber_id="chmbe",
     mistral_mode_default="ads",
-    # elog mode is left as screengrab default because Ch-MBE's elog
-    # variable map differs from Bulbasaur's (different cell names).
-    # Switch to "elog" once the Ch-MBE var_map is confirmed.
-    evap_mode_default="screengrab",
+    # Verified on Omicron 2026-08-05 against the live .elo schema.
+    evap_mode_default="elog",
     evap_log_dir=r"C:\evap_control_1.2.0.48\log",
+    evap_elog_var_map={
+        "MBE.Pressure": "chamber_pressure_mbar",
+        "Manipulator.PV": "substrate_temp_pv_C",
+        "HTEZ_Fe.PV": "cell_Fe_pv_C",
+        "NTEZ1_Te.PV": "cell_Te_pv_C",
+        "NTEZ2_Se.PV": "cell_Se_pv_C",
+    },
+    elog_source_display=[
+        {"label": "Fe (HTEZ)", "state_field": "cell_Fe_pv_C"},
+        {"label": "Te (NTEZ1)", "state_field": "cell_Te_pv_C"},
+        {"label": "Se (NTEZ2)", "state_field": "cell_Se_pv_C"},
+    ],
     # Cell1 = manipulator (substrate heater — confirmed Jul 22 2026).
     # Cell2–7 physical mapping (Fe/Se/Te cracker) pending Jiangang
     # confirmation. state_field=None: these come from ADS, not elog.
@@ -188,15 +207,14 @@ CHALCOGENIDE_MBE = MBESystemConfig(
     ],
     temperasure_title="BASF TemperaSure 5.7.0.4",
     temperasure_exe=r"C:\Users\Omicron\Desktop\TemperaSure.exe",
-    # Deliberately left None: Ch-MBE's serial path has never been
-    # characterised, and this chamber has never had a validated direct
-    # pyrometer read. None keeps its prior behaviour (pyserial's default)
-    # rather than exporting an O-MBE measurement to untested hardware.
-    #
-    # If Ch-MBE reads come back as a verbatim copy of the request, that is
-    # the same loopback signature O-MBE had — set False here and verify
-    # against the probe before trusting it.
-    pyrometer_rts=None,
+    # VERIFIED on Omicron 2026-08-05 — Prolific PL2303GS on COM3, 115200
+    # baud, device ID 1.  With RTS=False the probe returned Modbus FC 0x03
+    # version 9.3 and channel-1 temperature 213.84 C; the documented
+    # (non-word-swapped) float order is correct.
+    pyrometer_port="COM3",
+    pyrometer_baudrate=115200,
+    pyrometer_device_id=1,
+    pyrometer_rts=False,
     single_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     stream_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     # ADS: 7 cells on Ch-MBE (Task #191 validated Jul 22 2026).
