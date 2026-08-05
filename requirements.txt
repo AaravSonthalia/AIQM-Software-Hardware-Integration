@@ -7,6 +7,7 @@ scipy
 Pillow
 pytest
 opencv-python
+timm==1.0.28
 pyvisa
 pytesseract
 pymodbus

@@ -61,7 +61,7 @@ def _default_save_path() -> str:
 
 from gui.state import (
     CameraState, ClassifierState, EvapControlState, MistralState,
-    PowerSupplyState, PyrometerState, RheedQcState,
+    PowerSupplyState, PyrometerState, RheedQcState, WeakPrimaryShadowState,
 )
 from gui.widgets import ValueDisplay
 from gui.growth_logger import (
@@ -598,6 +598,22 @@ class GrowthMonitor(QWidget):
         self._recon_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._live_classifier_widgets.append(self._recon_status_label)
         right.addWidget(self._recon_status_label)
+
+        self._weak_primary_shadow_label = QLabel(
+            "Weak primary λ=0.1 shadow: disabled"
+        )
+        self._weak_primary_shadow_label.setWordWrap(True)
+        self._weak_primary_shadow_label.setStyleSheet(
+            "font-size: 10px; color: #a78bfa; border: 1px solid #4c1d95; "
+            "padding: 4px;"
+        )
+        self._weak_primary_shadow_label.setToolTip(
+            "Diagnostic only: conditional probabilities among four visible "
+            "superstructures. No 1x1/none class, no independent presence "
+            "gate, and never used for advice or control."
+        )
+        self._live_classifier_widgets.append(self._weak_primary_shadow_label)
+        right.addWidget(self._weak_primary_shadow_label)
 
         # Note input
         note_label = QLabel("Log Entry")
@@ -1209,6 +1225,17 @@ class GrowthMonitor(QWidget):
         self.config_classifier_enabled.setChecked(True)
         config_form.addRow("Live classifier:", self.config_classifier_enabled)
 
+        self.config_weak_primary_shadow_enabled = QCheckBox()
+        self.config_weak_primary_shadow_enabled.setChecked(False)
+        self.config_weak_primary_shadow_enabled.setToolTip(
+            "Run the complete 36-checkpoint λ=0.1 weak-primary ensemble as "
+            "a non-actionable diagnostic. Requires the registered DINOv2 "
+            "artifact package; never replaces the live classifier."
+        )
+        config_form.addRow(
+            "Weak primary shadow:", self.config_weak_primary_shadow_enabled,
+        )
+
         # Snapshot of the tooltips each config widget carries in its
         # "unlocked" (idle) state. When the session transitions to armed
         # or running, _set_config_widgets_enabled overwrites the tooltip
@@ -1230,6 +1257,7 @@ class GrowthMonitor(QWidget):
                 self.config_mistral_mode,
                 self.config_evap_mode,
                 self.config_classifier_enabled,
+                self.config_weak_primary_shadow_enabled,
             )
         }
 
@@ -1812,6 +1840,42 @@ class GrowthMonitor(QWidget):
         # (early classifier bridge init races GUI construction).
         if hasattr(self, "live_equalizer_tab"):
             self.live_equalizer_tab.update_classifier_state(state)
+
+    def update_weak_primary_shadow_state(
+        self, state: WeakPrimaryShadowState,
+    ) -> None:
+        """Render λ=0.1 output without feeding the five-class UI."""
+        if self._blind_labeling_mode:
+            return
+        if state.loading:
+            text = "Weak primary λ=0.1 shadow: loading 36 checkpoints…"
+        elif state.error:
+            text = f"Weak primary λ=0.1 shadow unavailable: {state.error}"
+        elif state.last_frame_number < 0:
+            text = (
+                f"Weak primary λ=0.1 shadow ready ({state.checkpoint_count}/36); "
+                "waiting for frame"
+            )
+        else:
+            probability = state.conditional_probabilities
+            breakdown = " · ".join(
+                f"{name} {100.0 * float(probability.get(name, 0.0)):.1f}%"
+                for name in ("Twinned (2x1)", "c(6x2)", "rt13xrt13", "HTR")
+            )
+            text = (
+                "SHADOW ONLY · conditional four-class · " + breakdown
+                + f" · disagreement {state.checkpoint_disagreement:.3f}"
+                + f" · {state.inference_ms:.0f} ms"
+            )
+            if not self._classifier_output_exposure_recorded:
+                recorded = self.events_tab.record_classifier_output_visible()
+                self._classifier_output_exposure_recorded = bool(recorded)
+        self._weak_primary_shadow_label.setText(text)
+
+    def set_weak_primary_shadow_disabled(self) -> None:
+        self._weak_primary_shadow_label.setText(
+            "Weak primary λ=0.1 shadow: disabled"
+        )
 
     # Documented for the tooltip messages so they stay in sync with
     # ClassifierWorker.OOD_QUALITY_THRESHOLD; hard-coded because the
@@ -2679,6 +2743,9 @@ class GrowthMonitor(QWidget):
             "mistral_mode": mistral_mode,
             "evap_mode": self.config_evap_mode.currentText(),
             "pyrometer_mode": self.config_pyrometer_mode.currentText(),
+            "weak_primary_shadow_enabled": (
+                self.config_weak_primary_shadow_enabled.isChecked()
+            ),
         }
         # ADS profile provenance — record the exact PLC endpoint + cell
         # count that produced this session's sensor log. Makes old CSVs
@@ -2736,6 +2803,7 @@ class GrowthMonitor(QWidget):
             )
         self._recon_status_label.setText("Classifier idle")
         self._recon_status_label.setStyleSheet(self._RECON_STATUS_STYLE_INFO)
+        self.set_weak_primary_shadow_disabled()
         self._start_time = None
         self._current_frame = None
         self._latest_psu = None

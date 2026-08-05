@@ -372,6 +372,34 @@ class ClassifierState:
 
 
 @dataclass
+class WeakPrimaryShadowState:
+    """Read-only λ=0.1 diagnostic output; never a control/advice signal."""
+
+    loading: bool = True
+    ready: bool = False
+    error: str = ""
+    last_frame_number: int = -1
+    source_capture_sequence: int = 0
+    source_received_monotonic_ns: int = field(default=0, repr=False, compare=False)
+    inference_started_monotonic_ns: int = field(default=0, repr=False, compare=False)
+    inference_completed_monotonic_ns: int = field(default=0, repr=False, compare=False)
+    worker_emitted_monotonic_ns: int = field(default=0, repr=False, compare=False)
+    gui_received_monotonic_ns: int = field(default=0, repr=False, compare=False)
+    inference_ms: float = 0.0
+    conditional_probabilities: dict[str, float] = field(default_factory=dict)
+    predicted_class: str = ""
+    predicted_applicability: float = 0.0
+    normalized_entropy: float = 0.0
+    checkpoint_disagreement: float = 0.0
+    checkpoint_count: int = 0
+    ensemble_id: str = ""
+    lambda_pair: float = 0.1
+    execution_scope: str = "weak_shadow_only"
+    actionable: bool = False
+    abstain_reason: str = "weak_shadow_only_no_independent_presence_gate"
+
+
+@dataclass
 class RheedQcState:
     """Acquisition-side validity of the current RHEED view.
 

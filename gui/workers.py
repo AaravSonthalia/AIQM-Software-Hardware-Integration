@@ -123,7 +123,7 @@ def _frame_luminance(frame: np.ndarray) -> float:
 
 from gui.state import (
     CameraState, ClassifierState, EvapControlState, MistralState, PowerSupplyState,
-    PyrometerState, RheedQcState, TemperatureState,
+    PyrometerState, RheedQcState, TemperatureState, WeakPrimaryShadowState,
 )
 
 # ---------------------------------------------------------------------------
@@ -1495,3 +1495,141 @@ class ClassifierWorker(QThread):
             {lbl: int(round(100 * v)) for lbl, v in zip(RECON_LABELS, vals)},
             raw_sum,
         )
+
+
+class WeakPrimaryShadowWorker(QThread):
+    """Independent low-rate worker for the λ=0.1 36-cell shadow ensemble."""
+
+    state_updated = pyqtSignal(WeakPrimaryShadowState)
+    POLL_INTERVAL_S = 2.0
+    MAX_CONSECUTIVE_FAILS = 3
+
+    def __init__(self, ai_repo_root, artifact_root=None, device=None):
+        super().__init__()
+        self.ai_repo_root = ai_repo_root
+        self.artifact_root = artifact_root
+        self.device = device
+        self.running = True
+        self._frame_mutex = QMutex()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_frame_number = -1
+        self._latest_frame_key: Optional[tuple] = None
+        self._latest_capture_sequence = 0
+        self._latest_received_monotonic_ns = 0
+        self._last_frame_key: Optional[tuple] = None
+
+    def _emit(self, state: WeakPrimaryShadowState) -> None:
+        state.worker_emitted_monotonic_ns = time.perf_counter_ns()
+        self.state_updated.emit(deepcopy(state))
+
+    def on_rheed_state(self, camera_state: CameraState) -> None:
+        self._frame_mutex.lock()
+        try:
+            if (
+                camera_state.frame is None
+                or not camera_state.connected
+                or not camera_state.valid
+            ):
+                self._latest_frame = None
+                self._latest_frame_key = None
+                return
+            self._latest_frame = camera_state.frame
+            self._latest_frame_number = camera_state.frame_number
+            self._latest_capture_sequence = int(camera_state.capture_sequence or 0)
+            self._latest_received_monotonic_ns = int(
+                camera_state.captured_monotonic_ns or 0
+            )
+            self._latest_frame_key = (
+                int(camera_state.capture_sequence or 0),
+                int(camera_state.captured_monotonic_ns or 0),
+                int(camera_state.frame_number),
+            )
+        finally:
+            self._frame_mutex.unlock()
+
+    def _create_bridge(self):
+        from gui.weak_primary_shadow import WeakPrimaryShadowBridge
+        return WeakPrimaryShadowBridge(
+            self.ai_repo_root,
+            artifact_root=self.artifact_root,
+            device=self.device,
+        )
+
+    def run(self) -> None:
+        state = WeakPrimaryShadowState()
+        self._emit(state)
+        try:
+            bridge = self._create_bridge()
+        except Exception as error:
+            state.loading = False
+            state.ready = False
+            state.error = f"Weak-primary shadow unavailable: {error}"
+            self._emit(state)
+            return
+        state.loading = False
+        state.ready = True
+        state.error = ""
+        state.checkpoint_count = int(bridge.checkpoint_count)
+        state.ensemble_id = str(bridge.ensemble_id)
+        self._emit(state)
+        consecutive_failures = 0
+
+        while self.running:
+            self._frame_mutex.lock()
+            try:
+                frame = self._latest_frame
+                frame_number = self._latest_frame_number
+                frame_key = self._latest_frame_key
+                sequence = self._latest_capture_sequence
+                received_ns = self._latest_received_monotonic_ns
+            finally:
+                self._frame_mutex.unlock()
+            if frame is None or frame_key == self._last_frame_key:
+                time.sleep(self.POLL_INTERVAL_S)
+                continue
+            started_ns = time.perf_counter_ns()
+            try:
+                result = bridge.classify(frame)
+                completed_ns = time.perf_counter_ns()
+                consecutive_failures = 0
+            except Exception as error:
+                consecutive_failures += 1
+                if consecutive_failures >= self.MAX_CONSECUTIVE_FAILS:
+                    state.error = (
+                        f"Weak-primary shadow failed {consecutive_failures}x: {error}"
+                    )
+                    self._emit(state)
+                    consecutive_failures = 0
+                time.sleep(self.POLL_INTERVAL_S)
+                continue
+            self._frame_mutex.lock()
+            try:
+                still_current = (
+                    self._latest_frame is not None
+                    and self._latest_frame_key == frame_key
+                )
+            finally:
+                self._frame_mutex.unlock()
+            if not still_current:
+                time.sleep(self.POLL_INTERVAL_S)
+                continue
+            self._last_frame_key = frame_key
+            state.error = ""
+            state.last_frame_number = int(frame_number)
+            state.source_capture_sequence = int(sequence)
+            state.source_received_monotonic_ns = int(received_ns)
+            state.inference_started_monotonic_ns = started_ns
+            state.inference_completed_monotonic_ns = completed_ns
+            state.inference_ms = (completed_ns - started_ns) / 1_000_000.0
+            for name in (
+                "conditional_probabilities", "predicted_class",
+                "predicted_applicability", "normalized_entropy",
+                "checkpoint_disagreement", "checkpoint_count", "ensemble_id",
+                "lambda_pair", "execution_scope", "actionable", "abstain_reason",
+            ):
+                setattr(state, name, result[name])
+            self._emit(state)
+            time.sleep(self.POLL_INTERVAL_S)
+
+    def stop(self) -> None:
+        self.running = False

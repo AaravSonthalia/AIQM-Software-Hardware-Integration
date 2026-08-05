@@ -41,11 +41,11 @@ from gui.growth_logger import (
 )
 from gui.state import (
     CameraState, ClassifierState, EvapControlState, MistralState,
-    PyrometerState, RheedQcState,
+    PyrometerState, RheedQcState, WeakPrimaryShadowState,
 )
 from gui.workers import (
     ClassifierWorker, EvapControlWorker, MistralWorker,
-    PyrometerWorker, RheedCameraWorker,
+    PyrometerWorker, RheedCameraWorker, WeakPrimaryShadowWorker,
 )
 from gui.growth_monitor import GrowthMonitor
 from gui.growth_logger import GrowthLogger
@@ -200,6 +200,12 @@ class GrowthApp(QMainWindow):
         self.mistral_worker: Optional[MistralWorker] = None
         self.evap_worker: Optional[EvapControlWorker] = None
         self.classifier_worker: Optional[ClassifierWorker] = None
+        self.weak_primary_shadow_worker: Optional[
+            WeakPrimaryShadowWorker
+        ] = None
+        self._latest_weak_primary_shadow: Optional[
+            WeakPrimaryShadowState
+        ] = None
         # Latest classifier state, cached from _on_classifier_state so the
         # auto-capture event handler can snapshot it into each event
         # directory (saves the model's opinion at trigger time — feeds the
@@ -573,6 +579,49 @@ class GrowthApp(QMainWindow):
                 Qt.ConnectionType.DirectConnection,
             )
 
+        shadow_enabled = (
+            self.monitor.config_weak_primary_shadow_enabled.isChecked()
+        )
+        if shadow_enabled and (
+            not self.weak_primary_shadow_worker
+            or not self.weak_primary_shadow_worker.isRunning()
+        ):
+            self.weak_primary_shadow_worker = WeakPrimaryShadowWorker(
+                ai_repo_root=_resolve_ai_repo_root(),
+                artifact_root=(
+                    os.environ.get("AIQM_WEAK_PRIMARY_SHADOW_ROOT") or None
+                ),
+                device=(os.environ.get("AIQM_WEAK_PRIMARY_DEVICE") or None),
+            )
+            self.camera_worker.state_updated.connect(
+                self.weak_primary_shadow_worker.on_rheed_state,
+                Qt.ConnectionType.DirectConnection,
+            )
+            self.weak_primary_shadow_worker.state_updated.connect(
+                self._on_weak_primary_shadow_state,
+            )
+            self.weak_primary_shadow_worker.start()
+        elif not shadow_enabled:
+            if (
+                self.weak_primary_shadow_worker
+                and self.weak_primary_shadow_worker.isRunning()
+            ):
+                survivors = self._stop_worker(
+                    self.weak_primary_shadow_worker
+                )
+                if not survivors:
+                    self.weak_primary_shadow_worker = None
+            self._latest_weak_primary_shadow = None
+            self.monitor.set_weak_primary_shadow_disabled()
+        elif (
+            new_camera_worker
+            and self.weak_primary_shadow_worker.isRunning()
+        ):
+            self.camera_worker.state_updated.connect(
+                self.weak_primary_shadow_worker.on_rheed_state,
+                Qt.ConnectionType.DirectConnection,
+            )
+
         if not self.pyrometer_worker or not self.pyrometer_worker.isRunning():
             exactus_port = self.monitor.config_exactus_port.text().strip() or "COM4"
             exactus_baud = int(self.monitor.config_exactus_baud.currentText())
@@ -608,13 +657,16 @@ class GrowthApp(QMainWindow):
     @pyqtSlot()
     def _on_disarm(self):
         """Disconnect all hardware workers without serial wait stacking."""
-        worker_slots = (
+        worker_slots = [
             ("camera_worker", self.camera_worker),
             ("pyrometer_worker", self.pyrometer_worker),
             ("mistral_worker", self.mistral_worker),
             ("evap_worker", self.evap_worker),
             ("classifier_worker", self.classifier_worker),
-        )
+        ]
+        shadow_worker = getattr(self, "weak_primary_shadow_worker", None)
+        if shadow_worker is not None:
+            worker_slots.append(("weak_primary_shadow_worker", shadow_worker))
         survivors = self._stop_workers(
             *(worker for _name, worker in worker_slots),
         )
@@ -691,6 +743,14 @@ class GrowthApp(QMainWindow):
                 self.classifier_worker.on_rheed_state,
                 Qt.ConnectionType.DirectConnection,
             )
+        if (
+            self.weak_primary_shadow_worker
+            and self.weak_primary_shadow_worker.isRunning()
+        ):
+            self.camera_worker.state_updated.connect(
+                self.weak_primary_shadow_worker.on_rheed_state,
+                Qt.ConnectionType.DirectConnection,
+            )
         self.camera_worker.start()
         self.statusBar().showMessage(
             "Reconnecting detached kSA Live Video...", 5000,
@@ -751,6 +811,7 @@ class GrowthApp(QMainWindow):
             reset_visual_history=True,
         )
         self._latest_classifier = None
+        self._latest_weak_primary_shadow = None
         if self.classifier_worker and self.classifier_worker.isRunning():
             self.monitor.reset_classifier_session_state()
         elif self.monitor.config_classifier_enabled.isChecked():
@@ -892,6 +953,7 @@ class GrowthApp(QMainWindow):
             reset_visual_history=True,
         )
         self._latest_classifier = None
+        self._latest_weak_primary_shadow = None
         self.monitor.reset_classifier_session_state("Classifier session ended")
 
         # Auto-generate T vs t plot from sensor_log.csv (Frankie-style).
@@ -2139,6 +2201,60 @@ class GrowthApp(QMainWindow):
 
     # --- Worker state fan-out to monitor -----------------------------------
 
+    @pyqtSlot(WeakPrimaryShadowState)
+    def _on_weak_primary_shadow_state(
+        self, state: WeakPrimaryShadowState,
+    ) -> None:
+        """Display and trace the isolated λ=0.1 diagnostic result."""
+        if self._shutdown_pending:
+            return
+        state = _stamp_gui_received(state)
+        self._latest_weak_primary_shadow = state
+        self.monitor.update_weak_primary_shadow_state(state)
+        if self.growth_log.active:
+            GrowthApp._trace_temporal(
+                self,
+                "weak_primary_shadow_state",
+                "weak_primary_lambda_0.1",
+                details={
+                    "source_capture_sequence": state.source_capture_sequence,
+                    "source_received_monotonic_ns": (
+                        state.source_received_monotonic_ns
+                    ),
+                    "inference_started_monotonic_ns": (
+                        state.inference_started_monotonic_ns
+                    ),
+                    "inference_completed_monotonic_ns": (
+                        state.inference_completed_monotonic_ns
+                    ),
+                    "worker_emitted_monotonic_ns": (
+                        state.worker_emitted_monotonic_ns
+                    ),
+                    "gui_received_monotonic_ns": (
+                        state.gui_received_monotonic_ns
+                    ),
+                    "inference_ms": state.inference_ms,
+                    "conditional_probabilities": dict(
+                        state.conditional_probabilities
+                    ),
+                    "predicted_class": state.predicted_class,
+                    "predicted_applicability": (
+                        state.predicted_applicability
+                    ),
+                    "normalized_entropy": state.normalized_entropy,
+                    "checkpoint_disagreement": (
+                        state.checkpoint_disagreement
+                    ),
+                    "checkpoint_count": state.checkpoint_count,
+                    "ensemble_id": state.ensemble_id,
+                    "lambda_pair": state.lambda_pair,
+                    "execution_scope": state.execution_scope,
+                    "actionable": False,
+                    "abstain_reason": state.abstain_reason,
+                    "error": state.error,
+                },
+            )
+
     @pyqtSlot(ClassifierState)
     def _on_classifier_state(self, state: ClassifierState):
         """Forward classifier worker state to the monitor's slider slot.
@@ -2804,14 +2920,18 @@ class GrowthApp(QMainWindow):
         ):
             auxiliary_window.close()
 
-        survivors = self._stop_workers(
+        close_workers = [
             self.camera_worker,
             self.pyrometer_worker,
             self.mistral_worker,
             self.evap_worker,
             self.classifier_worker,
             self._movie_worker,
-        )
+        ]
+        shadow_worker = getattr(self, "weak_primary_shadow_worker", None)
+        if shadow_worker is not None:
+            close_workers.insert(-1, shadow_worker)
+        survivors = self._stop_workers(*close_workers)
         # Once shutdown has been requested, never resume a partially stopped
         # acquisition stack.  Stop all image/log timers and close the session
         # before either accepting the window close or showing an explicit
