@@ -185,6 +185,26 @@ def _resolve_ai_repo_root() -> str:
     return _KNOWN_AI_REPO_ROOTS[0]
 
 
+_BUNDLED_WEAK_PRIMARY_AI_ROOT = (
+    WORKSPACE_DIR / "models" / "weak_primary_lambda_0_1" / "RHEEDClassify"
+)
+
+
+def _resolve_weak_primary_ai_repo_root() -> str:
+    """Resolve the self-contained weak-primary runtime package.
+
+    An explicit ``AI_REPO_ROOT`` remains the operator override. Otherwise the
+    model package shipped with this branch takes precedence over unrelated
+    workstation checkouts, keeping code and weights on one audited commit.
+    """
+    env = os.environ.get("AI_REPO_ROOT")
+    if env:
+        return env
+    if _BUNDLED_WEAK_PRIMARY_AI_ROOT.is_dir():
+        return str(_BUNDLED_WEAK_PRIMARY_AI_ROOT)
+    return _resolve_ai_repo_root()
+
+
 class GrowthApp(QMainWindow):
     """Main window for the OMBE Growth Monitor application."""
 
@@ -587,7 +607,7 @@ class GrowthApp(QMainWindow):
             or not self.weak_primary_shadow_worker.isRunning()
         ):
             self.weak_primary_shadow_worker = WeakPrimaryShadowWorker(
-                ai_repo_root=_resolve_ai_repo_root(),
+                ai_repo_root=_resolve_weak_primary_ai_repo_root(),
                 artifact_root=(
                     os.environ.get("AIQM_WEAK_PRIMARY_SHADOW_ROOT") or None
                 ),

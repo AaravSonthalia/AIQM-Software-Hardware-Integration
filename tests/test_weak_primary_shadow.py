@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -16,9 +17,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gui.growth_monitor import GrowthMonitor
+from gui.growth_app import (
+    _BUNDLED_WEAK_PRIMARY_AI_ROOT,
+    _resolve_weak_primary_ai_repo_root,
+)
 from gui.state import WeakPrimaryShadowState
 from gui.weak_primary_shadow import (
     WeakPrimaryShadowBridge,
+    _require_available_memory,
     discover_lambda_point_one_checkpoints,
 )
 
@@ -67,6 +73,40 @@ class CollectionDiscoveryTests(unittest.TestCase):
             WeakPrimaryShadowBridge._validate_checkpoint(
                 payload, Path("model.pth")
             )
+
+    def test_low_memory_preflight_fails_before_model_load(self) -> None:
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"AIQM_WEAK_PRIMARY_MIN_AVAILABLE_MB": "1536"},
+            ),
+            mock.patch(
+                "gui.weak_primary_shadow._available_system_memory_mb",
+                return_value=900.0,
+            ),
+        ):
+            with self.assertRaisesRegex(MemoryError, "was not loaded"):
+                _require_available_memory()
+
+    def test_bundled_package_is_complete_and_is_the_default(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AI_REPO_ROOT", None)
+            root = Path(_resolve_weak_primary_ai_repo_root())
+        self.assertEqual(root.resolve(), _BUNDLED_WEAK_PRIMARY_AI_ROOT.resolve())
+        artifact_root = (
+            root / "Classifier2" / "artifacts"
+            / "weak_primary_four_class_20260803"
+        )
+        self.assertTrue((root / "backbones.py").is_file())
+        self.assertTrue((root / "Classifier2" / "weak_primary_model.py").is_file())
+        self.assertTrue((root / "Classifier2" / "davidson_pairwise.py").is_file())
+        self.assertTrue((artifact_root / "encoder" / "dinov2_vits14_pretrained_zeropad512.pth").is_file())
+        self.assertEqual(
+            len(discover_lambda_point_one_checkpoints(
+                artifact_root / "full_benchmark" / "checkpoints"
+            )),
+            36,
+        )
 
 
 class ShadowDisplayTests(unittest.TestCase):

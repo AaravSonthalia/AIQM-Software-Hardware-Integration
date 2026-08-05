@@ -8,6 +8,7 @@ Pillow
 pytest
 opencv-python
 timm==1.0.28
+requests
 pyvisa
 pytesseract
 pymodbus

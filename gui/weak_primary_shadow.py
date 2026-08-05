@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -30,6 +31,49 @@ DISPLAY_CLASSES = (
     "Twinned (2x1)", "c(6x2)", "rt13xrt13", "HTR",
 )
 EXECUTION_SCOPE = "weak_shadow_only"
+DEFAULT_MIN_AVAILABLE_MEMORY_MB = 1536
+
+
+def _available_system_memory_mb() -> Optional[float]:
+    """Return Windows available physical memory without another dependency."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+
+    class MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    status = MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return None
+    return status.ullAvailPhys / (1024 * 1024)
+
+
+def _require_available_memory() -> None:
+    configured = os.environ.get("AIQM_WEAK_PRIMARY_MIN_AVAILABLE_MB", "1536")
+    try:
+        required_mb = max(0.0, float(configured))
+    except ValueError as error:
+        raise ValueError(
+            "AIQM_WEAK_PRIMARY_MIN_AVAILABLE_MB must be numeric."
+        ) from error
+    available_mb = _available_system_memory_mb()
+    if available_mb is not None and available_mb < required_mb:
+        raise MemoryError(
+            "Weak-primary shadow was not loaded: "
+            f"{available_mb:.0f} MB RAM available, {required_mb:.0f} MB required."
+        )
 
 
 def _sha256_file(path: Path) -> str:
@@ -110,6 +154,7 @@ class WeakPrimaryShadowBridge:
     ) -> None:
         import torch
 
+        _require_available_memory()
         self._torch = torch
         self._c2_dir = _classifier2_dir(ai_repo_root)
         self._repo = self._c2_dir.parent
