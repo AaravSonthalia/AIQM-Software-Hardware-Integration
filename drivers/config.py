@@ -188,15 +188,24 @@ CHALCOGENIDE_MBE = MBESystemConfig(
     ],
     temperasure_title="BASF TemperaSure 5.7.0.4",
     temperasure_exe=r"C:\Users\Omicron\Desktop\TemperaSure.exe",
-    # Deliberately left None: Ch-MBE's serial path has never been
-    # characterised, and this chamber has never had a validated direct
-    # pyrometer read. None keeps its prior behaviour (pyserial's default)
-    # rather than exporting an O-MBE measurement to untested hardware.
+    # VERIFIED on hardware 2026-08-05 via pyrometer_raw_modbus_probe.py.
+    # COM3 is a Prolific PL2303GS — the same adapter family as Bulbasaur,
+    # so the same RTS-loopback hazard applies and the same setting fixes it.
     #
-    # If Ch-MBE reads come back as a verbatim copy of the request, that is
-    # the same loopback signature O-MBE had — set False here and verify
-    # against the probe before trusting it.
-    pyrometer_rts=None,
+    # With RTS de-asserted the probe answers Modbus correctly:
+    #
+    #   REG_VER  0x1300  TX 01 03 13 00 00 01 80 8E
+    #                    RX 01 03 02 09 03 FE 15   -> version 9.3
+    #   REG_CH1  0x0000  TX 01 03 00 00 00 02 C4 0B
+    #                    RX 01 03 04 43 55 D7 2F E1 8B -> 213.84 C
+    #
+    # The REG_VER reply is byte-identical to Bulbasaur's validated response.
+    # Verdict: device_replied, classification non_echo_response.
+    pyrometer_rts=False,
+    # VERIFIED 2026-08-05 — the probe is on COM3 here, not COM4. pyserial
+    # enumerated exactly two ports: COM1 (motherboard) and COM3 (Prolific
+    # PL2303GS USB Serial). Nothing answers on COM4.
+    pyrometer_port="COM3",
     single_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     stream_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     # ADS: 7 cells on Ch-MBE (Task #191 validated Jul 22 2026).
