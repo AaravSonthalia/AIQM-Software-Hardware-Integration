@@ -30,13 +30,13 @@ from gui.equalizer_alignment import (
 )
 from gui.growth_logger import (
     EVENT_STATE_DISCARDED,
-    RHEED_VIEW_EVENT_ALIGNMENT_CONFIRMED,
+    RHEED_VIEW_EVENT_CURRENT_ADJUSTED,
+    RHEED_VIEW_EVENT_ENERGY_ADJUSTED,
     RHEED_VIEW_EVENT_HISTORY_RESET,
     RHEED_VIEW_EVENT_HISTORY_READY,
     RHEED_VIEW_EVENT_QC_PASS,
     RHEED_VIEW_EVENT_QC_REJECT,
-    RHEED_VIEW_EVENT_REALIGN_END,
-    RHEED_VIEW_EVENT_REALIGN_START,
+    RHEED_VIEW_EVENT_SAMPLE_DIRECTION_ADJUSTED,
     RHEED_VIEW_EVENT_SESSION_START,
 )
 from gui.state import (
@@ -218,7 +218,6 @@ class GrowthApp(QMainWindow):
             str, CalibrationRecord
         ] = {}
         self._camera_capture_interrupted = False
-        self._realign_start_capture_token: Optional[tuple] = None
         self._last_heartbeat_capture_token: Optional[tuple] = None
         # Set before any shutdown work begins.  A close can be refused while a
         # native worker is still exiting, so queued worker signals must remain
@@ -735,15 +734,16 @@ class GrowthApp(QMainWindow):
             session_dir.name if session_dir is not None else "",
         )
         self._camera_capture_interrupted = False
-        self._realign_start_capture_token = None
         self._last_heartbeat_capture_token = None
 
-        # Fail closed at every session boundary: a grower must confirm the
-        # initial stable view before temporal advice becomes actionable.
-        # The classifier model remains loaded, while its pixel-coordinate
-        # state and EMA are reset so STOP -> START cannot leak history.
+        # A session begins with an ordinary stable view. Operator adjustments
+        # are timestamped observations, not gates on acquisition or analysis.
+        # Pixel-coordinate history is still reset at the session boundary so
+        # STOP -> START cannot leak classifier state between samples.
         initial_qc = RheedQcState(
             session_active=True,
+            view_segment_id=0,
+            gun_aligned=True,
             history_required=ClassifierWorker.HISTORY_FRAMES_REQUIRED,
         )
         self._apply_rheed_qc_state(
@@ -800,12 +800,13 @@ class GrowthApp(QMainWindow):
         self._last_sensor_log_tick_ns = None
         self._sensor_log_timer.start()
 
-        # Arm shadow-mode auto-capture for this session
+        # Arm shadow-mode auto-capture immediately. RHEED adjustment markers
+        # do not pause or re-arm this independent acquisition path.
         self.auto_capture_engine.reset()
-        self.auto_capture_engine.enabled = False
+        self.auto_capture_engine.enabled = True
         self._auto_capture_event_count = 0
         self.monitor.set_auto_capture_status(
-            "Auto-capture: waiting for RHEED alignment confirmation"
+            "Auto-capture: armed (warmup)"
         )
         self.monitor.set_auto_capture_pause_enabled(True)
 
@@ -892,7 +893,6 @@ class GrowthApp(QMainWindow):
         )
         self._latest_classifier = None
         self.monitor.reset_classifier_session_state("Classifier session ended")
-        self._realign_start_capture_token = None
 
         # Auto-generate T vs t plot from sensor_log.csv (Frankie-style).
         # Soft-deps matplotlib; returns None and logs a warning if absent
@@ -1111,11 +1111,9 @@ class GrowthApp(QMainWindow):
         if not local_demo and (
             not self.growth_log.active
             or not qc.session_active
-            or qc.gun_aligned is not True
-            or qc.realignment_active
         ):
             self.monitor.live_equalizer_tab.invalidate_calibration(
-                "A running, gun-aligned session is required",
+                "A running session is required",
                 emit=False,
             )
             self.statusBar().showMessage(
@@ -1649,7 +1647,7 @@ class GrowthApp(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_rheed_view_event(self, payload: dict):
-        """Apply a validated alignment transition or explicit QC label."""
+        """Record a lightweight RHEED adjustment or explicit QC label."""
         if not self.growth_log.active or not self._rheed_qc_state.session_active:
             self.statusBar().showMessage(
                 "Start a session before recording RHEED QC.", 3000,
@@ -1659,112 +1657,43 @@ class GrowthApp(QMainWindow):
         event_type = str(payload.get("event_type", ""))
         elapsed_s = float(payload.get("elapsed_s", 0.0))
         note = str(payload.get("note", "")).strip()
-        old = self._rheed_qc_state
-        previous_segment = old.view_segment_id
-        new = old
+        state = self._rheed_qc_state
+        previous_segment = state.view_segment_id
         frame_role = ""
-        reset_visual = False
         qc_reject: Optional[bool] = None
         qc_reason = ""
         frame, capture_metadata, capture_token = (
             self._current_fresh_rheed_capture()
         )
-        if capture_token is None:
+        adjustment_events = {
+            RHEED_VIEW_EVENT_SAMPLE_DIRECTION_ADJUSTED,
+            RHEED_VIEW_EVENT_CURRENT_ADJUSTED,
+            RHEED_VIEW_EVENT_ENERGY_ADJUSTED,
+        }
+        if event_type in adjustment_events:
+            # These are annotations only. They deliberately do not change the
+            # view segment, calibration, classifier, visual history, heartbeat,
+            # or auto-capture state. A missing frame must not erase knowledge
+            # that the operator adjusted the instrument.
+            frame_role = event_type
+        elif capture_token is None:
             self.statusBar().showMessage(
-                "A fresh connected RHEED frame is required for this event.",
+                "A fresh connected RHEED frame is required for this QC label.",
                 4000,
             )
             return
-
-        if event_type == RHEED_VIEW_EVENT_ALIGNMENT_CONFIRMED:
-            if old.gun_aligned is not None or old.realignment_active:
-                self.statusBar().showMessage(
-                    "Initial alignment is already resolved.", 3000,
-                )
-                return
-            new = replace(
-                old,
-                view_segment_id=0,
-                gun_aligned=True,
-                realignment_active=False,
-                history_frame_count=0,
-                history_ready=False,
-            )
-            frame_role = "initial_aligned"
-            reset_visual = True
-        elif event_type == RHEED_VIEW_EVENT_REALIGN_START:
-            if old.gun_aligned is not True or old.realignment_active:
-                self.statusBar().showMessage(
-                    "Cannot start a second RHEED realignment.", 3000,
-                )
-                return
-            new = replace(
-                old,
-                realignment_id=old.realignment_id + 1,
-                gun_aligned=False,
-                realignment_active=True,
-                history_frame_count=0,
-                history_ready=False,
-            )
-            frame_role = "pre_realign"
-            reset_visual = True
-        elif event_type == RHEED_VIEW_EVENT_REALIGN_END:
-            if not old.realignment_active:
-                self.statusBar().showMessage(
-                    "No active RHEED realignment to finish.", 3000,
-                )
-                return
-            if (
-                self._realign_start_capture_token is None
-                or capture_token == self._realign_start_capture_token
-            ):
-                self.statusBar().showMessage(
-                    "Finish realignment only after a new RHEED frame arrives.",
-                    4000,
-                )
-                return
-            next_segment = (
-                0
-                if old.view_segment_id is None
-                else old.view_segment_id + 1
-            )
-            new = replace(
-                old,
-                view_segment_id=next_segment,
-                gun_aligned=True,
-                realignment_active=False,
-                history_frame_count=0,
-                history_ready=False,
-            )
-            frame_role = "post_realign"
-            reset_visual = True
         elif event_type == RHEED_VIEW_EVENT_QC_PASS:
-            if old.gun_aligned is not True or old.realignment_active:
-                self.statusBar().showMessage(
-                    "QC PASS requires a confirmed stable RHEED view.", 3000,
-                )
-                return
             frame_role = "qc_pass"
             qc_reject = False
         elif event_type == RHEED_VIEW_EVENT_QC_REJECT:
             frame_role = "qc_reject"
             qc_reject = True
-            qc_reason = note or (
-                "gun_realigning"
-                if old.realignment_active
-                else "operator_reject"
-            )
+            qc_reason = note or "operator_reject"
         else:
             self.statusBar().showMessage(
                 f"Unsupported RHEED QC event: {event_type}", 3000,
             )
             return
-
-        if new is not old:
-            self._apply_rheed_qc_state(
-                new,
-                reset_visual_history=reset_visual,
-            )
 
         self._record_rheed_view_event(
             event_type,
@@ -1778,32 +1707,7 @@ class GrowthApp(QMainWindow):
             capture_metadata=capture_metadata,
         )
 
-        if event_type == RHEED_VIEW_EVENT_REALIGN_START:
-            self._realign_start_capture_token = capture_token
-            # Preserve heartbeat frames, temperature, and process logs, but
-            # suppress the pixel-difference detector while the image is
-            # intentionally moving.
-            self.auto_capture_engine.enabled = False
-            self.auto_capture_engine.reset()
-            self.monitor.set_auto_capture_status(
-                "Auto-capture: paused for RHEED realignment"
-            )
-        elif event_type in (
-            RHEED_VIEW_EVENT_ALIGNMENT_CONFIRMED,
-            RHEED_VIEW_EVENT_REALIGN_END,
-        ):
-            if event_type == RHEED_VIEW_EVENT_REALIGN_END:
-                self._realign_start_capture_token = None
-            self.auto_capture_engine.reset()
-            if not self.monitor.is_auto_capture_paused():
-                self.auto_capture_engine.enabled = True
-                self.monitor.set_auto_capture_status(
-                    "Auto-capture: armed (warmup after alignment)"
-                )
-
-        self.statusBar().showMessage(
-            f"RHEED QC event recorded: {event_type}", 2500,
-        )
+        self.statusBar().showMessage(f"RHEED event recorded: {event_type}", 2500)
 
     # --- MARK EVENT --------------------------------------------------------
 
@@ -2400,20 +2304,11 @@ class GrowthApp(QMainWindow):
                 self._heartbeat_timer.start()
                 self.monitor.live_equalizer_tab.set_save_enabled(True)
                 self.auto_capture_engine.reset()
-                if (
-                    self.monitor.is_auto_capture_paused()
-                    or self._rheed_qc_state.gun_aligned is not True
-                    or self._rheed_qc_state.realignment_active
-                ):
+                if self.monitor.is_auto_capture_paused():
                     self.auto_capture_engine.enabled = False
-                    if self.monitor.is_auto_capture_paused():
-                        message = "Auto-capture: PAUSED (RHEED restored)"
-                    else:
-                        message = (
-                            "Auto-capture: waiting for RHEED alignment "
-                            "confirmation"
-                        )
-                    self.monitor.set_auto_capture_status(message)
+                    self.monitor.set_auto_capture_status(
+                        "Auto-capture: PAUSED (RHEED restored)"
+                    )
                 else:
                     self.auto_capture_engine.enabled = True
                     self.monitor.set_auto_capture_status(
@@ -2758,21 +2653,12 @@ class GrowthApp(QMainWindow):
                     "Auto-capture remains paused until RHEED capture returns.",
                     3000,
                 )
-            elif qc.gun_aligned is True and not qc.realignment_active:
+            else:
                 self.auto_capture_engine.enabled = True
                 self.monitor.set_auto_capture_status(
                     "Auto-capture: armed (warmup)"
                 )
                 self.statusBar().showMessage("Auto-capture resumed", 3000)
-            else:
-                self.auto_capture_engine.enabled = False
-                self.monitor.set_auto_capture_status(
-                    "Auto-capture: waiting for RHEED alignment confirmation"
-                )
-                self.statusBar().showMessage(
-                    "Auto-capture remains paused until RHEED is aligned.",
-                    3000,
-                )
 
     @pyqtSlot(PyrometerState)
     def _on_pyrometer_state(self, state: PyrometerState):

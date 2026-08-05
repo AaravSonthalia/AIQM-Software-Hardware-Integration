@@ -654,31 +654,53 @@ class GrowthMonitor(QWidget):
 
         right.addLayout(action_row)
 
-        # Acquisition QC is intentionally separate from the five
-        # reconstruction sliders.  Realignment is an interval boundary, not
-        # a reconstruction label; explicit QC PASS/REJECT marks train a
-        # future global image-validity head.
+        # Operator RHEED adjustments are lightweight timestamped annotations.
+        # They never pause acquisition or change classifier/Equalizer state.
+        # Explicit QC PASS/REJECT remains a separate one-frame label.
         rheed_qc_row = QHBoxLayout()
         rheed_qc_row.setSpacing(6)
         self.rheed_qc_status_label = QLabel(
-            "RHEED QC: alignment not confirmed"
+            "RHEED: adjustment events ready"
         )
         self.rheed_qc_status_label.setWordWrap(True)
         self.rheed_qc_status_label.setStyleSheet(
-            "color: #d97706; font-size: 11px; padding: 3px 6px;"
+            "color: #22c55e; font-size: 11px; padding: 3px 6px;"
         )
         rheed_qc_row.addWidget(self.rheed_qc_status_label, 1)
 
-        self.rheed_alignment_btn = QPushButton("Confirm RHEED aligned")
-        self.rheed_alignment_btn.setToolTip(
-            "Confirm the initial stable view, start gun realignment, or "
-            "finish it. Frames and temperature history are always retained; "
-            "only pixel-coordinate visual history is reset."
+        self.rheed_direction_btn = QPushButton("Sample direction")
+        self.rheed_direction_btn.setToolTip(
+            "Record that the sample direction was adjusted. This does not "
+            "change the view segment or pause any acquisition."
         )
-        self.rheed_alignment_btn.clicked.connect(
-            self._on_rheed_alignment_clicked,
+        self.rheed_direction_btn.clicked.connect(
+            lambda: self._emit_rheed_adjustment_event(
+                "sample_direction_adjusted"
+            ),
         )
-        rheed_qc_row.addWidget(self.rheed_alignment_btn, 0)
+        rheed_qc_row.addWidget(self.rheed_direction_btn, 0)
+
+        self.rheed_current_btn = QPushButton("RHEED current")
+        self.rheed_current_btn.setToolTip(
+            "Record a RHEED beam-current adjustment without changing state."
+        )
+        self.rheed_current_btn.clicked.connect(
+            lambda: self._emit_rheed_adjustment_event(
+                "rheed_current_adjusted"
+            ),
+        )
+        rheed_qc_row.addWidget(self.rheed_current_btn, 0)
+
+        self.rheed_energy_btn = QPushButton("RHEED energy")
+        self.rheed_energy_btn.setToolTip(
+            "Record a RHEED beam-energy adjustment without changing state."
+        )
+        self.rheed_energy_btn.clicked.connect(
+            lambda: self._emit_rheed_adjustment_event(
+                "rheed_energy_adjusted"
+            ),
+        )
+        rheed_qc_row.addWidget(self.rheed_energy_btn, 0)
 
         self.rheed_qc_pass_btn = QPushButton("QC PASS")
         self.rheed_qc_pass_btn.setToolTip(
@@ -2097,19 +2119,16 @@ class GrowthMonitor(QWidget):
 
     # ----- RHEED acquisition QC -------------------------------------------
 
-    def _on_rheed_alignment_clicked(self):
-        """Request the only valid next alignment-state transition."""
-        if not self.rheed_alignment_btn.isEnabled():
+    def _emit_rheed_adjustment_event(self, event_type: str):
+        """Record an operator adjustment without changing acquisition state."""
+        buttons = {
+            "sample_direction_adjusted": self.rheed_direction_btn,
+            "rheed_current_adjusted": self.rheed_current_btn,
+            "rheed_energy_adjusted": self.rheed_energy_btn,
+        }
+        button = buttons.get(event_type)
+        if button is None or not button.isEnabled():
             return
-
-        state = self._rheed_qc_state
-        if state.realignment_active:
-            event_type = "realign_end"
-        elif state.gun_aligned is True:
-            event_type = "realign_start"
-        else:
-            event_type = "alignment_confirmed"
-
         self.rheed_view_event_requested.emit({
             "event_type": event_type,
             "elapsed_s": self.get_elapsed_seconds(),
@@ -2146,59 +2165,44 @@ class GrowthMonitor(QWidget):
 
     def _update_rheed_qc_controls(self) -> None:
         """Refresh status text, transition label, and state-dependent gates."""
-        if not hasattr(self, "rheed_alignment_btn"):
+        if not hasattr(self, "rheed_direction_btn"):
             return
 
         state = self._rheed_qc_state
         running = self._state == "running" and state.session_active
         fresh_frame = self._has_fresh_rheed_frame()
 
-        if state.realignment_active:
+        if state.history_required <= 0:
             status = (
-                f"RHEED QC: REALIGNING (episode {state.realignment_id}); "
-                "advice frozen, frames retained"
-            )
-            color = "#ef4444"
-            alignment_text = "Finish gun realignment"
-        elif state.gun_aligned is not True:
-            status = "RHEED QC: alignment not confirmed; advice frozen"
-            color = "#d97706"
-            alignment_text = "Confirm RHEED aligned"
-        elif state.history_required <= 0:
-            status = (
-                f"RHEED QC: segment {state.view_segment_id} aligned; "
+                f"RHEED: segment {state.view_segment_id}; "
                 "single-frame classifier only, temporal advice not deployed"
             )
             color = "#d97706"
-            alignment_text = "Start gun realignment"
         elif state.history_ready:
             status = (
-                f"RHEED QC: segment {state.view_segment_id} ready "
+                f"RHEED: segment {state.view_segment_id} ready "
                 f"({state.history_frame_count}/{state.history_required})"
             )
             color = "#22c55e"
-            alignment_text = "Start gun realignment"
         else:
             status = (
-                f"RHEED QC: segment {state.view_segment_id} warming "
+                f"RHEED: segment {state.view_segment_id} warming "
                 f"({state.history_frame_count}/{state.history_required}); "
                 "temporal advice not actionable"
             )
             color = "#d97706"
-            alignment_text = "Start gun realignment"
 
         self.rheed_qc_status_label.setText(status)
         self.rheed_qc_status_label.setStyleSheet(
             f"color: {color}; font-size: 11px; padding: 3px 6px;"
         )
-        self.rheed_alignment_btn.setText(alignment_text)
-        self.rheed_alignment_btn.setEnabled(running and fresh_frame)
+        self.rheed_direction_btn.setEnabled(running)
+        self.rheed_current_btn.setEnabled(running)
+        self.rheed_energy_btn.setEnabled(running)
         self.rheed_qc_reject_btn.setEnabled(running and fresh_frame)
         self.rheed_qc_pass_btn.setEnabled(
             running
             and fresh_frame
-            and state.gun_aligned is True
-            and not state.realignment_active
         )
 
     def _has_fresh_rheed_frame(self) -> bool:

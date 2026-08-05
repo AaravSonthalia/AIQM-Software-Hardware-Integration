@@ -457,7 +457,7 @@ class EqualizerAppIntegrationTests(unittest.TestCase):
         app.growth_log.record_calibration.assert_not_called()
         self.assertIsNone(app._equalizer_calibration)
         self.assertIn(
-            "running, gun-aligned session",
+            "running session",
             app.monitor.live_equalizer_tab.invalidations[-1][0],
         )
 

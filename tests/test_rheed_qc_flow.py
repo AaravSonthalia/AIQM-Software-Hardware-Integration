@@ -1,4 +1,4 @@
-"""Tests for structured RHEED alignment/QC state and GUI wiring.
+"""Tests for lightweight RHEED adjustment events and GUI wiring.
 
 Run with the GUI environment:
 
@@ -39,6 +39,8 @@ class RheedQcFlowTests(unittest.TestCase):
         self.window.monitor.grower_input.setText("QC_TESTER")
         initial = RheedQcState(
             session_active=True,
+            view_segment_id=0,
+            gun_aligned=True,
             history_required=3,
         )
         self.window._rheed_qc_state = initial
@@ -72,66 +74,56 @@ class RheedQcFlowTests(unittest.TestCase):
             "note": note,
         })
 
-    def test_alignment_realign_and_explicit_qc_sequence(self):
-        self._event("alignment_confirmed")
-        self.assertEqual(self.window._rheed_qc_state.view_segment_id, 0)
-        self.assertTrue(self.window._rheed_qc_state.gun_aligned)
-
+    def test_adjustments_are_events_only_and_qc_remains_explicit(self):
+        original = self.window._rheed_qc_state
+        self.window.auto_capture_engine.enabled = True
+        self._event("sample_direction_adjusted", "rotated azimuth")
+        self._event("rheed_current_adjusted")
+        self._event("rheed_energy_adjusted")
         self._event("qc_pass")
-        self._event("realign_start")
-        self.assertTrue(self.window._rheed_qc_state.realignment_active)
-        self.assertFalse(self.window._rheed_qc_state.gun_aligned)
-        self.assertFalse(self.window.auto_capture_engine.enabled)
+        self._event("qc_reject", "operator rejected frame")
 
-        self._event("qc_reject", "defocused during steering")
-        self.window.monitor.update_camera_state(CameraState(
-            frame=np.full((20, 30, 3), 82, dtype=np.uint8),
-            frame_number=2,
-            connected=True,
-            valid=True,
-            capture_backend="wgc",
-            captured_at_utc="2026-07-29T12:00:01.000Z",
-            capture_sequence=11,
-            frame_age_ms=3.0,
-            source_hwnd=123,
-        ))
-        self._event("realign_end")
         state = self.window._rheed_qc_state
-        self.assertEqual(state.view_segment_id, 1)
+        self.assertEqual(state, original)
+        self.assertEqual(state.view_segment_id, 0)
         self.assertTrue(state.gun_aligned)
-        self.assertFalse(state.realignment_active)
-        self.assertFalse(state.history_ready)
+        self.assertTrue(self.window.auto_capture_engine.enabled)
 
         rows = self._rows()
         self.assertEqual(
             [row["event_type"] for row in rows],
             [
-                "alignment_confirmed",
+                "sample_direction_adjusted",
+                "rheed_current_adjusted",
+                "rheed_energy_adjusted",
                 "qc_pass",
-                "realign_start",
                 "qc_reject",
-                "realign_end",
             ],
         )
-        self.assertEqual(rows[2]["frame_role"], "pre_realign")
-        self.assertEqual(rows[4]["frame_role"], "post_realign")
-        self.assertEqual(rows[4]["previous_view_segment_id"], "0")
-        self.assertEqual(rows[4]["view_segment_id"], "1")
-        self.assertEqual(rows[3]["qc_reject"], "True")
-        self.assertEqual(rows[3]["qc_reason"], "defocused during steering")
-        self.assertEqual(rows[3]["labeler"], "QC_TESTER")
+        self.assertEqual(rows[0]["frame_role"], "sample_direction_adjusted")
+        self.assertEqual(rows[0]["previous_view_segment_id"], "0")
+        self.assertEqual(rows[0]["view_segment_id"], "0")
+        self.assertEqual(rows[0]["note"], "rotated azimuth")
+        self.assertEqual(rows[4]["qc_reject"], "True")
+        self.assertEqual(rows[4]["qc_reason"], "operator rejected frame")
+        self.assertEqual(rows[4]["labeler"], "QC_TESTER")
         self.assertTrue(Path(rows[0]["frame_path"]).exists())
 
-    def test_invalid_duplicate_start_does_not_write_row(self):
-        self._event("alignment_confirmed")
-        self._event("realign_start")
-        before = len(self._rows())
-        self._event("realign_start")
-        self.assertEqual(len(self._rows()), before)
-        self.assertTrue(self.window._rheed_qc_state.realignment_active)
+    def test_adjustment_is_logged_without_a_fresh_frame(self):
+        self.window.monitor.update_camera_state(CameraState(
+            frame=None,
+            connected=False,
+            valid=False,
+            error="capture unavailable",
+        ))
+        self._event("rheed_current_adjusted", "operator changed current")
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["event_type"], "rheed_current_adjusted")
+        self.assertEqual(rows[0]["frame_path"], "")
+        self.assertEqual(rows[0]["note"], "operator changed current")
 
     def test_history_ready_is_logged_once_for_current_segment(self):
-        self._event("alignment_confirmed")
         segment = self.window._rheed_qc_state.view_segment_id
         ready = ClassifierState(
             loading=False,
@@ -154,14 +146,6 @@ class RheedQcFlowTests(unittest.TestCase):
             1,
         )
         self.assertTrue(self.window._rheed_qc_state.prediction_actionable)
-
-    def test_same_cached_frame_cannot_close_realignment(self):
-        self._event("alignment_confirmed")
-        self._event("realign_start")
-        before = len(self._rows())
-        self._event("realign_end")
-        self.assertEqual(len(self._rows()), before)
-        self.assertTrue(self.window._rheed_qc_state.realignment_active)
 
     def test_heartbeat_writes_each_capture_token_only_once(self):
         frame = np.random.default_rng(7).integers(
@@ -191,7 +175,6 @@ class RheedQcFlowTests(unittest.TestCase):
         self.assertEqual(self.window.growth_log._heartbeat_counter, 1)
 
     def test_stale_same_segment_classifier_generation_is_ignored(self):
-        self._event("alignment_confirmed")
         current = self.window._rheed_qc_state
         stale = ClassifierState(
             loading=False,
@@ -211,7 +194,6 @@ class RheedQcFlowTests(unittest.TestCase):
         self.assertIsNone(self.window._latest_classifier)
 
     def test_non_wgc_capture_loss_resets_history_once(self):
-        self._event("alignment_confirmed")
         generation = (
             self.window._rheed_qc_state.visual_history_generation
         )
@@ -236,7 +218,6 @@ class RheedQcFlowTests(unittest.TestCase):
         self.assertFalse(self.window.auto_capture_engine.enabled)
 
     def test_auto_capture_cannot_resume_without_fresh_frame(self):
-        self._event("alignment_confirmed")
         self.window._on_camera_state(CameraState(
             frame=None,
             connected=False,
@@ -272,34 +253,21 @@ class RheedQcFlowTests(unittest.TestCase):
         self.assertIsNone(self.window._latest_classifier)
         self.assertIsNone(self.window.monitor._latest_classifier)
 
-    def test_monitor_emits_only_the_valid_next_transition(self):
+    def test_monitor_emits_three_lightweight_adjustment_events(self):
         payloads: list[dict] = []
         self.window.monitor.rheed_view_event_requested.connect(payloads.append)
 
-        self.window.monitor.rheed_alignment_btn.click()
-        self.assertEqual(payloads[-1]["event_type"], "alignment_confirmed")
-
-        aligned = RheedQcState(
-            session_active=True,
-            view_segment_id=0,
-            gun_aligned=True,
-            history_required=3,
+        self.window.monitor.rheed_direction_btn.click()
+        self.window.monitor.rheed_current_btn.click()
+        self.window.monitor.rheed_energy_btn.click()
+        self.assertEqual(
+            [payload["event_type"] for payload in payloads],
+            [
+                "sample_direction_adjusted",
+                "rheed_current_adjusted",
+                "rheed_energy_adjusted",
+            ],
         )
-        self.window.monitor.update_rheed_qc_state(aligned)
-        self.window.monitor.rheed_alignment_btn.click()
-        self.assertEqual(payloads[-1]["event_type"], "realign_start")
-
-        moving = RheedQcState(
-            session_active=True,
-            view_segment_id=0,
-            realignment_id=1,
-            gun_aligned=False,
-            realignment_active=True,
-            history_required=3,
-        )
-        self.window.monitor.update_rheed_qc_state(moving)
-        self.window.monitor.rheed_alignment_btn.click()
-        self.assertEqual(payloads[-1]["event_type"], "realign_end")
 
 
 if __name__ == "__main__":
