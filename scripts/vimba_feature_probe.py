@@ -105,13 +105,24 @@ CONTEXT_CANDIDATES = (
 )
 
 
-def _safe(fn, default=None):
-    """Call a vmbpy accessor, returning `default` if the SDK refuses.
+def _safe(owner, method_name: str, default=None):
+    """Call ``owner.method_name()``, tolerating a missing OR a raising method.
 
-    vmbpy raises for accessors that do not apply to a given feature type
-    (get_range on a string, get() on a command). Probing must never abort
-    on one awkward feature when the point is to survey all of them.
+    The attribute lookup must happen INSIDE this function. Passing a bound
+    method (``_safe(feature.get_available_entries)``) evaluates the attribute
+    at the call site, so an AttributeError escapes before the try block ever
+    runs. That is exactly how the 2026-08-06 Ch-MBE Full-access run died on
+    the very first feature: get_available_entries is EnumFeature-only, and
+    FirmwareVerMajor is an IntFeature.
+
+    vmbpy's feature classes are a ragged hierarchy — get_range/get_increment
+    exist on Int/Float only, get_available_entries on Enum only, get() on
+    everything except Command. Surveying all 168 means every accessor is
+    conditional, so absence must be as survivable as failure.
     """
+    fn = getattr(owner, method_name, None)
+    if fn is None or not callable(fn):
+        return default
     try:
         return fn()
     except Exception as exc:  # noqa: BLE001 — surveying unknown SDK surface
@@ -120,16 +131,16 @@ def _safe(fn, default=None):
 
 def describe_feature(feature) -> dict[str, Any]:
     """Collect everything interesting about one feature, defensively."""
-    name = _safe(feature.get_name, "<unknown>")
+    name = _safe(feature, "get_name", "<unknown>")
     info: dict[str, Any] = {
         "name": name,
-        "display_name": _safe(feature.get_display_name, ""),
+        "display_name": _safe(feature, "get_display_name", ""),
         "type": type(feature).__name__,
-        "unit": _safe(feature.get_unit, ""),
-        "tooltip": _safe(feature.get_tooltip, ""),
+        "unit": _safe(feature, "get_unit", ""),
+        "tooltip": _safe(feature, "get_tooltip", ""),
     }
 
-    access = _safe(feature.get_access_mode, None)
+    access = _safe(feature, "get_access_mode", None)
     if isinstance(access, tuple) and len(access) == 2:
         info["readable"], info["writable"] = bool(access[0]), bool(access[1])
     else:
@@ -140,20 +151,20 @@ def describe_feature(feature) -> dict[str, Any]:
     # does raise. Skip by type name rather than by try/except so the report
     # distinguishes "command" from "read failed".
     if "Command" not in info["type"]:
-        value = _safe(feature.get, None)
+        value = _safe(feature, "get", None)
         info["value"] = value if _is_jsonable(value) else str(value)
 
-    rng = _safe(feature.get_range, None)
+    rng = _safe(feature, "get_range", None)
     if isinstance(rng, tuple) and len(rng) == 2:
         info["min"], info["max"] = _jsonable(rng[0]), _jsonable(rng[1])
 
-    inc = _safe(feature.get_increment, None)
+    inc = _safe(feature, "get_increment", None)
     if inc is not None and not isinstance(inc, str):
         info["increment"] = _jsonable(inc)
 
     # Enum features carry the legal strings — needed to know whether
     # ExposureAuto accepts "Off"/"Once"/"Continuous" verbatim.
-    entries = _safe(feature.get_available_entries, None)
+    entries = _safe(feature, "get_available_entries", None)
     if isinstance(entries, (list, tuple)):
         info["entries"] = [str(e) for e in entries]
 
@@ -246,8 +257,8 @@ def write_test(feature, test_value: float, features: dict[str, dict]) -> dict[st
 
     # Validate against the feature's own range/increment BEFORE writing,
     # rather than discovering rejection from an SDK exception.
-    rng = _safe(feature.get_range, None)
-    increment = _safe(feature.get_increment, None)
+    rng = _safe(feature, "get_range", None)
+    increment = _safe(feature, "get_increment", None)
     if isinstance(rng, tuple) and len(rng) == 2:
         low, high = float(rng[0]), float(rng[1])
         result["range"] = [low, high]
@@ -343,15 +354,29 @@ def main() -> int:
         "phase_2_attempted": bool(args.i_am_doing_a_write),
     }
 
+    try:
+        exit_code = _probe(vmbpy, args, report, exit_code)
+    finally:
+        # Always emit whatever was gathered. A crash mid-sweep still costs a
+        # Viewer close, a GUI close and ~30 s of discovery to repeat, so the
+        # partial report is worth more than a clean stack trace alone.
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                json.dump(report, handle, indent=2, sort_keys=True)
+            print(f"\nReport written to {args.output}")
+    return exit_code
+
+
+def _probe(vmbpy, args, report: dict[str, Any], exit_code: int) -> int:
     with vmbpy.VmbSystem.get_instance() as vmb:
         cam, mode = open_camera(vmbpy, vmb, args.camera_index, args.access_mode)
         report["access_mode"] = mode
         try:
             report["camera"] = {
-                "id": _safe(cam.get_id, ""),
-                "model": _safe(cam.get_model, ""),
-                "serial": _safe(cam.get_serial, ""),
-                "interface": _safe(cam.get_interface_id, ""),
+                "id": _safe(cam, "get_id", ""),
+                "model": _safe(cam, "get_model", ""),
+                "serial": _safe(cam, "get_serial", ""),
+                "interface": _safe(cam, "get_interface_id", ""),
             }
             print(f"Camera : {report['camera']['model']} ({report['camera']['serial']})")
             print(f"Access : {mode.upper()}")
@@ -385,10 +410,30 @@ def main() -> int:
                     "     Close the Vimba X Viewer and re-run for a valid answer.\n"
                 )
 
+            # Per-feature isolation. describe_feature() is already defensive,
+            # but this probe exists to survey an SDK surface we do not fully
+            # know — one unanticipated feature type must never cost the whole
+            # run. Lab runs are expensive: they need the Viewer closed, the
+            # GUI closed, and ~30 s of discovery. Losing 167 good records to
+            # one bad one (as happened 2026-08-06) is the failure to avoid.
             features: dict[str, dict] = {}
+            describe_errors: dict[str, str] = {}
             for feature in cam.get_all_features():
-                info = describe_feature(feature)
-                features[info["name"]] = info
+                fallback_name = _safe(feature, "get_name", "<unknown>")
+                try:
+                    info = describe_feature(feature)
+                    features[info["name"]] = info
+                except Exception as exc:  # noqa: BLE001
+                    describe_errors[str(fallback_name)] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            if describe_errors:
+                report["describe_errors"] = describe_errors
+                print(
+                    f"\n{len(describe_errors)} feature(s) could not be "
+                    f"described; see 'describe_errors' in the JSON. The rest "
+                    f"of the report is complete."
+                )
             report["feature_count"] = len(features)
             report["features"] = features
 
@@ -467,11 +512,8 @@ def main() -> int:
         finally:
             cam.__exit__(None, None, None)
 
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as handle:
-            json.dump(report, handle, indent=2, sort_keys=True)
-        print(f"\nFull report written to {args.output}")
-
+    # The report is written by main()'s finally, so it survives an exception
+    # raised anywhere above. Do not duplicate the write here.
     return exit_code
 
 
