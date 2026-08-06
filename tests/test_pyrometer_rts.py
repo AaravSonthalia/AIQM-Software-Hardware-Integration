@@ -40,9 +40,9 @@ class ConfigSurfaceTests(unittest.TestCase):
         self.assertFalse(OXIDE_MBE.pyrometer_rts)
         self.assertIsNotNone(OXIDE_MBE.pyrometer_rts)
 
-    def test_chmbe_is_false(self):
-        """Ch-MBE Modbus mode must de-assert RTS by default."""
-        self.assertIs(CHALCOGENIDE_MBE.pyrometer_rts, False)
+    def test_chmbe_is_true(self):
+        """Ch-MBE's COM3 Modbus path must assert RTS by default."""
+        self.assertIs(CHALCOGENIDE_MBE.pyrometer_rts, True)
 
     def test_setting_is_per_chamber_not_module_global(self):
         """A future edit must not collapse this into one shared constant."""
@@ -116,11 +116,11 @@ class WorkerWiringTests(unittest.TestCase):
         )._create_sensor()
         self.assertIs(sensor._rts, False)
 
-    def test_chmbe_config_reaches_the_driver_as_false(self):
+    def test_chmbe_config_reaches_the_driver_as_true(self):
         """The Ch-MBE chamber default must reach the Modbus driver."""
         from gui.workers import PyrometerWorker
 
         sensor = PyrometerWorker(
             mode="modbus", rts=CHALCOGENIDE_MBE.pyrometer_rts,
         )._create_sensor()
-        self.assertIs(sensor._rts, False)
+        self.assertIs(sensor._rts, True)

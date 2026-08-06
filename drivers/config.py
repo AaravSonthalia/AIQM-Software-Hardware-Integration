@@ -188,10 +188,13 @@ CHALCOGENIDE_MBE = MBESystemConfig(
     ],
     temperasure_title="BASF TemperaSure 5.7.0.4",
     temperasure_exe=r"C:\Users\Omicron\Desktop\TemperaSure.exe",
-    # Ch-MBE Modbus default: de-assert RTS when the serial port opens.
+    # Ch-MBE Modbus default: assert RTS when the serial port opens.
+    # The COM3 / 115200 workstation preset did not return temperature with
+    # RTS de-asserted during the Aug 6 2026 live test, so this polarity is
+    # intentionally different from O-MBE's verified RTS=False adapter.
     # Keep this chamber-local; the dataclass and driver defaults remain None
     # so unrelated, unconfigured serial paths retain their previous behavior.
-    pyrometer_rts=False,
+    pyrometer_rts=True,
     single_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     stream_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     # ADS: 7 cells on Ch-MBE (Task #191 validated Jul 22 2026).
