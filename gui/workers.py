@@ -557,6 +557,7 @@ class PyrometerWorker(QThread):
         port: str = "COM4",
         baudrate: int = 115200,
         rts: Optional[bool] = None,
+        modbus_backend: str = "pymodbus",
     ):
         super().__init__()
         self.mode = mode
@@ -566,6 +567,7 @@ class PyrometerWorker(QThread):
         # for this chamber" and leaves the serial library alone; the
         # driver logs a warning naming the field when it sees None.
         self.rts = rts
+        self.modbus_backend = modbus_backend
         # Number of rapid sub-readings to average per poll cycle. 5 ≈ 0.5 s
         # at the Exactus default rate (~10 reads/s); for screengrab mode it
         # samples whatever jitter the GUI exposes between refreshes.
@@ -703,6 +705,7 @@ class PyrometerWorker(QThread):
                 port=self.port,
                 baudrate=self.baudrate,
                 rts=self.rts,
+                backend=self.modbus_backend,
             )
         elif self.mode == "screengrab":
             from drivers.pyrometer import ScreenGrabPyrometer

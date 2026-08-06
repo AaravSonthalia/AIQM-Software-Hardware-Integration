@@ -97,6 +97,10 @@ class MBESystemConfig:
     # logs a hint naming this field when it sees None, so an unconfigured
     # chamber diagnoses itself the first time someone looks at the log.
     pyrometer_rts: Optional[bool] = None
+    # Modbus transport implementation. ``pymodbus`` remains the safe
+    # default; ``raw_serial`` is a read-only CRC-scanning path for adapters
+    # whose replies pymodbus cannot frame reliably.
+    pyrometer_modbus_backend: str = "pymodbus"
 
     # Data storage paths
     single_images_folder: str = ""
@@ -188,13 +192,13 @@ CHALCOGENIDE_MBE = MBESystemConfig(
     ],
     temperasure_title="BASF TemperaSure 5.7.0.4",
     temperasure_exe=r"C:\Users\Omicron\Desktop\TemperaSure.exe",
-    # Ch-MBE Modbus default: assert RTS when the serial port opens.
-    # The COM3 / 115200 workstation preset did not return temperature with
-    # RTS de-asserted during the Aug 6 2026 live test, so this polarity is
-    # intentionally different from O-MBE's verified RTS=False adapter.
-    # Keep this chamber-local; the dataclass and driver defaults remain None
-    # so unrelated, unconfigured serial paths retain their previous behavior.
-    pyrometer_rts=True,
+    pyrometer_port="COM3",
+    pyrometer_baudrate=115200,
+    # VERIFIED on Ch-MBE COM3, Aug 5 2026: the read-only raw probe returned
+    # firmware 9.3 and 213.84056 C with RTS=False. pymodbus 3.14 timed out on
+    # the same link, so this chamber uses the CRC-scanning raw read backend.
+    pyrometer_rts=False,
+    pyrometer_modbus_backend="raw_serial",
     single_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     stream_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     # ADS: 7 cells on Ch-MBE (Task #191 validated Jul 22 2026).

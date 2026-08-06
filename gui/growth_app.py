@@ -651,6 +651,7 @@ class GrowthApp(QMainWindow):
                 port=exactus_port,
                 baudrate=exactus_baud,
                 rts=self._chamber_config.pyrometer_rts,
+                modbus_backend=self._chamber_config.pyrometer_modbus_backend,
             )
             self.pyrometer_worker.state_updated.connect(self._on_pyrometer_state)
             self.pyrometer_worker.start()
