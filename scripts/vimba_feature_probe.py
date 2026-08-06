@@ -47,12 +47,16 @@ from typing import Any, Optional
 # most-likely-first for this camera family; the probe reports which exist
 # rather than assuming any of them do.
 EXPOSURE_CANDIDATES = (
-    "ExposureTimeAbs",      # legacy AVT GigE (expected on Manta)
-    "ExposureTime",         # SFNC standard
+    # CONFIRMED 2026-08-06 from the Vimba X Viewer "All" tab on this camera:
+    # Camera > Controls > Exposure > ExposureTimeAbs = 300000, shown green
+    # (writable). The SFNC spelling is absent on this firmware, so the
+    # fallbacks below exist only to keep the probe honest on other cameras.
+    "ExposureTimeAbs",      # legacy AVT GigE — the real name here
+    "ExposureTime",         # SFNC standard — not present on Manta 00.01.44
     "ExposureTimeRaw",
-    "ExposureAuto",
+    "ExposureAuto",         # Off
     "ExposureAutoTarget",
-    "ExposureMode",
+    "ExposureMode",         # Timed
 )
 GAIN_CANDIDATES = (
     "Gain",
@@ -71,11 +75,23 @@ CONTEXT_CANDIDATES = (
     "PixelFormat",
     "Width",
     "Height",
+    # AcquisitionFrameRateLimit is read-only and equals 1/exposure: the
+    # camera's own statement of what it can physically deliver. Observed
+    # 2026-08-06 as 3.3323 fps against a configured AcquisitionFrameRateAbs
+    # of 88.4017 — i.e. the configured rate is unreachable at 300 ms
+    # exposure. VmbCamera.trigger_hz must stay under the limit.
     "AcquisitionFrameRateAbs",
+    "AcquisitionFrameRateLimit",
     "AcquisitionFrameRate",
+    # SensorBits confirms VmbCamera's _max_value = (1 << bit_depth) - 1
+    # assumption programmatically instead of by datasheet. Observed 12.
+    "SensorBits",
+    "SensorType",
     "DeviceFirmwareVersion",
     "DeviceModelName",
     "DeviceSerialNumber",
+    "DevicePartNumber",
+    "DeviceVendorName",
 )
 
 
@@ -233,6 +249,11 @@ def main() -> int:
         help="Enable Phase 2: the set/readback/restore exposure test.",
     )
     parser.add_argument(
+        "--trigger-hz", type=float, default=1.0,
+        help="VmbCamera.trigger_hz to sanity-check against the camera's "
+             "achievable frame rate (default 1.0, the driver's default).",
+    )
+    parser.add_argument(
         "--test-exposure-us", type=float, default=150000.0,
         help="Exposure to set during Phase 2 (default 150000 us = 150 ms, "
              "half the 2026-08-06 observed value of 300000 us).",
@@ -302,6 +323,11 @@ def main() -> int:
             print("\n--- VERDICT ---")
             print(f"Exposure feature : {exposure_name or 'NOT FOUND'}")
             print(f"Gain feature     : {gain_name or 'NOT FOUND'}")
+            report["frame_rate_check"] = _frame_rate_check(
+                features, exposure_name, args.trigger_hz,
+            )
+            for line in report["frame_rate_check"]["lines"]:
+                print(line)
             if exposure_name:
                 writable = features[exposure_name].get("writable")
                 print(f"Exposure writable: {writable}")
@@ -334,6 +360,56 @@ def main() -> int:
         print(f"\nFull report written to {args.output}")
 
     return 0
+
+
+def _frame_rate_check(
+    features: dict[str, dict], exposure_name: Optional[str], trigger_hz: float,
+) -> dict[str, Any]:
+    """Cross-check exposure against what the camera can actually deliver.
+
+    A GUI exposure slider is a frame-rate control in disguise: the sensor
+    cannot start a new integration until the previous one ends, so the
+    achievable rate is bounded by 1/exposure. AcquisitionFrameRateLimit is
+    the camera's own read-only statement of that bound. If VmbCamera's
+    trigger_hz exceeds it, software triggers arrive faster than frames can
+    be produced and RheedCameraWorker sees stale/dropped frames — which
+    presents as a camera fault, not as "exposure is too long".
+    """
+    out: dict[str, Any] = {"lines": [], "ok": None}
+    exposure_us = features.get(exposure_name or "", {}).get("value")
+    limit = features.get("AcquisitionFrameRateLimit", {}).get("value")
+    configured = features.get("AcquisitionFrameRateAbs", {}).get("value")
+
+    if isinstance(exposure_us, (int, float)) and exposure_us > 0:
+        implied = 1_000_000.0 / float(exposure_us)
+        out["exposure_us"] = float(exposure_us)
+        out["implied_max_fps"] = round(implied, 4)
+        out["lines"].append(
+            f"Exposure         : {exposure_us:.0f} us "
+            f"-> implies <= {implied:.2f} fps"
+        )
+    if isinstance(limit, (int, float)):
+        out["frame_rate_limit"] = float(limit)
+        out["lines"].append(f"Camera fps limit : {limit:.4f} (read-only)")
+    if isinstance(configured, (int, float)):
+        out["frame_rate_configured"] = float(configured)
+        note = ""
+        if isinstance(limit, (int, float)) and configured > limit:
+            note = "  <-- configured above the limit; unreachable"
+        out["lines"].append(f"Configured fps   : {configured:.4f}{note}")
+
+    bound = limit if isinstance(limit, (int, float)) else out.get("implied_max_fps")
+    if isinstance(bound, (int, float)):
+        headroom = bound / trigger_hz if trigger_hz > 0 else float("inf")
+        out["trigger_hz"] = trigger_hz
+        out["headroom_x"] = round(headroom, 2)
+        out["ok"] = trigger_hz <= bound
+        verdict = "OK" if out["ok"] else "TOO FAST — expect stale/dropped frames"
+        out["lines"].append(
+            f"VmbCamera trigger: {trigger_hz:.2f} Hz vs {bound:.2f} fps "
+            f"achievable ({headroom:.1f}x headroom) -> {verdict}"
+        )
+    return out
 
 
 def _print_group(title: str, names, features: dict[str, dict]) -> None:
