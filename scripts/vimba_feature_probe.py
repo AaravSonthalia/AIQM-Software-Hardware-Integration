@@ -46,18 +46,28 @@ from typing import Any, Optional
 # Feature-name candidates for the two knobs the growers asked for. Ordered
 # most-likely-first for this camera family; the probe reports which exist
 # rather than assuming any of them do.
-EXPOSURE_CANDIDATES = (
+# Settable exposure *time* features only. Kept strictly separate from the
+# contextual ones below: resolution picks the first present entry, and if
+# ExposureAuto were in this tuple a camera lacking all three time features
+# would resolve the enum and Phase 2 would call ExposureAuto.set(250000.0).
+# That cannot happen on this Manta (ExposureTimeAbs is present) but it would
+# silently break the probe's cross-camera claim.
+EXPOSURE_VALUE_CANDIDATES = (
     # CONFIRMED 2026-08-06 from the Vimba X Viewer "All" tab on this camera:
-    # Camera > Controls > Exposure > ExposureTimeAbs = 300000, shown green
-    # (writable). The SFNC spelling is absent on this firmware, so the
-    # fallbacks below exist only to keep the probe honest on other cameras.
+    # Camera > Controls > Exposure > ExposureTimeAbs = 300000. The SFNC
+    # spelling is absent on this firmware; the fallbacks keep the probe
+    # honest on other cameras.
     "ExposureTimeAbs",      # legacy AVT GigE — the real name here
     "ExposureTime",         # SFNC standard — not present on Manta 00.01.44
     "ExposureTimeRaw",
-    "ExposureAuto",         # Off
+)
+# Read and reported, never written, never resolved as "the exposure feature".
+EXPOSURE_CONTEXT_CANDIDATES = (
+    "ExposureAuto",         # Off — must stay Off for a write test to mean anything
     "ExposureAutoTarget",
     "ExposureMode",         # Timed
 )
+EXPOSURE_CANDIDATES = EXPOSURE_VALUE_CANDIDATES + EXPOSURE_CONTEXT_CANDIDATES
 GAIN_CANDIDATES = (
     "Gain",
     "GainRaw",
@@ -196,39 +206,83 @@ def find_first_present(features: dict[str, dict], names) -> Optional[str]:
     return None
 
 
-def write_test(feature, test_value: float) -> dict[str, Any]:
-    """Set → read back → restore. The restore runs even on failure.
+def write_test(feature, test_value: float, features: dict[str, dict]) -> dict[str, Any]:
+    """Set → read back → restore, with preconditions checked first.
 
-    Deliberately does NOT call UserSetSave: the write stays in volatile
-    camera RAM, so a power-cycle is a guaranteed escape hatch regardless of
-    how this script exits.
+    SCOPE: this proves the camera *register* accepted a value and reported it
+    back. It does NOT start acquisition, so it says nothing about whether
+    integration time actually changed, whether image brightness responded, or
+    whether in-stream writes are safe from the GUI's thread. Those need a
+    separate acquisition phase — do not read a pass here as end-to-end proof.
+
+    Deliberately does NOT call UserSetSave/UserSetStore: the write stays in
+    volatile camera RAM, so a power-cycle reverts it regardless of how this
+    script exits. That is the real safety net — a finally block cannot help
+    after a SIGKILL, an interpreter crash, or a dropped GigE link.
     """
-    original = feature.get()
     result: dict[str, Any] = {
-        "original": _jsonable(original),
         "requested": test_value,
-        "restored": None,
+        "original": None,
         "readback": None,
+        "restored": None,
         "accepted": False,
+        "restore_verified": False,
+        "skipped_reason": "",
         "error": "",
     }
+
+    # Precondition: auto-exposure must be off, or the camera overwrites the
+    # value we just set and the readback measures the auto loop, not our write.
+    auto = features.get("ExposureAuto", {}).get("value")
+    if auto is not None and str(auto).split("_")[-1].lower() != "off":
+        result["skipped_reason"] = (
+            f"ExposureAuto is {auto!r}, not Off — a write test would race the "
+            "auto-exposure loop. Set it Off in the Viewer first."
+        )
+        return result
+
+    original = feature.get()
+    result["original"] = _jsonable(original)
+
+    # Validate against the feature's own range/increment BEFORE writing,
+    # rather than discovering rejection from an SDK exception.
+    rng = _safe(feature.get_range, None)
+    increment = _safe(feature.get_increment, None)
+    if isinstance(rng, tuple) and len(rng) == 2:
+        low, high = float(rng[0]), float(rng[1])
+        result["range"] = [low, high]
+        if not (low <= test_value <= high):
+            result["skipped_reason"] = (
+                f"requested {test_value} outside device range [{low}, {high}]"
+            )
+            return result
+    if isinstance(increment, (int, float)) and increment:
+        # Quantise to the device grid so the readback comparison is exact
+        # rather than "close enough".
+        quantised = round(test_value / float(increment)) * float(increment)
+        result["quantised_request"] = quantised
+        test_value = quantised
+
     try:
         feature.set(test_value)
-        readback = feature.get()
-        result["readback"] = _jsonable(readback)
-        # GenICam quantises to the feature increment, so exact equality is
-        # the wrong test — accept anything within one increment.
-        increment = _safe(feature.get_increment, 1.0)
+        readback = float(feature.get())
+        result["readback"] = readback
         tolerance = abs(float(increment)) if isinstance(increment, (int, float)) else 1.0
-        result["accepted"] = abs(float(readback) - float(test_value)) <= max(tolerance, 1.0)
+        result["accepted"] = abs(readback - test_value) <= max(tolerance, 1.0)
     except Exception as exc:  # noqa: BLE001
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         try:
             feature.set(original)
-            result["restored"] = _jsonable(feature.get())
+            restored = float(feature.get())
+            result["restored"] = restored
+            tolerance = abs(float(increment)) if isinstance(increment, (int, float)) else 1.0
+            result["restore_verified"] = (
+                abs(restored - float(original)) <= max(tolerance, 1.0)
+            )
         except Exception as exc:  # noqa: BLE001
             result["restored"] = f"<RESTORE FAILED: {exc}>"
+            result["restore_verified"] = False
     return result
 
 
@@ -254,9 +308,22 @@ def main() -> int:
              "achievable frame rate (default 1.0, the driver's default).",
     )
     parser.add_argument(
-        "--test-exposure-us", type=float, default=150000.0,
-        help="Exposure to set during Phase 2 (default 150000 us = 150 ms, "
-             "half the 2026-08-06 observed value of 300000 us).",
+        "--test-exposure-us", type=float, default=250000.0,
+        help="Exposure to set during Phase 2. Default 250000 us is a "
+             "deliberately small perturbation from the 2026-08-06 observed "
+             "300000 us — large enough to be unambiguous in a readback, "
+             "small enough not to disturb the beam picture much.",
+    )
+    parser.add_argument(
+        "--require-serial", default="",
+        help="Abort unless the opened camera reports this serial. Phase 2 "
+             "writes to whatever --camera-index resolves to, and enumeration "
+             "order is not guaranteed stable; on Ch-MBE pass 50-0503464907.",
+    )
+    parser.add_argument(
+        "--require-id", default="",
+        help="Abort unless the opened camera reports this device ID "
+             "(Ch-MBE: DEV_000F314E8D67).",
     )
     args = parser.parse_args()
 
@@ -269,6 +336,7 @@ def main() -> int:
         )
         return 1
 
+    exit_code = 0
     report: dict[str, Any] = {
         "probed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "vmbpy_version": getattr(vmbpy, "__version__", "<unknown>"),
@@ -287,6 +355,29 @@ def main() -> int:
             }
             print(f"Camera : {report['camera']['model']} ({report['camera']['serial']})")
             print(f"Access : {mode.upper()}")
+
+            # Identity lock. --camera-index is positional and enumeration
+            # order is not guaranteed across reboots or NIC changes, so a
+            # write must never be aimed by index alone.
+            for field, expected in (
+                ("serial", args.require_serial), ("id", args.require_id),
+            ):
+                actual = str(report["camera"].get(field, ""))
+                if expected and expected not in actual:
+                    print(
+                        f"\nABORT: camera {field} is {actual!r}, expected "
+                        f"{expected!r}. Refusing to touch the wrong camera.",
+                        file=sys.stderr,
+                    )
+                    return 3
+            if args.i_am_doing_a_write and not (args.require_serial or args.require_id):
+                print(
+                    "\nABORT: Phase 2 requires --require-serial and/or "
+                    "--require-id so the write is aimed at a verified camera, "
+                    "not at whatever --camera-index happened to resolve.",
+                    file=sys.stderr,
+                )
+                return 3
             if mode != "full":
                 print(
                     "\n  !! Opened in READ mode. Every feature below will report\n"
@@ -301,7 +392,7 @@ def main() -> int:
             report["feature_count"] = len(features)
             report["features"] = features
 
-            exposure_name = find_first_present(features, EXPOSURE_CANDIDATES)
+            exposure_name = find_first_present(features, EXPOSURE_VALUE_CANDIDATES)
             gain_name = find_first_present(features, GAIN_CANDIDATES)
             report["resolved"] = {
                 "exposure_feature": exposure_name,
@@ -346,11 +437,33 @@ def main() -> int:
                 else:
                     print(f"\n--- PHASE 2: write test on {exposure_name} ---")
                     outcome = write_test(
-                        getattr(cam, exposure_name), args.test_exposure_us,
+                        getattr(cam, exposure_name),
+                        args.test_exposure_us,
+                        features,
                     )
                     report["write_test"] = outcome
                     for key, value in outcome.items():
-                        print(f"  {key:10s}: {value}")
+                        print(f"  {key:18s}: {value}")
+                    print(
+                        "\n  SCOPE: this proves the register accepted and "
+                        "reported back a value.\n"
+                        "  It does NOT prove integration time changed or that "
+                        "image brightness responded —\n"
+                        "  that needs a separate acquisition phase."
+                    )
+                    if outcome["skipped_reason"]:
+                        print(f"\n  SKIPPED: {outcome['skipped_reason']}")
+                    elif not outcome["restore_verified"]:
+                        print(
+                            "\n  *** RESTORATION NOT VERIFIED ***\n"
+                            f"  The camera may still be at {outcome['requested']} us.\n"
+                            "  Check ExposureTimeAbs in the Vimba X Viewer, or "
+                            "power-cycle the camera\n"
+                            "  (the write was never saved to a user set, so a "
+                            "power-cycle reverts it).",
+                            file=sys.stderr,
+                        )
+                        exit_code = 4
         finally:
             cam.__exit__(None, None, None)
 
@@ -359,7 +472,7 @@ def main() -> int:
             json.dump(report, handle, indent=2, sort_keys=True)
         print(f"\nFull report written to {args.output}")
 
-    return 0
+    return exit_code
 
 
 def _frame_rate_check(
@@ -376,9 +489,23 @@ def _frame_rate_check(
     presents as a camera fault, not as "exposure is too long".
     """
     out: dict[str, Any] = {"lines": [], "ok": None}
-    exposure_us = features.get(exposure_name or "", {}).get("value")
+    exposure_info = features.get(exposure_name or "", {})
+    exposure_us = exposure_info.get("value")
     limit = features.get("AcquisitionFrameRateLimit", {}).get("value")
     configured = features.get("AcquisitionFrameRateAbs", {}).get("value")
+
+    # The 1e6/exposure arithmetic is only valid if the feature really is in
+    # microseconds. ExposureTimeRaw on some firmwares is in device ticks, and
+    # silently reporting a wrong fps ceiling is worse than reporting none.
+    unit = str(exposure_info.get("unit", "") or "")
+    unit_ok = unit.strip().lower() in ("us", "µs", "microsecond", "microseconds", "")
+    out["exposure_unit"] = unit
+    if not unit_ok:
+        out["lines"].append(
+            f"Exposure unit    : {unit!r} is not microseconds — skipping the "
+            "fps derivation (would be meaningless)."
+        )
+        exposure_us = None
 
     if isinstance(exposure_us, (int, float)) and exposure_us > 0:
         implied = 1_000_000.0 / float(exposure_us)
