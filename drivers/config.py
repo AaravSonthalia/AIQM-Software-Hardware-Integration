@@ -188,15 +188,10 @@ CHALCOGENIDE_MBE = MBESystemConfig(
     ],
     temperasure_title="BASF TemperaSure 5.7.0.4",
     temperasure_exe=r"C:\Users\Omicron\Desktop\TemperaSure.exe",
-    # Deliberately left None: Ch-MBE's serial path has never been
-    # characterised, and this chamber has never had a validated direct
-    # pyrometer read. None keeps its prior behaviour (pyserial's default)
-    # rather than exporting an O-MBE measurement to untested hardware.
-    #
-    # If Ch-MBE reads come back as a verbatim copy of the request, that is
-    # the same loopback signature O-MBE had — set False here and verify
-    # against the probe before trusting it.
-    pyrometer_rts=None,
+    # Ch-MBE Modbus default: de-assert RTS when the serial port opens.
+    # Keep this chamber-local; the dataclass and driver defaults remain None
+    # so unrelated, unconfigured serial paths retain their previous behavior.
+    pyrometer_rts=False,
     single_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     stream_images_folder=r"C:\Dropbox\Data\RHEED\RHEED_YangGroup\FeSeTe_STO",
     # ADS: 7 cells on Ch-MBE (Task #191 validated Jul 22 2026).

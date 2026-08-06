@@ -40,14 +40,9 @@ class ConfigSurfaceTests(unittest.TestCase):
         self.assertFalse(OXIDE_MBE.pyrometer_rts)
         self.assertIsNotNone(OXIDE_MBE.pyrometer_rts)
 
-    def test_chmbe_stays_unset(self):
-        """Ch-MBE's cabling is uncharacterised, so it must make no claim.
-
-        This test is the guard against a well-meaning future edit copying
-        O-MBE's False across "for consistency". Changing it requires
-        measuring the Ch-MBE probe first, and changing this test with it.
-        """
-        self.assertIsNone(CHALCOGENIDE_MBE.pyrometer_rts)
+    def test_chmbe_is_false(self):
+        """Ch-MBE Modbus mode must de-assert RTS by default."""
+        self.assertIs(CHALCOGENIDE_MBE.pyrometer_rts, False)
 
     def test_setting_is_per_chamber_not_module_global(self):
         """A future edit must not collapse this into one shared constant."""
@@ -121,15 +116,11 @@ class WorkerWiringTests(unittest.TestCase):
         )._create_sensor()
         self.assertIs(sensor._rts, False)
 
-    def test_unset_rts_propagates_as_none_not_false(self):
-        """An uncharacterised chamber must reach the driver as None.
-
-        Ch-MBE's pyrometer_rts is None; if that arrived as False the GUI
-        would de-assert RTS on hardware nobody has measured.
-        """
+    def test_chmbe_config_reaches_the_driver_as_false(self):
+        """The Ch-MBE chamber default must reach the Modbus driver."""
         from gui.workers import PyrometerWorker
 
         sensor = PyrometerWorker(
             mode="modbus", rts=CHALCOGENIDE_MBE.pyrometer_rts,
         )._create_sensor()
-        self.assertIsNone(sensor._rts)
+        self.assertIs(sensor._rts, False)
