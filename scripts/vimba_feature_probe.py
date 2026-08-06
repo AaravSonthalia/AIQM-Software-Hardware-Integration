@@ -483,10 +483,22 @@ def _frame_rate_check(
     A GUI exposure slider is a frame-rate control in disguise: the sensor
     cannot start a new integration until the previous one ends, so the
     achievable rate is bounded by 1/exposure. AcquisitionFrameRateLimit is
-    the camera's own read-only statement of that bound. If VmbCamera's
-    trigger_hz exceeds it, software triggers arrive faster than frames can
-    be produced and RheedCameraWorker sees stale/dropped frames — which
-    presents as a camera fault, not as "exposure is too long".
+    the camera's own read-only statement of that bound.
+
+    FAILURE MODE (corrected 2026-08-06). Over-triggering the DIRECT Vimba
+    path does not raise a timeout. window_capture.py's 5 s stale timeout
+    belongs to ScreenGrabCamera (the WGC/kSA-window backend); VmbCamera
+    never calls it. VmbCamera.read_frame() returns ``_latest_frame.copy()``
+    unconditionally, with no age check and no frame identity, and VmbCamera
+    exposes no ``last_capture`` — so RheedCameraWorker takes its else-branch
+    and synthesises ``frame_age_ms = 0.0`` with ``capture_sequence =
+    frame_count``.
+
+    The real consequence is therefore silent, not loud: the same cached
+    image is re-served and counted as a new frame. That inflates worker FPS,
+    feeds duplicates to the intensity trend and the classifier, and corrupts
+    change-detector inputs. Nothing errors. Until VmbCamera carries a camera
+    frame ID and capture timestamp, this check is the only warning available.
     """
     out: dict[str, Any] = {"lines": [], "ok": None}
     exposure_info = features.get(exposure_name or "", {})
@@ -531,7 +543,11 @@ def _frame_rate_check(
         out["trigger_hz"] = trigger_hz
         out["headroom_x"] = round(headroom, 2)
         out["ok"] = trigger_hz <= bound
-        verdict = "OK" if out["ok"] else "TOO FAST — expect stale/dropped frames"
+        verdict = (
+            "OK" if out["ok"]
+            else "TOO FAST — expect silently re-served cached frames "
+                 "counted as new (no error is raised)"
+        )
         out["lines"].append(
             f"VmbCamera trigger: {trigger_hz:.2f} Hz vs {bound:.2f} fps "
             f"achievable ({headroom:.1f}x headroom) -> {verdict}"
