@@ -373,7 +373,7 @@ class ClassifierState:
 
 @dataclass
 class WeakPrimaryShadowState:
-    """Read-only λ=0.1 diagnostic output; never a control/advice signal."""
+    """Read-only four-output diagnostic; never a control/advice signal."""
 
     loading: bool = True
     ready: bool = False
@@ -393,10 +393,15 @@ class WeakPrimaryShadowState:
     checkpoint_disagreement: float = 0.0
     checkpoint_count: int = 0
     ensemble_id: str = ""
+    bundle_family: str = "brightness_robust_weak_primary_v1"
+    brightness_policy: str = "all_extreme"
+    output_classes: tuple[str, ...] = field(default_factory=tuple)
     lambda_pair: float = 0.1
     execution_scope: str = "weak_shadow_only"
     actionable: bool = False
-    abstain_reason: str = "weak_shadow_only_no_independent_presence_gate"
+    abstain_reason: str = (
+        "weak_shadow_only_no_registered_real_frame_actionability_policy"
+    )
 
 
 @dataclass

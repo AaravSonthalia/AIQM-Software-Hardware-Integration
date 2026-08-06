@@ -2225,7 +2225,7 @@ class GrowthApp(QMainWindow):
     def _on_weak_primary_shadow_state(
         self, state: WeakPrimaryShadowState,
     ) -> None:
-        """Display and trace the isolated λ=0.1 diagnostic result."""
+        """Display and trace the isolated brightness-robust diagnostic."""
         if self._shutdown_pending:
             return
         state = _stamp_gui_received(state)
@@ -2235,7 +2235,7 @@ class GrowthApp(QMainWindow):
             GrowthApp._trace_temporal(
                 self,
                 "weak_primary_shadow_state",
-                "weak_primary_lambda_0.1",
+                "brightness_robust_four_output_all_extreme",
                 details={
                     "source_capture_sequence": state.source_capture_sequence,
                     "source_received_monotonic_ns": (
@@ -2267,6 +2267,9 @@ class GrowthApp(QMainWindow):
                     ),
                     "checkpoint_count": state.checkpoint_count,
                     "ensemble_id": state.ensemble_id,
+                    "bundle_family": state.bundle_family,
+                    "brightness_policy": state.brightness_policy,
+                    "output_classes": list(state.output_classes),
                     "lambda_pair": state.lambda_pair,
                     "execution_scope": state.execution_scope,
                     "actionable": False,

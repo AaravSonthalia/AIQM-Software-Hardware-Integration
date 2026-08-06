@@ -1,4 +1,4 @@
-"""Runtime bridge for the λ=0.1 weak-primary diagnostic ensemble.
+"""Runtime bridge for the brightness-robust four-output shadow ensemble.
 
 This route is deliberately isolated from the deployed classifier.  Its four
 outputs are conditional probabilities among visible superstructures; there is
@@ -19,6 +19,9 @@ import numpy as np
 
 
 LAMBDA_PAIR = 0.1
+BUNDLE_FAMILY = "brightness_robust_weak_primary_v1"
+BRIGHTNESS_POLICY = "all_extreme"
+SOURCE_BUNDLE_NAME = "four_output_no_1x1_all_extreme"
 EXPECTED_FOLDS = frozenset(range(4))
 EXPECTED_SEEDS = frozenset((17, 29, 43))
 EXPECTED_CHECKPOINT_COUNT = 36
@@ -94,11 +97,86 @@ def _classifier2_dir(ai_repo_root: str | Path) -> Path:
 
 
 def default_artifact_root(ai_repo_root: str | Path) -> Path:
-    return (
-        _classifier2_dir(ai_repo_root)
-        / "artifacts"
-        / "weak_primary_four_class_20260803"
+    root = Path(ai_repo_root).expanduser().resolve()
+    return root / "brightness_robust_four_output_all_extreme"
+
+
+def _resolve_release_file(artifact_root: Path, record: dict) -> Path:
+    """Resolve a release record while preserving the upstream manifest.
+
+    The research manifest stores repository-relative source paths.  The GUI
+    package uses a shorter Windows-safe directory, so the suffix following the
+    bundle name is resolved inside ``artifact_root``.
+    """
+    source_path = Path(str(record.get("path", "")))
+    try:
+        suffix = source_path.parts[
+            source_path.parts.index(SOURCE_BUNDLE_NAME) + 1:
+        ]
+    except ValueError as error:
+        raise ValueError(
+            f"Release path is outside bundle {SOURCE_BUNDLE_NAME}: {source_path}"
+        ) from error
+    path = artifact_root.joinpath(*suffix).resolve()
+    try:
+        path.relative_to(artifact_root.resolve())
+    except ValueError as error:
+        raise ValueError(f"Release path escapes bundle: {source_path}") from error
+    if not path.is_file():
+        raise FileNotFoundError(f"Release file is missing: {path}")
+    expected_bytes = int(record.get("bytes", -1))
+    if (
+        path.stat().st_size != expected_bytes
+        or _sha256_file(path) != record.get("sha256")
+    ):
+        raise ValueError(f"Release integrity validation failed: {path}")
+    return path
+
+
+def load_release_manifest(artifact_root: Path) -> tuple[dict, list[Path]]:
+    """Validate the four-output, non-deployable release and all file hashes."""
+    manifest_path = artifact_root / "MANIFEST.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Release manifest is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    contract = manifest.get("contracts", {}).get("four_output", {})
+    cells = manifest.get("cells", [])
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("bundle_family") != BUNDLE_FAMILY
+        or manifest.get("brightness_policy") != BRIGHTNESS_POLICY
+        or not math.isclose(float(manifest.get("lambda_pair", -1)), LAMBDA_PAIR)
+        or manifest.get("execution_scope") != EXECUTION_SCOPE
+        or manifest.get("deployment_eligible") is not False
+        or manifest.get("ensemble_cells") != EXPECTED_CHECKPOINT_COUNT
+        or tuple(contract.get("classes", ())) != MODEL_CLASSES
+        or contract.get("semantics")
+        != "conditional_primary_type_probability_not_surface_fraction"
+        or "five_output" in manifest.get("contracts", {})
+        or len(cells) != EXPECTED_CHECKPOINT_COUNT
+    ):
+        raise ValueError("Release manifest violates the four-output shadow contract.")
+    encoder_path = _resolve_release_file(artifact_root, manifest["encoder"])
+    metadata_path = _resolve_release_file(
+        artifact_root, manifest["encoder_metadata"],
     )
+    checkpoint_paths = []
+    seen_cells = set()
+    for cell in cells:
+        name = str(cell.get("cell", ""))
+        if name in seen_cells or CHECKPOINT_RE.fullmatch(name) is None:
+            raise ValueError(f"Invalid or duplicate release cell: {name}")
+        seen_cells.add(name)
+        path = _resolve_release_file(artifact_root, cell["conditional_head"])
+        if path.parent.name != name:
+            raise ValueError(f"Release cell/path mismatch: {name}")
+        checkpoint_paths.append(path)
+    discover_lambda_point_one_checkpoints(
+        artifact_root / "conditional_four_output_heads"
+    )
+    manifest["_resolved_encoder_path"] = encoder_path
+    manifest["_resolved_encoder_metadata_path"] = metadata_path
+    return manifest, checkpoint_paths
 
 
 def discover_lambda_point_one_checkpoints(checkpoint_root: Path) -> list[Path]:
@@ -137,7 +215,7 @@ def discover_lambda_point_one_checkpoints(checkpoint_root: Path) -> list[Path]:
 
 
 class WeakPrimaryShadowBridge:
-    """Load and evaluate the complete non-deployable λ=0.1 collection."""
+    """Load and evaluate the brightness-robust non-deployable collection."""
 
     input_mode = "single_frame_weak_primary_shadow"
     execution_scope = EXECUTION_SCOPE
@@ -161,16 +239,13 @@ class WeakPrimaryShadowBridge:
         self.artifact_root = Path(
             artifact_root or default_artifact_root(ai_repo_root)
         ).expanduser().resolve()
-        self.encoder_path = (
-            self.artifact_root / "encoder"
-            / "dinov2_vits14_pretrained_zeropad512.pth"
+        manifest, self.checkpoint_paths = load_release_manifest(
+            self.artifact_root
         )
-        self.encoder_metadata_path = self.encoder_path.with_suffix(".json")
-        self.checkpoint_paths = discover_lambda_point_one_checkpoints(
-            self.artifact_root / "full_benchmark" / "checkpoints"
-        )
-        if not self.encoder_path.is_file() or not self.encoder_metadata_path.is_file():
-            raise FileNotFoundError("Registered DINOv2 encoder package is incomplete.")
+        self.encoder_path = manifest.pop("_resolved_encoder_path")
+        self.encoder_metadata_path = manifest.pop("_resolved_encoder_metadata_path")
+        self.manifest = manifest
+        self.manifest_path = self.artifact_root / "MANIFEST.json"
         metadata = json.loads(self.encoder_metadata_path.read_text(encoding="utf-8"))
         observed_encoder_sha = _sha256_file(self.encoder_path)
         if (
@@ -211,10 +286,11 @@ class WeakPrimaryShadowBridge:
         self._models = []
         self._temperatures: list[float] = []
         checkpoint_hashes: list[str] = []
-        shared_identity: Optional[tuple[str, str]] = None
-        for path in self.checkpoint_paths:
+        for cell, path in zip(self.manifest["cells"], self.checkpoint_paths):
             payload = torch.load(path, map_location="cpu", weights_only=True)
-            self._validate_checkpoint(payload, path)
+            self._validate_checkpoint(
+                payload, path, cell["cell"], observed_encoder_sha,
+            )
             state = payload["model_state_dict"]
             shared_dim = int(state["shared.0.weight"].shape[0])
             dropout = float(payload.get("optimizer", {}).get("dropout", 0.1))
@@ -227,46 +303,67 @@ class WeakPrimaryShadowBridge:
             self._models.append(model.requires_grad_(False).eval().to(self.device))
             self._temperatures.append(float(payload["temperature"]))
             checkpoint_hashes.append(_sha256_file(path))
-            identity = (
-                str(payload["data_manifest_sha256"]),
-                str(payload["embedding_cache"].get("build_contract_sha256", "")),
-            )
-            if shared_identity is None:
-                shared_identity = identity
-            elif identity != shared_identity:
-                raise ValueError("λ=0.1 checkpoints do not share one data/cache contract.")
 
         identity_bytes = "\n".join(
-            [observed_encoder_sha, *checkpoint_hashes]
+            [
+                _sha256_file(self.manifest_path), observed_encoder_sha,
+                *checkpoint_hashes,
+            ]
         ).encode("ascii")
-        self.ensemble_id = "weak-primary-lambda0.1-cv36-" + hashlib.sha256(
+        self.ensemble_id = "brightness-robust-all-extreme-cv36-" + hashlib.sha256(
             identity_bytes
         ).hexdigest()[:16]
-        self.model_path = self.artifact_root / "full_benchmark" / "checkpoints"
+        self.model_path = self.artifact_root / "conditional_four_output_heads"
         self.checkpoint_count = len(self._models)
+        self.bundle_family = BUNDLE_FAMILY
+        self.brightness_policy = BRIGHTNESS_POLICY
 
     @staticmethod
-    def _validate_checkpoint(payload: dict, path: Path) -> None:
+    def _validate_checkpoint(
+        payload: dict, path: Path, expected_cell: Optional[str] = None,
+        encoder_sha: Optional[str] = None,
+    ) -> None:
         required = {
             "model_state_dict", "embedding_dim", "temperature",
-            "data_manifest_sha256", "embedding_cache",
+            "cache", "brightness_policy", "output_semantics",
         }
         if not isinstance(payload, dict) or not required.issubset(payload):
             raise ValueError(f"Malformed weak-primary checkpoint: {path}")
         temperature = float(payload["temperature"])
         if (
-            payload.get("checkpoint_family") != "weak_four_class_primary_v1"
+            payload.get("checkpoint_family") != BUNDLE_FAMILY
             or payload.get("execution_scope") != EXECUTION_SCOPE
             or payload.get("deployment_eligible") is not False
             or not math.isclose(float(payload.get("lambda_pair", -1)), LAMBDA_PAIR)
             or tuple(payload.get("classes", ())) != MODEL_CLASSES
-            or payload.get("one_by_one_class") is not False
-            or payload.get("none_or_weak_class") is not False
+            or payload.get("output_semantics")
+            != "conditional_primary_probability_not_surface_fraction"
+            or payload.get("brightness_policy") != BRIGHTNESS_POLICY
             or int(payload.get("embedding_dim", 0)) != 512
             or not math.isfinite(temperature)
             or temperature <= 0
         ):
-            raise ValueError(f"Checkpoint violates λ=0.1 shadow contract: {path}")
+            raise ValueError(
+                f"Checkpoint violates brightness-robust shadow contract: {path}"
+            )
+        if expected_cell is not None:
+            match = CHECKPOINT_RE.fullmatch(expected_cell)
+            identity = (
+                int(payload.get("fold", -1)),
+                str(payload.get("held_out_pair_run", "")),
+                int(payload.get("seed", -1)),
+            )
+            expected_identity = (
+                int(match.group("fold")), match.group("pair"),
+                int(match.group("seed")),
+            )
+            if identity != expected_identity:
+                raise ValueError(f"Checkpoint identity mismatch: {path}")
+        cache_encoder_sha = (
+            payload.get("cache", {}).get("encoder", {}).get("checkpoint_sha256")
+        )
+        if encoder_sha is not None and cache_encoder_sha != encoder_sha:
+            raise ValueError(f"Checkpoint encoder mismatch: {path}")
 
     def _preprocess(self, frame: np.ndarray):
         torch = self._torch
@@ -329,8 +426,13 @@ class WeakPrimaryShadowBridge:
             "checkpoint_disagreement": float(disagreement.clamp(0.0, 1.0)),
             "checkpoint_count": self.checkpoint_count,
             "ensemble_id": self.ensemble_id,
+            "bundle_family": self.bundle_family,
+            "brightness_policy": self.brightness_policy,
+            "output_classes": DISPLAY_CLASSES,
             "lambda_pair": LAMBDA_PAIR,
             "execution_scope": EXECUTION_SCOPE,
             "actionable": False,
-            "abstain_reason": "weak_shadow_only_no_independent_presence_gate",
+            "abstain_reason": (
+                "weak_shadow_only_no_registered_real_frame_actionability_policy"
+            ),
         }

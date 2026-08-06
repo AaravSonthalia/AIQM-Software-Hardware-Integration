@@ -1498,7 +1498,7 @@ class ClassifierWorker(QThread):
 
 
 class WeakPrimaryShadowWorker(QThread):
-    """Independent low-rate worker for the λ=0.1 36-cell shadow ensemble."""
+    """Independent low-rate worker for the brightness-robust shadow."""
 
     state_updated = pyqtSignal(WeakPrimaryShadowState)
     POLL_INTERVAL_S = 2.0
@@ -1625,6 +1625,7 @@ class WeakPrimaryShadowWorker(QThread):
                 "conditional_probabilities", "predicted_class",
                 "predicted_applicability", "normalized_entropy",
                 "checkpoint_disagreement", "checkpoint_count", "ensemble_id",
+                "bundle_family", "brightness_policy", "output_classes",
                 "lambda_pair", "execution_scope", "actionable", "abstain_reason",
             ):
                 setattr(state, name, result[name])

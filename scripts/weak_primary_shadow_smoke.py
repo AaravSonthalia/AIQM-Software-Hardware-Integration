@@ -1,4 +1,4 @@
-"""Load the bundled lambda=0.1 shadow ensemble and run one inference."""
+"""Load the bundled brightness-robust four-output shadow and infer once."""
 from __future__ import annotations
 
 import argparse
@@ -29,6 +29,10 @@ def main() -> int:
         "status": "PASS",
         "ensemble_id": bridge.ensemble_id,
         "checkpoint_count": bridge.checkpoint_count,
+        "bundle_family": bridge.bundle_family,
+        "brightness_policy": bridge.brightness_policy,
+        "output_classes": result["output_classes"],
+        "has_1x1_output": "1x1" in result["output_classes"],
         "device": str(bridge.device),
         "actionable": result["actionable"],
         "probability_sum": sum(result["conditional_probabilities"].values()),

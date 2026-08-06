@@ -600,7 +600,7 @@ class GrowthMonitor(QWidget):
         right.addWidget(self._recon_status_label)
 
         self._weak_primary_shadow_label = QLabel(
-            "Weak primary λ=0.1 shadow: disabled"
+            "Brightness-robust 4-output shadow: disabled"
         )
         self._weak_primary_shadow_label.setWordWrap(True)
         self._weak_primary_shadow_label.setStyleSheet(
@@ -608,9 +608,10 @@ class GrowthMonitor(QWidget):
             "padding: 4px;"
         )
         self._weak_primary_shadow_label.setToolTip(
-            "Diagnostic only: conditional probabilities among four visible "
-            "superstructures. No 1x1/none class, no independent presence "
-            "gate, and never used for advice or control."
+            "Diagnostic only: all_extreme brightness-robust conditional "
+            "probabilities for Twinned, c(6x2), rt13 and HTR. The shadow "
+            "panel has no 1x1 column and is never used for advice, control, "
+            "or automatic capture."
         )
         self._live_classifier_widgets.append(self._weak_primary_shadow_label)
         right.addWidget(self._weak_primary_shadow_label)
@@ -1228,12 +1229,12 @@ class GrowthMonitor(QWidget):
         self.config_weak_primary_shadow_enabled = QCheckBox()
         self.config_weak_primary_shadow_enabled.setChecked(False)
         self.config_weak_primary_shadow_enabled.setToolTip(
-            "Run the complete 36-checkpoint λ=0.1 weak-primary ensemble as "
-            "a non-actionable diagnostic. Requires the registered DINOv2 "
-            "artifact package; never replaces the live classifier."
+            "Run the complete 36-head all_extreme four-output ensemble as a "
+            "non-actionable diagnostic. It has no 1x1 output, never replaces "
+            "the deployed classifier, and does not drive automatic capture."
         )
         config_form.addRow(
-            "Weak primary shadow:", self.config_weak_primary_shadow_enabled,
+            "4-output shadow:", self.config_weak_primary_shadow_enabled,
         )
 
         # Snapshot of the tooltips each config widget carries in its
@@ -1844,16 +1845,17 @@ class GrowthMonitor(QWidget):
     def update_weak_primary_shadow_state(
         self, state: WeakPrimaryShadowState,
     ) -> None:
-        """Render λ=0.1 output without feeding the five-class UI."""
+        """Render four outputs without feeding the five-class UI."""
         if self._blind_labeling_mode:
             return
         if state.loading:
-            text = "Weak primary λ=0.1 shadow: loading 36 checkpoints…"
+            text = "Brightness-robust 4-output shadow: loading 36 heads…"
         elif state.error:
-            text = f"Weak primary λ=0.1 shadow unavailable: {state.error}"
+            text = f"Brightness-robust 4-output shadow unavailable: {state.error}"
         elif state.last_frame_number < 0:
             text = (
-                f"Weak primary λ=0.1 shadow ready ({state.checkpoint_count}/36); "
+                "Brightness-robust 4-output shadow "
+                f"({state.brightness_policy}, {state.checkpoint_count}/36); "
                 "waiting for frame"
             )
         else:
@@ -1863,7 +1865,7 @@ class GrowthMonitor(QWidget):
                 for name in ("Twinned (2x1)", "c(6x2)", "rt13xrt13", "HTR")
             )
             text = (
-                "SHADOW ONLY · conditional four-class · " + breakdown
+                "SHADOW ONLY · all_extreme · no 1x1 · " + breakdown
                 + f" · disagreement {state.checkpoint_disagreement:.3f}"
                 + f" · {state.inference_ms:.0f} ms"
             )
@@ -1874,7 +1876,7 @@ class GrowthMonitor(QWidget):
 
     def set_weak_primary_shadow_disabled(self) -> None:
         self._weak_primary_shadow_label.setText(
-            "Weak primary λ=0.1 shadow: disabled"
+            "Brightness-robust 4-output shadow: disabled"
         )
 
     # Documented for the tooltip messages so they stay in sync with

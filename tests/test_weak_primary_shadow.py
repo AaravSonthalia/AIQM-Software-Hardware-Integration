@@ -1,4 +1,4 @@
-"""Offline contract tests for the λ=0.1 GUI shadow integration."""
+"""Offline contract tests for the brightness-robust GUI shadow integration."""
 from __future__ import annotations
 
 import os
@@ -26,6 +26,7 @@ from gui.weak_primary_shadow import (
     WeakPrimaryShadowBridge,
     _require_available_memory,
     discover_lambda_point_one_checkpoints,
+    load_release_manifest,
 )
 
 _app = QApplication.instance() or QApplication(sys.argv)
@@ -56,18 +57,19 @@ class CollectionDiscoveryTests(unittest.TestCase):
 
     def test_checkpoint_contract_rejects_deployable_claim(self) -> None:
         payload = {
-            "checkpoint_family": "weak_four_class_primary_v1",
+            "checkpoint_family": "brightness_robust_weak_primary_v1",
             "execution_scope": "weak_shadow_only",
             "deployment_eligible": True,
             "lambda_pair": 0.1,
             "classes": ["twinned_2x1", "c_6x2", "rt13", "htr"],
-            "one_by_one_class": False,
-            "none_or_weak_class": False,
+            "output_semantics": (
+                "conditional_primary_probability_not_surface_fraction"
+            ),
+            "brightness_policy": "all_extreme",
             "embedding_dim": 512,
             "temperature": 1.0,
             "model_state_dict": {},
-            "data_manifest_sha256": "a" * 64,
-            "embedding_cache": {},
+            "cache": {},
         }
         with self.assertRaisesRegex(ValueError, "shadow contract"):
             WeakPrimaryShadowBridge._validate_checkpoint(
@@ -93,18 +95,22 @@ class CollectionDiscoveryTests(unittest.TestCase):
             os.environ.pop("AI_REPO_ROOT", None)
             root = Path(_resolve_weak_primary_ai_repo_root())
         self.assertEqual(root.resolve(), _BUNDLED_WEAK_PRIMARY_AI_ROOT.resolve())
-        artifact_root = (
-            root / "Classifier2" / "artifacts"
-            / "weak_primary_four_class_20260803"
-        )
+        artifact_root = root / "brightness_robust_four_output_all_extreme"
         self.assertTrue((root / "backbones.py").is_file())
         self.assertTrue((root / "Classifier2" / "weak_primary_model.py").is_file())
         self.assertTrue((root / "Classifier2" / "davidson_pairwise.py").is_file())
-        self.assertTrue((artifact_root / "encoder" / "dinov2_vits14_pretrained_zeropad512.pth").is_file())
+        manifest, paths = load_release_manifest(artifact_root)
+        self.assertEqual(manifest["brightness_policy"], "all_extreme")
+        self.assertNotIn("five_output", manifest["contracts"])
+        self.assertFalse((artifact_root / "five_output_1x1_gates").exists())
+        self.assertTrue(
+            (
+                artifact_root / "shared_encoder"
+                / "dinov2_vits14_pretrained_zeropad512.pth"
+            ).is_file()
+        )
         self.assertEqual(
-            len(discover_lambda_point_one_checkpoints(
-                artifact_root / "full_benchmark" / "checkpoints"
-            )),
+            len(paths),
             36,
         )
 
@@ -126,7 +132,9 @@ class ShadowDisplayTests(unittest.TestCase):
             ready=True,
             last_frame_number=7,
             checkpoint_count=36,
-            ensemble_id="weak-primary-lambda0.1-cv36-test",
+            ensemble_id="brightness-robust-all-extreme-cv36-test",
+            brightness_policy="all_extreme",
+            output_classes=("Twinned (2x1)", "c(6x2)", "rt13xrt13", "HTR"),
             conditional_probabilities={
                 "Twinned (2x1)": 0.1,
                 "c(6x2)": 0.2,
@@ -141,7 +149,8 @@ class ShadowDisplayTests(unittest.TestCase):
         self.monitor.update_weak_primary_shadow_state(state)
         text = self.monitor._weak_primary_shadow_label.text()
         self.assertIn("SHADOW ONLY", text)
-        self.assertIn("conditional four-class", text)
+        self.assertIn("all_extreme", text)
+        self.assertIn("no 1x1", text)
         self.assertIn("HTR 40.0%", text)
         self.assertEqual(
             before,

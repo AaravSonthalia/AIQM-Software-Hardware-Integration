@@ -138,6 +138,10 @@ def main() -> int:
         "model": {
             "ensemble_id": bridge.ensemble_id,
             "checkpoint_count": bridge.checkpoint_count,
+            "bundle_family": bridge.bundle_family,
+            "brightness_policy": bridge.brightness_policy,
+            "output_classes": result["output_classes"],
+            "has_1x1_output": "1x1" in result["output_classes"],
             "execution_scope": result["execution_scope"],
             "actionable": result["actionable"],
         },
